@@ -27,14 +27,21 @@ LOG_FILE="$LOG_DIR/hostapp.log"
 
 usage() {
   cat <<USAGE
-Usage: scripts/verify_cluster.sh [--talos-ip 100.x.y.z] [--svc <ip:port>] [--wait 40] [--no-restart]
+Usage: scripts/verify_cluster.sh [--talos-ip 100.x.y.z] [--svc <ip:port>] [--wait 40] [--no-restart] [--auto-init]
 
 Options:
   --talos-ip IP     Tailnet IP of a Talos node exposing TCP :50000.
   --svc ip:port     Optional ClusterIP:port or NodePort ip:port to test /proxy.
   --wait seconds    Time to wait for server readiness (default: 40).
   --no-restart      If server is running, do not restart it.
-  --help            Show this help.
+  --auto-init       If config is missing, auto-fill init wizard using flags below.
+  --login-server URL   Headscale/TS control server URL for auto-init.
+  --auth-key KEY       Pre-auth key for auto-init.
+  --hostname NAME      Hostname for auto-init (default host-app).
+  --listen-local ADDR  Local listen addr for auto-init (default 127.0.0.1:8080).
+  --dial-timeout-ms N  Dial timeout ms for auto-init (default 3000).
+  --allowlist CSV      Comma-separated allowlist entries for auto-init.
+  --help               Show this help.
 
 Examples:
   scripts/verify_cluster.sh --talos-ip 100.64.1.10
@@ -47,6 +54,13 @@ TALOS_IP=""
 SVC_ADDR=""
 WAIT_SECS=40
 NO_RESTART=0
+AUTO_INIT=0
+AI_LOGIN=""
+AI_AUTHKEY=""
+AI_HOSTNAME="host-app"
+AI_LISTEN="127.0.0.1:8080"
+AI_DIAL="3000"
+AI_ALLOWLIST=""
 
 # Parse args
 while [ $# -gt 0 ]; do
@@ -55,6 +69,13 @@ while [ $# -gt 0 ]; do
     --svc) SVC_ADDR="${2:-}"; shift 2;;
     --wait) WAIT_SECS="${2:-}"; shift 2;;
     --no-restart) NO_RESTART=1; shift;;
+  --auto-init) AUTO_INIT=1; shift;;
+  --login-server) AI_LOGIN="${2:-}"; shift 2;;
+  --auth-key) AI_AUTHKEY="${2:-}"; shift 2;;
+  --hostname) AI_HOSTNAME="${2:-}"; shift 2;;
+  --listen-local) AI_LISTEN="${2:-}"; shift 2;;
+  --dial-timeout-ms) AI_DIAL="${2:-}"; shift 2;;
+  --allowlist) AI_ALLOWLIST="${2:-}"; shift 2;;
     --help|-h) usage; exit 0;;
     *) echo -e "${YELLOW}WARN${NC}: unknown arg: $1"; shift;;
   esac
@@ -107,7 +128,26 @@ prompt() { # $1 prompt, $2 default -> echoes value
 if [ ! -s "$CONF_FILE" ]; then
   echo -e "${YELLOW}WARN${NC}: Config $CONF_FILE missing, starting init wizard..."
   echo "You'll need: Headscale login URL, pre-auth key, hostname, listen address, and allowlist."
-  "$APP_BIN" init || { echo -e "${RED}FAIL${NC}: init wizard failed"; exit 1; }
+  if [ "$AUTO_INIT" -eq 1 ]; then
+    # Build allowlist for auto-init from SVC/TALOS if not provided
+    AI_ALLOWLIST_COMBINED="$AI_ALLOWLIST"
+    if [ -n "$TALOS_IP" ]; then
+      if [ -n "$AI_ALLOWLIST_COMBINED" ]; then AI_ALLOWLIST_COMBINED+="","$TALOS_IP:50000"; else AI_ALLOWLIST_COMBINED="$TALOS_IP:50000"; fi
+    fi
+    if [ -n "$SVC_ADDR" ]; then
+      if [ -n "$AI_ALLOWLIST_COMBINED" ]; then AI_ALLOWLIST_COMBINED+="","$SVC_ADDR"; else AI_ALLOWLIST_COMBINED="$SVC_ADDR"; fi
+    fi
+    # Provide defaults if user didn't pass login/auth (still runs full flow with deterministic answers)
+    : "${AI_LOGIN:=https://headscale.example.com}"
+    : "${AI_AUTHKEY:=tskey-example-123456}" 
+    INIT_INPUT=$(printf "%s\n%s\n%s\n%s\n%s\n%s\n%s\n" \
+      "$AI_LOGIN" "$AI_AUTHKEY" "$AI_HOSTNAME" "$AI_LISTEN" "$AI_DIAL" "$AI_ALLOWLIST_COMBINED" "demo-cluster")
+    if ! printf "%s" "$INIT_INPUT" | "$APP_BIN" init; then
+      die "auto-init wizard failed"
+    fi
+  else
+    "$APP_BIN" init || { echo -e "${RED}FAIL${NC}: init wizard failed"; exit 1; }
+  fi
 fi
 
 # Validate config JSON and required keys
@@ -122,9 +162,6 @@ for k in login_server auth_key hostname listen_local dial_timeout_ms allowlist; 
     echo -e "${RED}FAIL${NC}: missing key '$k' in $CONF_FILE"; exit 1
   fi
 done
-
-LISTEN_LOCAL=$(jq -r .listen_local "$CONF_FILE")
-BASE_URL="http://$LISTEN_LOCAL"
 
 # Failure helper with next steps
 die() {
@@ -160,6 +197,26 @@ if [ -z "$TALOS_IP" ]; then TALOS_IP=$(prompt "Enter Talos node tailnet IP" "");
 if [ -z "$TALOS_IP" ]; then die "--talos-ip is required"; fi
 ensure_allowlist "$TALOS_IP:50000"
 if [ -n "$SVC_ADDR" ]; then ensure_allowlist "$SVC_ADDR"; fi
+
+# If AUTO_INIT and flags provided, update existing config keys
+if [ "$AUTO_INIT" -eq 1 ]; then
+  JQ_ARGS=()
+  FILTER='.'
+  if [ -n "$AI_LOGIN" ]; then JQ_ARGS+=(--arg login "$AI_LOGIN"); FILTER="$FILTER | .login_server=\$login"; fi
+  if [ -n "$AI_AUTHKEY" ]; then JQ_ARGS+=(--arg akey "$AI_AUTHKEY"); FILTER="$FILTER | .auth_key=\$akey"; fi
+  if [ -n "$AI_HOSTNAME" ]; then JQ_ARGS+=(--arg hname "$AI_HOSTNAME"); FILTER="$FILTER | .hostname=\$hname"; fi
+  if [ -n "$AI_LISTEN" ]; then JQ_ARGS+=(--arg ll "$AI_LISTEN"); FILTER="$FILTER | .listen_local=\$ll"; fi
+  if [ -n "$AI_DIAL" ]; then JQ_ARGS+=(--argjson dt "$AI_DIAL"); FILTER="$FILTER | .dial_timeout_ms=\$dt"; fi
+  if [ ${#JQ_ARGS[@]} -gt 0 ]; then
+    tmp=$(mktemp)
+    cp "$CONF_FILE" "$CONF_FILE.bak" || true
+    if jq "${JQ_ARGS[@]}" "$FILTER" "$CONF_FILE" > "$tmp"; then mv "$tmp" "$CONF_FILE"; else rm -f "$tmp"; die "failed to update config with provided flags"; fi
+  fi
+fi
+
+# Read (possibly updated) listen_local
+LISTEN_LOCAL=$(jq -r .listen_local "$CONF_FILE")
+BASE_URL="http://$LISTEN_LOCAL"
 
 # Start/restart app
 running_pid=""

@@ -69,12 +69,19 @@ func main() {
 	}
 	defer tsServer.Close()
 
-	tsInfo, err := ts.Info(ctx, tsServer)
-	if err != nil {
-		log.Printf("tsnet info error: %v", err)
-	} else {
-		log.Printf("tailscale up: ip=%s fqdn=%s", tsInfo.IP, tsInfo.FQDN)
-	}
+	// Fetch TS info asynchronously; don't block server startup
+	go func() {
+		infoCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		tsInfo, err := ts.Info(infoCtx, tsServer)
+		if err != nil {
+			log.Printf("tsnet info error: %v", err)
+			return
+		}
+		if tsInfo != nil {
+			log.Printf("tailscale up: ip=%s fqdn=%s", tsInfo.IP, tsInfo.FQDN)
+		}
+	}()
 
 	mux := http.NewServeMux()
 

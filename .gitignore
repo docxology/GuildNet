@@ -1,0 +1,23 @@
+# Go build artifacts
+/bin/
+/dist/
+/build/
+/tmp/
+/coverage/
+*.out
+*.test
+
+# Logs
+*.log
+
+# Dependencies (uncomment if you vendor)
+# /vendor/
+
+# Editor/IDE
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local app state (should not be committed)
+.guildnet/
