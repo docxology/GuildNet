@@ -1,0 +1,85 @@
+package httpx
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"log"
+	"net/http"
+	"time"
+)
+
+// Logger returns a standard log.Logger for reuse.
+func Logger() *log.Logger {
+	l := log.Default()
+	l.SetFlags(0)
+	return l
+}
+
+// JSON writes a JSON response.
+func JSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func JSONError(w http.ResponseWriter, code int, msg string) {
+	JSON(w, code, map[string]any{"error": msg})
+}
+
+// RequestID middleware adds/propagates a request ID.
+func RequestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rid := r.Header.Get("X-Request-Id")
+		if rid == "" {
+			rid = genID()
+		}
+		w.Header().Set("X-Request-Id", rid)
+		ctx := context.WithValue(r.Context(), reqIDKey, rid)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// Logging middleware logs basic request info.
+func Logging(next http.Handler) http.Handler {
+	logger := Logger()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rw := &respWriter{ResponseWriter: w, code: http.StatusOK}
+		next.ServeHTTP(rw, r)
+		rid := ReqIDFromCtx(r.Context())
+		logger.Printf("method=%s path=%s status=%d dur_ms=%d req_id=%s", r.Method, r.URL.Path, rw.code, time.Since(start).Milliseconds(), rid)
+	})
+}
+
+type respWriter struct{
+	http.ResponseWriter
+	code int
+}
+
+func (w *respWriter) WriteHeader(code int) {
+	w.code = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// request id context key
+type ctxKey string
+
+const reqIDKey ctxKey = "req_id"
+
+func ReqIDFromCtx(ctx context.Context) string {
+	if v := ctx.Value(reqIDKey); v != nil {
+		if s, ok := v.(string); ok { return s }
+	}
+	return ""
+}
+
+func genID() string {
+	// random 16 bytes hex
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return time.Now().Format("20060102150405.000000000")
+	}
+	return hex.EncodeToString(b[:])
+}

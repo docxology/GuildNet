@@ -1,0 +1,18 @@
+# Ignore Git and editor artifacts
+.git
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+
+# Build artifacts
+bin/
+dist/
+/build/
+/tmp/
+coverage/
+*.log
+
+# Local app state (mount explicitly when needed)
+$HOME/.guildnet/
+.guildnet/
