@@ -50,15 +50,12 @@ fi
 export FRONTEND_ORIGIN="$ORIGIN"
 log "FRONTEND_ORIGIN=$FRONTEND_ORIGIN"
 
-# DEV_NO_TSNET: run without tsnet for local dev
-export DEV_NO_TSNET=1
-log "DEV_NO_TSNET=$DEV_NO_TSNET"
-
-# Ensure config exists (auto-init with defaults if missing)
+# Ensure config exists (required for tsnet). If missing, launch interactive init.
 CFG="$HOME/.guildnet/config.json"
 if [ ! -f "$CFG" ]; then
-  log "Config not found; running init with defaults..."
-  printf "\n\n\n\n\n\n\n\n" | "$ROOT/bin/hostapp" init || true
+  log "Config not found; launching interactive init (requires Login server URL, Pre-auth key, Hostname)"
+  "$ROOT/bin/hostapp" init
+# Tailscale (tsnet) is mandatory; ensure config/init provides LoginServer/AuthKey/Hostname.
 fi
 
 # Prefer 127.0.0.1:8080 unless already in use; allow override via LISTEN_LOCAL
@@ -66,5 +63,5 @@ LISTEN_LOCAL_DEFAULT="127.0.0.1:8080"
 export LISTEN_LOCAL="${LISTEN_LOCAL:-$LISTEN_LOCAL_DEFAULT}"
 log "LISTEN_LOCAL=$LISTEN_LOCAL"
 
-# Run server
+# Run server (tsnet mandatory)
 exec "$ROOT/bin/hostapp" serve

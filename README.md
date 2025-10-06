@@ -9,6 +9,7 @@ It includes:
 - A containerized Agent image (code-server + Caddy) that serves an embeddable VS Code UI over one HTTP port.
 - A Kubernetes Deployment + Service example for the agent.
 - HTTPS-by-default for local dev, plus a helper script to generate shared certificates.
+  Note: Tailscale (tsnet) is mandatory; the host app always runs via Tailscale.
 
 ## Features
 
@@ -35,18 +36,25 @@ It includes:
   - Vite dev server uses HTTPS (self-signed or provided)
   - Script to generate a shared local CA and issue certs for both sides
 
-## Quick start
+## Quick start (Tailscale required)
 
-1) Build and run backend (TLS, CORS prepped)
+1) Initialize configuration (Headscale/Tailscale)
 
 ```bash
-# one-liner helper (build + certs + CORS + serve; skips tsnet for local dev)
-make dev-run ORIGIN=https://localhost:5173
-# or manually
-make build && scripts/generate-certs.sh && FRONTEND_ORIGIN=https://localhost:5173 DEV_NO_TSNET=1 ./bin/hostapp serve
+make build
+./bin/hostapp init  # prompts: Login server URL, Pre-auth key, Hostname, Listen local, etc.
 ```
 
-2) Run the UI (HTTPS)
+2) Build and run backend (TLS, CORS prepped, tsnet mandatory)
+
+```bash
+# one-liner helper (build + certs + CORS + serve)
+make dev-run ORIGIN=https://localhost:5173
+# or manually
+make build && scripts/generate-certs.sh && FRONTEND_ORIGIN=https://localhost:5173 ./bin/hostapp serve
+```
+
+3) Run the UI (HTTPS)
 
 ```bash
 cd ui
@@ -56,7 +64,7 @@ VITE_WS_BASE=wss://127.0.0.1:8080 \
 npm run dev
 ```
 
-3) Verify it works
+4) Verify it works
 
 ```bash
 # API health (self-signed):
@@ -118,17 +126,40 @@ WebSocket echo:
 wscat -c wss://127.0.0.1:8080/ws/echo --no-check
 ```
 
+## Optional: run a local Headscale (dev only)
+
+This repo includes a convenience script to launch a Headscale server in Docker for local/dev use. You only need one Headscale per cluster/team; if you already have one, skip this section.
+
+```bash
+# start local Headscale on http://127.0.0.1:8081
+scripts/headscale-run.sh up
+
+# create a user and issue a reusable pre-auth key
+scripts/headscale-run.sh create-user myuser
+scripts/headscale-run.sh preauth-key myuser
+
+# point GuildNet host app at it
+# ~/.guildnet/config.json -> login_server: http://127.0.0.1:8081
+# use the printed pre-auth key for auth_key and set a hostname
+```
+
+Notes:
+- For production, deploy Headscale properly with HTTPS and persistent storage.
+- Some clients require HTTPS; if needed locally, put a trusted reverse proxy in front and set `login_server` to its https URL.
+
 ## Paths & config
 
 - Config: `~/.guildnet/config.json`
 - State: `~/.guildnet/state/`
 - Env: `FRONTEND_ORIGIN` (CORS allow for dev UI, default `https://localhost:5173`)
+- The host app always starts a Tailscale listener in addition to the local TLS listener; ensure your Headscale/Tailscale settings are valid in `~/.guildnet/config.json`.
 
 ## Security notes
 
 - The host app enforces an allowlist for `/api/ping` and `/proxy`.
 - The agent image runs as non-root and doesn’t bundle secrets; set `PASSWORD` or persist `/data`.
 - For production, use proper certificates (or terminate TLS at ingress) and PVCs for `/data` and `/workspace`.
+- Tailscale (tsnet) is required; disabling it is not supported.
 
 ## Development
 
@@ -158,3 +189,21 @@ scripts/talos-upgrade-inplace.sh \
 Notes:
 - Ensure `talosctl` is installed and versions align with your target Talos.
 - For fresh deploys, `talosctl reset --reboot` is used opportunistically before applying configs.
+
+# Progress
+
+- [x] Join/create Headscale/Tailscale network
+- [x] Create Talos cluster inside Tailnet
+- [x] Build & run Code Server image inside Talos cluster
+- [x] Create dashboard server to run scripts and report status
+- [x] Create UI for dashboard server to join/create network, manage clusters and observe code servers
+- [ ] Ensure multi-user support with orgs/clusters
+- [ ] Run Ollama on host machine and OpenAI Codex inside code servers, opening terminal to interact with agent via web UI
+- [ ] Event bus for agent-host communication (e.g. notify users of PR created, code pushed, etc) with web UI
+- [ ] Add persistent storage to cluster via Longhorn, save code server data there
+- [ ] Add Radicle for git hosting inside cluster, hook up to agent workflow for PR creation
+- [ ] Create UI for code review and PR management
+- [ ] Prompt engineering for agent workflows, provide templates and examples
+- [ ] Add MCPs for agent integration/interaction/memory/thinking etc
+- [ ] Add Obsidian or similar for personal and collective knowledge management inside cluster
+- [ ] Add task management system inside cluster, hook up to agent workflows, with 2D/3D graphical interface

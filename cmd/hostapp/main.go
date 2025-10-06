@@ -2,59 +2,74 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log"
+	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"syscall"
 	"time"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
-	"encoding/pem"
-	"math/big"
-	"net"
 
 	httpx "github.com/your/module/internal/httpx"
 	"github.com/your/module/internal/proxy"
 	"github.com/your/module/internal/ts"
 	ws "github.com/your/module/internal/ws"
 	"github.com/your/module/pkg/config"
-	"tailscale.com/tsnet"
 )
 
 // ensureSelfSigned creates a minimal self-signed certificate if not present.
 func ensureSelfSigned(dir, certPath, keyPath string) error {
 	if _, err := os.Stat(certPath); err == nil {
-		if _, err2 := os.Stat(keyPath); err2 == nil { return nil }
+		if _, err2 := os.Stat(keyPath); err2 == nil {
+			return nil
+		}
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil { return err }
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
 	// build a tiny self-signed cert
 	// NOTE: This is for development only.
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	tmpl := x509.Certificate{
-		SerialNumber: big.NewInt(time.Now().UnixNano()),
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
-		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		SerialNumber:          big.NewInt(time.Now().UnixNano()),
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
-		DNSNames: []string{"localhost"},
+		DNSNames:              []string{"localhost"},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	cf, err := os.Create(certPath)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	defer cf.Close()
-	if err := pem.Encode(cf, &pem.Block{Type: "CERTIFICATE", Bytes: der}); err != nil { return err }
+	if err := pem.Encode(cf, &pem.Block{Type: "CERTIFICATE", Bytes: der}); err != nil {
+		return err
+	}
 	kf, err := os.Create(keyPath)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	defer kf.Close()
-	if err := pem.Encode(kf, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)}); err != nil { return err }
+	if err := pem.Encode(kf, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)}); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -100,39 +115,32 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Optional tsnet startup (skip in dev if DEV_NO_TSNET=1)
-	var tsServer *tsnet.Server
-	if os.Getenv("DEV_NO_TSNET") != "1" {
-		s, err := ts.StartServer(ctx, ts.Options{
-			StateDir:  config.StateDir(),
-			Hostname:  cfg.Hostname,
-			LoginURL:  cfg.LoginServer,
-			AuthKey:   cfg.AuthKey,
-		})
-		if err != nil {
-			log.Fatalf("tsnet start: %v", err)
-		}
-		tsServer = s
-		defer tsServer.Close()
-	} else {
-		log.Printf("DEV_NO_TSNET=1 set: starting without tsnet listener")
+	// Start tsnet (mandatory)
+	s, err := ts.StartServer(ctx, ts.Options{
+		StateDir: config.StateDir(),
+		Hostname: cfg.Hostname,
+		LoginURL: cfg.LoginServer,
+		AuthKey:  cfg.AuthKey,
+	})
+	if err != nil {
+		log.Fatalf("tsnet start: %v", err)
 	}
+	tsServer := s
+	defer tsServer.Close()
 
-	// Fetch TS info asynchronously when tsnet is enabled
-	if tsServer != nil {
-		go func() {
-			infoCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			tsInfo, err := ts.Info(infoCtx, tsServer)
-			if err != nil {
-				log.Printf("tsnet info error: %v", err)
-				return
-			}
-			if tsInfo != nil {
-				log.Printf("tailscale up: ip=%s fqdn=%s", tsInfo.IP, tsInfo.FQDN)
-			}
-		}()
-	}
+	// Fetch TS info asynchronously
+	go func() {
+		infoCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		tsInfo, err := ts.Info(infoCtx, tsServer)
+		if err != nil {
+			log.Printf("tsnet info error: %v", err)
+			return
+		}
+		if tsInfo != nil {
+			log.Printf("tailscale up: ip=%s fqdn=%s", tsInfo.IP, tsInfo.FQDN)
+		}
+	}()
 
 	mux := http.NewServeMux()
 
@@ -153,9 +161,9 @@ func main() {
 			return
 		}
 		start := time.Now()
-		ctx, cancel := context.WithTimeout(r.Context(), time.Duration(cfg.DialTimeoutMS)*time.Millisecond)
+		dctx, cancel := context.WithTimeout(r.Context(), time.Duration(cfg.DialTimeoutMS)*time.Millisecond)
 		defer cancel()
-		conn, err := ts.DialContext(ctx, tsServer, "tcp", addr)
+		conn, err := ts.DialContext(dctx, tsServer, "tcp", addr)
 		if err != nil {
 			httpx.JSON(w, http.StatusBadGateway, map[string]any{
 				"addr":   addr,
@@ -195,7 +203,9 @@ func main() {
 
 	// Wrap with middleware (logging, request id, CORS)
 	corsOrigin := os.Getenv("FRONTEND_ORIGIN")
-	if corsOrigin == "" { corsOrigin = "https://localhost:5173" }
+	if corsOrigin == "" {
+		corsOrigin = "https://localhost:5173"
+	}
 	handler := httpx.RequestID(httpx.Logging(httpx.CORS(corsOrigin)(mux)))
 
 	// Certs: prefer repo ./certs/dev.crt|dev.key if present; else use ~/.guildnet/state/certs
@@ -224,10 +234,10 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	// tsnet listener server (if available)
+	// tsnet listener server
 	var tsSrv *http.Server
 	var ln net.Listener
-	if tsServer != nil {
+	{
 		var err error
 		ln, err = ts.Listen(ctx, tsServer, "tcp", ":443")
 		if err != nil {
@@ -244,12 +254,8 @@ func main() {
 
 	errCh := make(chan error, 2)
 	go func() { errCh <- localSrv.ListenAndServeTLS(certFile, keyFile) }()
-	if tsSrv != nil {
-		go func() { errCh <- tsSrv.ServeTLS(ln, certFile, keyFile) }()
-		log.Printf("serving TLS on local %s and tailscale listener :443 (self-signed)", cfg.ListenLocal)
-	} else {
-		log.Printf("serving TLS on local %s (DEV_NO_TSNET=1)", cfg.ListenLocal)
-	}
+	go func() { errCh <- tsSrv.ServeTLS(ln, certFile, keyFile) }()
+	log.Printf("serving TLS on local %s and tailscale listener :443", cfg.ListenLocal)
 
 	select {
 	case <-ctx.Done():

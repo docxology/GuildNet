@@ -11,7 +11,7 @@ build:
 run: build
 	./bin/$(BINARY) serve
 
-# Dev helper: builds, generates certs, sets CORS origin, runs with DEV_NO_TSNET=1
+# Dev helper: builds, generates certs, sets CORS origin, runs with Tailscale (tsnet)
 # Usage:
 #   make dev-run                    # default origin https://localhost:5173
 #   make dev-run ORIGIN=https://app.example.com NO_CERTS=1
