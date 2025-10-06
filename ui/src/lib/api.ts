@@ -1,4 +1,5 @@
 import type { JobAccepted, JobSpec, LogLine, Server } from './types';
+import { apiUrl } from './config';
 
 async function handle<T>(res: Response): Promise<T> {
   if (!res.ok) {
@@ -13,13 +14,13 @@ async function handle<T>(res: Response): Promise<T> {
 }
 
 export async function listServers(signal?: AbortSignal): Promise<Server[]> {
-  const res = await fetch('/api/servers', { signal });
+  const res = await fetch(apiUrl('/api/servers'), { signal });
   return handle<Server[]>(res).catch(() => []);
 }
 
 export async function getServer(id: string, signal?: AbortSignal): Promise<Server | null> {
   try {
-    const res = await fetch(`/api/servers/${encodeURIComponent(id)}`, { signal });
+  const res = await fetch(apiUrl(`/api/servers/${encodeURIComponent(id)}`), { signal });
     return await handle<Server>(res);
   } catch {
     return null;
@@ -37,7 +38,7 @@ export async function getLogs(
   if (params.until) qs.set('until', params.until);
   if (params.limit != null) qs.set('limit', String(params.limit));
   try {
-    const res = await fetch(`/api/servers/${encodeURIComponent(id)}/logs?${qs.toString()}`, { signal });
+  const res = await fetch(apiUrl(`/api/servers/${encodeURIComponent(id)}/logs?${qs.toString()}`), { signal });
     return await handle<LogLine[]>(res);
   } catch {
     return [];
@@ -45,7 +46,7 @@ export async function getLogs(
 }
 
 export async function postJob(payload: JobSpec, signal?: AbortSignal): Promise<JobAccepted> {
-  const res = await fetch('/api/jobs', {
+  const res = await fetch(apiUrl('/api/jobs'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),

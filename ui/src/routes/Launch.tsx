@@ -1,7 +1,6 @@
 import { createSignal } from 'solid-js';
 import { z } from 'zod';
 import Card from '../components/Card';
-import Button from '../components/Button';
 import Input from '../components/Input';
 import { postJob } from '../lib/api';
 import { pushToast } from '../components/Toaster';
@@ -21,6 +20,9 @@ const schema = z.object({
 export default function Launch() {
   const navigate = useNavigate();
   const [image, setImage] = createSignal('');
+  const imagePresets: Array<{ label: string; value: string }> = [
+    { label: 'GuildNet Agent (VS Code)', value: 'guildnet/agent:dev' },
+  ];
   const [name, setName] = createSignal('');
   const [args, setArgs] = createSignal<string[]>([]);
   const [env, setEnv] = createSignal<Array<{k:string;v:string}>>([]);
@@ -60,6 +62,22 @@ export default function Launch() {
       <Card title="Launch new workload">
         <div class="grid md:grid-cols-2 gap-4">
           <div class="space-y-3">
+            <label class="block text-sm">Image preset
+              <select class="w-full rounded-md border px-3 py-2 bg-white dark:bg-neutral-900 mt-1"
+                onChange={(e) => {
+                  const v = e.currentTarget.value;
+                  if (v) {
+                    setImage(v);
+                    // If no ports provided yet, suggest default 8080 name http
+                    if ((ports()?.length ?? 0) === 0) setPorts([{ name: 'http', port: 8080 }]);
+                  }
+                }}>
+                <option value="">Custom (enter URL below)</option>
+                {imagePresets.map((p) => (
+                  <option value={p.value}>{p.label}</option>
+                ))}
+              </select>
+            </label>
             <label class="block text-sm">Image URL<span class="text-red-600">*</span><Input value={image()} onInput={(e) => setImage(e.currentTarget.value)} placeholder="ghcr.io/org/app:tag" /></label>
             <label class="block text-sm">Name<Input value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="optional" /></label>
             <label class="block text-sm">Args
@@ -120,7 +138,7 @@ export default function Launch() {
           </div>
         )}
         <div class="mt-4">
-          <Button variant="primary" disabled={busy()} onClick={submit}>{busy() ? 'Submitting…' : 'Launch'}</Button>
+          <button class="inline-flex items-center justify-center gap-2 rounded-md px-3 py-2 text-sm font-medium border bg-neutral-50 dark:bg-neutral-800 hover:bg-neutral-100 dark:hover:bg-neutral-700" disabled={busy()} onClick={submit}>{busy() ? 'Submitting…' : 'Launch'}</button>
         </div>
       </Card>
     </div>

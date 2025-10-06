@@ -1,0 +1,39 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GuildNet Agent</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; line-height: 1.5; }
+    .wrap { max-width: 720px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 1.25rem; }
+    h1 { margin: 0 0 0.5rem 0; }
+    ul { padding-left: 1.25rem; }
+    a { color: #0b5fff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code { background: rgba(127,127,127,.15); padding: 0 .25rem; border-radius: 4px; }
+    .muted { color: #666; font-size: 0.9rem; }
+    .kv { display: grid; grid-template-columns: 180px 1fr; gap: .5rem 1rem; }
+    .kv div { padding: .15rem 0; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>GuildNet Agent</h1>
+      <p class="muted">A lightweight workload server running VS Code (code-server) behind Caddy.</p>
+      <div class="kv">
+        <div>Container</div><div><code>guildnet/agent</code></div>
+        <div>Port</div><div><code>${PORT:-8080}</code></div>
+        <div>Workspace</div><div><code>/workspace</code></div>
+      </div>
+      <ul>
+        <li><a href="/">Open VS Code (code-server)</a></li>
+        <li><a href="/healthz">Health</a></li>
+      </ul>
+    </div>
+  </div>
+</body>
+</html>

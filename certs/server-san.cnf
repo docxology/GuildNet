@@ -1,0 +1,13 @@
+[ req ]
+distinguished_name = dn
+req_extensions = v3_req
+prompt = no
+
+[ dn ]
+CN = localhost
+
+[ v3_req ]
+subjectAltName = @alt_names
+
+[ alt_names ]
+# Auto-generated SANs\nDNS.1 = localhost\nIP.1 = 127.0.0.1\nIP.2 = ::1

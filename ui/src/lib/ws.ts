@@ -1,4 +1,5 @@
 import type { LogLine } from './types';
+import { wsUrl } from './config';
 
 type WSState = 'connecting' | 'open' | 'closed' | 'reconnecting' | 'error';
 
@@ -123,7 +124,7 @@ export class WSManager extends Emitter {
 
 export function openLogsStream(params: { target: string; level: 'info' | 'debug' | 'error'; tail?: number }) {
   const qs = new URLSearchParams({ target: params.target, level: params.level, tail: String(params.tail ?? 200) });
-  const url = `${location.origin.replace('http', 'ws')}/ws/logs?${qs.toString()}`;
+  const url = wsUrl(`/ws/logs?${qs.toString()}`);
   const ws = new WSManager(url);
   return ws;
 }

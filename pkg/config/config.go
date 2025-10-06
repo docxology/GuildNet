@@ -46,11 +46,14 @@ func Save(c *Config) error {
 }
 
 func (c *Config) Validate() error {
-	if !strings.HasPrefix(c.LoginServer, "http://") && !strings.HasPrefix(c.LoginServer, "https://") {
-		return errors.New("login_server must be a URL")
+	devNoTS := os.Getenv("DEV_NO_TSNET") == "1"
+	if !devNoTS {
+		if !strings.HasPrefix(c.LoginServer, "http://") && !strings.HasPrefix(c.LoginServer, "https://") {
+			return errors.New("login_server must be a URL")
+		}
+		if c.AuthKey == "" { return errors.New("auth_key required") }
+		if c.Hostname == "" { return errors.New("hostname required") }
 	}
-	if c.AuthKey == "" { return errors.New("auth_key required") }
-	if c.Hostname == "" { return errors.New("hostname required") }
 	if c.ListenLocal == "" { return errors.New("listen_local required") }
 	if c.DialTimeoutMS <= 0 || c.DialTimeoutMS > 60000 { return fmt.Errorf("dial_timeout_ms out of range: %d", c.DialTimeoutMS) }
 	// validate allowlist entries
