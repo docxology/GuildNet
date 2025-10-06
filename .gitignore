@@ -21,3 +21,7 @@ Thumbs.db
 
 # Local app state (should not be committed)
 .guildnet/
+
+# Node
+ui/node_modules/
+ui/dist/
