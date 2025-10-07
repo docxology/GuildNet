@@ -7,6 +7,7 @@ log() {
 
 # Defaults
 PORT="${PORT:-8080}"
+HTTPS_PORT="${HTTPS_PORT:-8443}"
 PASSWORD_ENV="${PASSWORD:-}"
 
 # Ensure dirs
@@ -76,9 +77,9 @@ HTML
 fi
 
 # Start code-server (listen on loopback only), workspace at /workspace
-CODE_SERVER_ADDR="127.0.0.1:10000"
+CODE_SERVER_ADDR="127.0.0.1:8080"
 
-log "Starting code-server on ${CODE_SERVER_ADDR}, proxy port ${PORT}, workspace /workspace"
+log "Starting code-server on ${CODE_SERVER_ADDR}, proxy ports http:${PORT} https:${HTTPS_PORT}, workspace /workspace"
 
 CODE_SERVER_CMD="code-server --bind-addr ${CODE_SERVER_ADDR} \
   --user-data-dir /data/user-data \

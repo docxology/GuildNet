@@ -3,15 +3,29 @@ import Card from '../components/Card';
 import StatusPill from '../components/StatusPill';
 import KeyValueList from '../components/KeyValueList';
 import LogViewer from '../components/LogViewer';
-import { A, useParams } from '@solidjs/router';
-import { Show, createResource, createSignal } from 'solid-js';
+import { useParams } from '@solidjs/router';
+import { Show, createMemo, createResource, createSignal } from 'solid-js';
 import { getServer } from '../lib/api';
 import { formatDate } from '../lib/format';
+import { apiUrl } from '../lib/config';
 
 export default function ServerDetail() {
   const params = useParams();
-  const [tab, setTab] = createSignal<'info'|'debug'|'error'>('info');
+  const [tab, setTab] = createSignal<'info'|'debug'|'error'|'ide'>('info');
   const [srv] = createResource(() => params.id, (id: string) => getServer(id));
+
+  const ideUrl = createMemo(() => {
+    const s = srv();
+    if (!s) return '';
+    const has8443 = (s.ports ?? []).some((p) => p.port === 8443);
+    if (!has8443) return '';
+    // Pick a host: prefer node; otherwise try env-derived hints.
+    const env = s.env ?? {} as Record<string, string>;
+    const host = (s as any).node || env['AGENT_HOST'] || env['HOST'] || env['SERVICE_HOST'];
+    if (!host) return '';
+    // Agent 8443 currently serves HTTP (Caddy without TLS inside container)
+    return apiUrl(`/proxy?to=${encodeURIComponent(`${host}:8443`)}&path=${encodeURIComponent('/')}&scheme=http`);
+  });
 
   return (
     <div class="flex flex-col gap-4">
@@ -35,8 +49,17 @@ export default function ServerDetail() {
               </div>
             </Card>
 
-            <Card title="Logs">
-              <Tabs tabs={[{id:'info',label:'Info'},{id:'debug',label:'Debug'},{id:'error',label:'Error'}]} value={tab()} onChange={(t) => setTab(t as any)} />
+            <Card title="Logs & Tools">
+              <Tabs
+                tabs={[
+                  { id: 'info', label: 'Info' },
+                  { id: 'debug', label: 'Debug' },
+                  { id: 'error', label: 'Error' },
+                  ...(ideUrl() ? [{ id: 'ide', label: 'IDE' }] : []),
+                ] as { id: string; label: string }[]}
+                value={tab()}
+                onChange={(t) => setTab(t as any)}
+              />
               <TabPanel when={tab() === 'info'}>
                 <LogViewer serverId={server().id} level="info" />
               </TabPanel>
@@ -45,6 +68,21 @@ export default function ServerDetail() {
               </TabPanel>
               <TabPanel when={tab() === 'error'}>
                 <LogViewer serverId={server().id} level="error" />
+              </TabPanel>
+              <TabPanel when={tab() === 'ide'}>
+                <Show when={ideUrl()} fallback={<div class="text-sm text-neutral-500">IDE not available. Ensure this agent exposes port 8443 and has a node address.</div>}>
+                  {(url) => (
+                    <div class="border rounded-md overflow-hidden h-[70vh]">
+                      <iframe
+                        src={url()}
+                        title="code-server"
+                        class="w-full h-full bg-white"
+                        referrerpolicy="no-referrer"
+                        allow="clipboard-read; clipboard-write;"
+                      />
+                    </div>
+                  )}
+                </Show>
               </TabPanel>
             </Card>
 

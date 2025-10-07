@@ -1,42 +1,33 @@
 {
-	# Disable admin endpoint for safety
 	admin off
-	# Enable basic logging to stdout
-	log {
-		output stdout
-		format console
+}
+
+# Serve code-server on plain HTTP 8443 with embed-friendly headers
+:{$HTTPS_PORT} {
+	encode zstd gzip
+
+	header {
+		-X-Frame-Options
+		Content-Security-Policy "frame-ancestors 'self' *"
+		Referrer-Policy "no-referrer"
+		X-Content-Type-Options "nosniff"
 	}
-}
 
-:{$PORT}
+	@health path /healthz
+	handle @health {
+		root * /srv
+		file_server
+		try_files {path} /healthz.txt
+	}
 
-encode zstd gzip
+	@landing path /landing
+	handle @landing {
+		root * /srv
+		file_server
+		try_files {path} /index.html
+	}
 
-# Security and embed headers
-header {
-	-X-Frame-Options
-	Content-Security-Policy "frame-ancestors 'self' *"
-	Referrer-Policy "no-referrer"
-	X-Content-Type-Options "nosniff"
-}
-
-# Health endpoint
-@health path /healthz
-handle @health {
-	root * /srv
-	file_server browse false
-	try_files {path} /healthz.txt
-}
-
-# Landing page at /landing
-@landing path /landing
-handle @landing {
-	root * /srv
-	file_server browse false
-	try_files {path} /index.html
-}
-
-# Default: reverse proxy to code-server running on loopback
-handle {
-	reverse_proxy 127.0.0.1:10000
+	handle {
+		reverse_proxy 127.0.0.1:8080
+	}
 }

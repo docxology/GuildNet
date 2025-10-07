@@ -153,9 +153,9 @@ func (s *Store) SeedDemo() {
 		Name:      "GuildNet Agent",
 		Image:     "guildnet/agent:dev",
 		Status:    "running",
-		Ports:     []model.Port{{Name: "http", Port: 8080}},
+		Ports:     []model.Port{{Name: "http", Port: 8080}, {Name: "https", Port: 8443}},
 		Resources: &model.Resources{CPU: "500m", Memory: "256Mi"},
-		Env:       map[string]string{"ENV": "dev"},
+		Env:       map[string]string{"ENV": "dev", "AGENT_HOST": "127.0.0.1"},
 	}
 	s.UpsertServer(srv)
 	// add some logs

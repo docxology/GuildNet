@@ -83,6 +83,39 @@ func ensureSelfSigned(dir, certPath, keyPath string) error {
 	return nil
 }
 
+// dns1123Name converts an arbitrary string into a DNS-1123 compliant name:
+// - lowercased
+// - only a-z, 0-9, and '-'
+// - must start/end with alphanumeric; collapse multiple dashes
+func dns1123Name(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	var b strings.Builder
+	prevDash := false
+	for _, r := range s {
+		switch {
+ 		case r >= 'a' && r <= 'z':
+ 			b.WriteRune(r)
+ 			prevDash = false
+ 		case r >= '0' && r <= '9':
+ 			b.WriteRune(r)
+ 			prevDash = false
+ 		case r == '-' || r == '_' || r == ' ':
+ 			if !prevDash && b.Len() > 0 {
+ 				b.WriteByte('-')
+ 				prevDash = true
+ 			}
+ 		default:
+ 			// drop
+ 		}
+ 	}
+ 	res := strings.Trim(b.String(), "-")
+ 	// trim repeated dashes
+ 	for strings.Contains(res, "--") {
+ 		res = strings.ReplaceAll(res, "--", "-")
+ 	}
+ 	return res
+}
+
 func main() {
 	log.SetFlags(0)
 	cmd := "serve"
@@ -155,6 +188,26 @@ func main() {
 		httpx.JSON(w, http.StatusOK, map[string]any{"name": cfg.Name})
 	})
 
+	// Image defaults: return suggested env/ports for a given image reference
+	mux.HandleFunc("/api/image-defaults", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		img := strings.TrimSpace(r.URL.Query().Get("image"))
+		resp := map[string]any{}
+		if img == "" {
+			httpx.JSON(w, http.StatusOK, resp)
+			return
+		}
+		// Very simple matcher; can be extended to read from config or OCI metadata.
+		if strings.Contains(img, "guildnet/agent") {
+			resp["ports"] = []model.Port{{Name: "http", Port: 8080}, {Name: "https", Port: 8443}}
+			resp["env"] = map[string]string{"AGENT_HOST": ""}
+		}
+		httpx.JSON(w, http.StatusOK, resp)
+	})
+
 	// servers list
 	mux.HandleFunc("/api/servers", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -219,6 +272,34 @@ func main() {
 			httpx.JSONError(w, http.StatusBadRequest, "invalid spec")
 			return
 		}
+
+		// Ensure env map and default AGENT_HOST if missing/empty.
+		if spec.Env == nil {
+			spec.Env = map[string]string{}
+		}
+		if strings.TrimSpace(spec.Env["AGENT_HOST"]) == "" {
+			base := strings.TrimSpace(spec.Name)
+			if base == "" {
+				// Derive base name from image last path segment without tag.
+				img := spec.Image
+				last := img
+				if i := strings.LastIndex(img, "/"); i >= 0 && i+1 < len(img) {
+					last = img[i+1:]
+				}
+				if j := strings.IndexByte(last, ':'); j >= 0 {
+					last = last[:j]
+				}
+				base = last
+			}
+			if base == "" {
+				base = "workload"
+			}
+			host := dns1123Name(base)
+			if host == "" {
+				host = "workload"
+			}
+			spec.Env["AGENT_HOST"] = host
+		}
 		// For demo: create a server record with accepted status and echo some logs
 		id := fmt.Sprintf("job-%d", time.Now().UnixNano())
 		srv := &model.Server{ID: id, Name: spec.Name, Image: spec.Image, Status: "pending", Ports: spec.Expose, Resources: spec.Resources, Args: spec.Args, Env: spec.Env}
@@ -227,6 +308,9 @@ func main() {
 		}
 		mem.UpsertServer(srv)
 		_, _ = mem.AppendLog(id, "info", "job accepted")
+		if v := spec.Env["AGENT_HOST"]; v != "" {
+			_, _ = mem.AppendLog(id, "debug", fmt.Sprintf("AGENT_HOST=%s", v))
+		}
 		_, _ = mem.AppendLog(id, "debug", "preparing")
 		go func() {
 			time.Sleep(500 * time.Millisecond)
@@ -355,6 +439,7 @@ func main() {
 		Logger: httpx.Logger(),
 	})
 	mux.Handle("/proxy", proxyHandler)
+	mux.Handle("/proxy/", proxyHandler)
 
 	// Wrap with middleware (logging, request id, CORS)
 	corsOrigin := os.Getenv("FRONTEND_ORIGIN")

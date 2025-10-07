@@ -54,3 +54,14 @@ export async function postJob(payload: JobSpec, signal?: AbortSignal): Promise<J
   });
   return handle<JobAccepted>(res);
 }
+
+export async function getImageDefaults(image: string, signal?: AbortSignal): Promise<{ ports?: {name?: string; port: number}[]; env?: Record<string,string> }> {
+  if (!image) return {};
+  const url = apiUrl(`/api/image-defaults?image=${encodeURIComponent(image)}`);
+  const res = await fetch(url, { signal });
+  try {
+    return await handle<{ ports?: {name?: string; port: number}[]; env?: Record<string,string> }>(res);
+  } catch {
+    return {};
+  }
+}

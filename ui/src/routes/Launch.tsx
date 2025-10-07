@@ -1,8 +1,8 @@
-import { createSignal } from 'solid-js';
+import { createEffect, createSignal } from 'solid-js';
 import { z } from 'zod';
 import Card from '../components/Card';
 import Input from '../components/Input';
-import { postJob } from '../lib/api';
+import { getImageDefaults, postJob } from '../lib/api';
 import { pushToast } from '../components/Toaster';
 import { useNavigate } from '@solidjs/router';
 
@@ -18,6 +18,7 @@ const schema = z.object({
 });
 
 export default function Launch() {
+  type ImageDefaults = { ports?: { name?: string; port: number }[]; env?: Record<string, string> };
   const navigate = useNavigate();
   const [image, setImage] = createSignal('');
   const imagePresets: Array<{ label: string; value: string }> = [
@@ -32,6 +33,18 @@ export default function Launch() {
   const [memory, setMemory] = createSignal('');
   const [busy, setBusy] = createSignal(false);
   const [errors, setErrors] = createSignal<string[]>([]);
+
+  // Prefill defaults by querying backend for the selected image
+  createEffect(async () => {
+    const img = image() || 'guildnet/agent:dev';
+    if (!image()) setImage(img);
+    const d: ImageDefaults = await getImageDefaults(img).catch(() => ({} as ImageDefaults));
+    if ((ports()?.length ?? 0) === 0 && Array.isArray(d.ports)) setPorts(d.ports.map((p) => ({ name: p.name || '', port: p.port })));
+    const existing: Record<string, string> = Object.fromEntries(env().map((e) => [e.k, e.v] as const));
+    const merged: Record<string, string> = { ...(d.env || {}), ...existing };
+    const arr = Object.entries(merged).map(([k, v]) => ({ k, v }));
+    setEnv(arr);
+  });
 
   const submit = async () => {
     setErrors([]);
@@ -64,12 +77,17 @@ export default function Launch() {
           <div class="space-y-3">
             <label class="block text-sm">Image preset
               <select class="w-full rounded-md border px-3 py-2 bg-white dark:bg-neutral-900 mt-1"
-                onChange={(e) => {
+        onChange={async (e) => {
                   const v = e.currentTarget.value;
                   if (v) {
                     setImage(v);
-                    // If no ports provided yet, suggest default 8080 name http
-                    if ((ports()?.length ?? 0) === 0) setPorts([{ name: 'http', port: 8080 }]);
+                    // Load defaults for selected image
+          const d: ImageDefaults = await getImageDefaults(v).catch(() => ({} as ImageDefaults));
+          if ((ports()?.length ?? 0) === 0 && Array.isArray(d.ports)) setPorts(d.ports.map((p) => ({ name: p.name || '', port: p.port })));
+          const existing: Record<string, string> = Object.fromEntries(env().map((e) => [e.k, e.v] as const));
+          const merged: Record<string, string> = { ...(d.env || {}), ...existing };
+          const arr = Object.entries(merged).map(([k, v]) => ({ k, v }));
+          setEnv(arr);
                   }
                 }}>
                 <option value="">Custom (enter URL below)</option>
@@ -94,7 +112,7 @@ export default function Launch() {
             </div>
           </div>
           <div class="space-y-3">
-            <label class="block text-sm">Env
+      <label class="block text-sm">Env
               <div class="space-y-2">
                 {env().map((p, i) => (
                   <div class="flex gap-2">
@@ -104,6 +122,7 @@ export default function Launch() {
                   </div>
                 ))}
                 <button class="inline-flex items-center justify-center gap-2 rounded-md px-3 py-2 text-sm font-medium border bg-neutral-50 dark:bg-neutral-800 hover:bg-neutral-100 dark:hover:bg-neutral-700" onClick={()=> setEnv([...env(), {k:'',v:''}])}>Add env</button>
+                <div class="text-xs text-neutral-500">Tip: Image defaults prefill suggested env and ports; you can override as needed. For IDE, AGENT_HOST should be the agent's reachable DNS or IP (e.g., service name).</div>
               </div>
             </label>
             <label class="block text-sm">Labels

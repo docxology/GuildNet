@@ -5,6 +5,7 @@ FROM debian:bookworm-slim AS builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG CODE_SERVER_VERSION=latest
+ARG TARGETARCH
 
 RUN set -eux; \
     apt-get update; \
@@ -13,16 +14,23 @@ RUN set -eux; \
 
 # Resolve code-server version and download
 RUN set -eux; \
-    mkdir -p /tmp/code-server; \
+        mkdir -p /tmp/code-server; \
+        ARCH="${TARGETARCH}"; \
+        case "$ARCH" in \
+            amd64) CS_ARCH=linux-amd64 ;; \
+            arm64) CS_ARCH=linux-arm64 ;; \
+            *) echo "Unsupported TARGETARCH: $ARCH"; exit 1 ;; \
+        esac; \
     if [ "$CODE_SERVER_VERSION" = "latest" ]; then \
       VER=$(curl -fsSL https://api.github.com/repos/coder/code-server/releases/latest | jq -r .tag_name | sed 's/^v//'); \
     else \
       VER="$CODE_SERVER_VERSION"; \
     fi; \
     echo "Using code-server version: ${VER}"; \
-    curl -fsSL "https://github.com/coder/code-server/releases/download/v${VER}/code-server-${VER}-linux-amd64.tar.gz" -o /tmp/code-server.tgz; \
+        echo "Detected TARGETARCH=${TARGETARCH}, downloading ${CS_ARCH}"; \
+        curl -fsSL "https://github.com/coder/code-server/releases/download/v${VER}/code-server-${VER}-${CS_ARCH}.tar.gz" -o /tmp/code-server.tgz; \
     tar -xzf /tmp/code-server.tgz -C /tmp/code-server --strip-components=1; \
-    install -m 0755 /tmp/code-server/bin/code-server /usr/local/bin/code-server
+        true
 
 # Install tini in builder to copy into final image
 RUN set -eux; \
@@ -46,8 +54,9 @@ RUN set -eux; \
     useradd -u 10001 -m -d /home/app -s /usr/sbin/nologin app; \
     install -d -m 0755 -o app -g app /opt/agent /srv /workspace /data
 
-# Copy binaries from builder
-COPY --from=builder /usr/local/bin/code-server /usr/local/bin/code-server
+# Copy code-server distribution and install symlink so relative paths work
+COPY --from=builder /tmp/code-server /usr/local/lib/code-server
+RUN ln -sf /usr/local/lib/code-server/bin/code-server /usr/local/bin/code-server
 COPY --from=builder /usr/bin/tini /sbin/tini
 
 # Copy agent assets
@@ -60,9 +69,10 @@ RUN set -eux; \
     chown -R app:app /opt/agent /srv /workspace /data
 
 ENV PORT=8080 \
+    HTTPS_PORT=8443 \
     HOME=/home/app
 
-EXPOSE 8080
+EXPOSE 8080 8443
 
 # Healthcheck for Kubernetes/docker
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD sh -c "curl -fsS http://127.0.0.1:${PORT:-8080}/healthz >/dev/null || exit 1"
