@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -352,10 +351,13 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Cache-Control", "no-store")
 				w.Header().Set("Pragma", "no-cache")
 				w.Header().Set("Expires", "0")
-				// Allow embedding in iframe by relaxing frame headers
+				// Allow embedding in iframe by relaxing frame headers but preserve other CSP directives
 				w.Header().Del("X-Frame-Options")
-				w.Header().Del("Content-Security-Policy")
-				w.Header().Set("Content-Security-Policy", "frame-ancestors *")
+				if csp := w.Header().Get("Content-Security-Policy"); csp != "" {
+					w.Header().Set("Content-Security-Policy", relaxFrameAncestors(csp))
+				} else {
+					w.Header().Set("Content-Security-Policy", "frame-ancestors *")
+				}
 
 				// Rewrite Location header to stay within proxy base
 				if loc := resp.Header.Get("Location"); loc != "" {
@@ -367,44 +369,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					w.Header().Set("Location", newLoc)
 				}
 
-				// Relax Set-Cookie for third-party iframes (dev): add Secure; SameSite=None; Partitioned if missing
-				if cookies := w.Header()["Set-Cookie"]; len(cookies) > 0 {
-					adj := make([]string, 0, len(cookies))
-					for _, c := range cookies {
-						cc := adjustSetCookie(c)
-						adj = append(adj, cc)
-					}
-					w.Header()["Set-Cookie"] = adj
-				}
-
-				ctype := strings.ToLower(resp.Header.Get("Content-Type"))
-				if strings.Contains(ctype, "text/html") {
-					// Read, inject <base>, and rewrite absolute asset paths to proxy prefix
-					b, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
-					_ = resp.Body.Close()
-					html := string(b)
-					// Compute base href
-					baseHref := "/proxy/" + to + "/"
-					if serverIDForAPI != "" {
-						baseHref = "/proxy/server/" + url.PathEscape(serverIDForAPI) + "/"
-					}
-					// Rewrite common absolute attributes to proxy-prefixed paths first
-					html = strings.ReplaceAll(html, "href=\"/", "href=\""+baseHref)
-					html = strings.ReplaceAll(html, "src=\"/", "src=\""+baseHref)
-					html = strings.ReplaceAll(html, "action=\"/", "action=\""+baseHref)
-					// Inject <base> if no existing base (after rewrites to avoid rewriting our own base)
-					re := regexp.MustCompile(`(?i)<head[^>]*>`) // first <head>
-					if re.MatchString(html) && !strings.Contains(strings.ToLower(html), "<base ") {
-						html = re.ReplaceAllString(html, fmt.Sprintf("<head><base href=\"%s\">", baseHref))
-					}
-					// Write updated body
-					nb := []byte(html)
-					w.Header().Set("Content-Length", fmt.Sprintf("%d", len(nb)))
-					w.WriteHeader(resp.StatusCode)
-					_, _ = w.Write(nb)
-					return
-				}
-				// Non-HTML: stream as-is
+				// Stream body as-is (avoid brittle HTML rewriting)
 				w.WriteHeader(resp.StatusCode)
 				_, _ = io.Copy(w, resp.Body)
 				return
@@ -475,41 +440,12 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if p.opts.Logger != nil {
 				p.opts.Logger.Printf("proxy to=%s path=%s status=%d", to, subPath, resp.StatusCode)
 			}
-			// Relax frame restrictions for embedding
+			// Relax frame restrictions for embedding while preserving other CSP directives
 			resp.Header.Del("X-Frame-Options")
-			resp.Header.Del("Content-Security-Policy")
-			resp.Header.Set("Content-Security-Policy", "frame-ancestors *")
-			// If HTML, inject <base href="/proxy/{to}/"> when using path-based routing, to make absolute URLs resolve.
-			if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") {
-				// detect if request path indicates path-based mode (legacy or server-aware)
-				if strings.HasPrefix(r.URL.Path, "/proxy/") && (q.Get("to") == "" || q.Get("path") == "") {
-					// Read and rewrite body
-					b, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
-					if err != nil {
-						return nil
-					}
-					_ = resp.Body.Close()
-					html := string(b)
-					// Simple injection into <head>
-					baseHref := "/proxy/" + to + "/"
-					if serverIDForAPI != "" {
-						baseHref = "/proxy/server/" + url.PathEscape(serverIDForAPI) + "/"
-					}
-					// Rewrite absolute attributes first
-					html = strings.ReplaceAll(html, "href=\"/", "href=\""+baseHref)
-					html = strings.ReplaceAll(html, "src=\"/", "src=\""+baseHref)
-					html = strings.ReplaceAll(html, "action=\"/", "action=\""+baseHref)
-					// Inject <base> if missing after rewrites
-					re := regexp.MustCompile(`(?i)<head[^>]*>`) // first <head>
-					if re.MatchString(html) && !strings.Contains(strings.ToLower(html), "<base ") {
-						html = re.ReplaceAllString(html, fmt.Sprintf("<head><base href=\"%s\">", baseHref))
-					}
-					// Replace body
-					nb := []byte(html)
-					resp.Body = io.NopCloser(strings.NewReader(html))
-					resp.ContentLength = int64(len(nb))
-					resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(nb)))
-				}
+			if csp := resp.Header.Get("Content-Security-Policy"); csp != "" {
+				resp.Header.Set("Content-Security-Policy", relaxFrameAncestors(csp))
+			} else {
+				resp.Header.Set("Content-Security-Policy", "frame-ancestors *")
 			}
 			// Rewrite Location to stay under proxy base
 			if loc := resp.Header.Get("Location"); loc != "" && strings.HasPrefix(r.URL.Path, "/proxy/") {
@@ -519,11 +455,11 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				resp.Header.Set("Location", rewriteLocation(loc, baseHref))
 			}
-			// Adjust Set-Cookie for iframe usage
+			// Ensure cookies are usable within an iframe by adding Secure and SameSite=None if missing
 			if cookies := resp.Header["Set-Cookie"]; len(cookies) > 0 {
 				adj := make([]string, 0, len(cookies))
 				for _, c := range cookies {
-					adj = append(adj, adjustSetCookie(c))
+					adj = append(adj, ensureCookieIframeOK(c))
 				}
 				resp.Header["Set-Cookie"] = adj
 			}
@@ -577,27 +513,7 @@ func rewriteLocation(loc string, baseHref string) string {
 	return strings.TrimRight(baseHref, "/") + "/" + loc
 }
 
-// adjustSetCookie ensures cookies work in an iframe by adding Secure and SameSite=None if missing.
-// Also set the Partitioned attribute to help in modern browsers for third-party cookies (optional).
-func adjustSetCookie(header string) string {
-	if header == "" {
-		return header
-	}
-	lower := strings.ToLower(header)
-	// Ensure Secure
-	if !strings.Contains(lower, " secure") && !strings.Contains(lower, ";secure") {
-		header += "; Secure"
-	}
-	// Ensure SameSite=None (do not override stricter if present)
-	if !strings.Contains(lower, "samesite=") {
-		header += "; SameSite=None"
-	}
-	// Add Partitioned if not present (safe no-op in browsers that don't support it)
-	if !strings.Contains(lower, "partitioned") {
-		header += "; Partitioned"
-	}
-	return header
-}
+// Note: We no longer rewrite Set-Cookie to avoid interfering with upstream auth flows.
 
 // htmlEscapeTrunc returns an HTML-escaped version of s, truncated to n runes with an ellipsis if needed.
 func htmlEscapeTrunc(s string, n int) string {
@@ -609,4 +525,48 @@ func htmlEscapeTrunc(s string, n int) string {
 		rs = append(rs[:n], '…')
 	}
 	return html.EscapeString(string(rs))
+}
+
+// relaxFrameAncestors updates a CSP string to allow embedding while preserving other directives.
+// If frame-ancestors exists, it's replaced with frame-ancestors *; otherwise it's appended.
+func relaxFrameAncestors(csp string) string {
+	if csp == "" {
+		return "frame-ancestors *"
+	}
+	parts := strings.Split(csp, ";")
+	found := false
+	for i, p := range parts {
+		if strings.Contains(strings.ToLower(p), "frame-ancestors") {
+			parts[i] = " frame-ancestors *"
+			found = true
+		}
+	}
+	if !found {
+		parts = append(parts, " frame-ancestors *")
+	}
+	// Rejoin, trimming redundant whitespace
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		s := strings.TrimSpace(p)
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return strings.Join(out, "; ")
+}
+
+// ensureCookieIframeOK adds Secure and SameSite=None if they are missing.
+// We avoid adding Partitioned or overriding upstream's stricter settings.
+func ensureCookieIframeOK(header string) string {
+	if header == "" {
+		return header
+	}
+	lower := strings.ToLower(header)
+	if !strings.Contains(lower, " secure") && !strings.Contains(lower, ";secure") {
+		header += "; Secure"
+	}
+	if !strings.Contains(lower, "samesite=") {
+		header += "; SameSite=None"
+	}
+	return header
 }
