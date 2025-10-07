@@ -3,6 +3,7 @@ import { z } from 'zod';
 import Card from '../components/Card';
 import Input from '../components/Input';
 import { getImageDefaults, postJob } from '../lib/api';
+import { K8S_DNS_SUFFIX, K8S_NS } from '../lib/config';
 import { pushToast } from '../components/Toaster';
 import { useNavigate } from '@solidjs/router';
 
@@ -50,7 +51,18 @@ export default function Launch() {
     setErrors([]);
     const envObj = Object.fromEntries(env().filter(e=>e.k).map((e)=>[e.k,e.v]));
     const labelsObj = Object.fromEntries(labels().filter(e=>e.k).map((e)=>[e.k,e.v]));
-    const spec = { image: image(), name: name() || undefined, args: args(), env: envObj, labels: labelsObj, resources: { cpu: cpu()||undefined, memory: memory()||undefined }, expose: ports() } as any;
+    // If AGENT_HOST not provided, derive from name and namespace as a Service FQDN
+    const dns1123 = (s: string) => s.toLowerCase().trim().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').replace(/--+/g, '-');
+    const nm = name() || '';
+    const ensureAgentHost = () => {
+      const current = envObj['AGENT_HOST'];
+      if (current && current.trim()) return current.trim();
+      const base = dns1123(nm || 'workload');
+      return `${base}.${K8S_NS}.${K8S_DNS_SUFFIX}`;
+    };
+    if (!envObj['AGENT_HOST']) envObj['AGENT_HOST'] = ensureAgentHost();
+
+    const spec = { image: image(), name: nm || undefined, args: args(), env: envObj, labels: labelsObj, resources: { cpu: cpu()||undefined, memory: memory()||undefined }, expose: ports() } as any;
     const parsed = schema.safeParse({ image: spec.image, name: spec.name, args: spec.args, env: spec.env, labels: spec.labels, cpu: spec.resources.cpu, memory: spec.resources.memory, ports: spec.expose });
     if (!parsed.success) {
       setErrors(parsed.error.issues.map((e) => `${(e.path ?? []).join('.')}: ${e.message}`));

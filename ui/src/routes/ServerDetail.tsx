@@ -19,13 +19,10 @@ export default function ServerDetail() {
     const s = srv();
     if (!s) return '';
     const env = s.env ?? ({} as Record<string, string>);
-    const host = (s as any).node || env['AGENT_HOST'] || env['HOST'] || env['SERVICE_HOST'];
-    if (!host) return '';
-    const ports = (s.ports ?? []).map((p) => p.port);
-    // Use 8080 unless 8443 is explicitly open (for advanced/production use)
-    const port = ports.includes(8443) ? 8443 : 8080;
-    // Agent Caddy serves HTTP; the host reverse proxy sets TLS to the browser. Use scheme=http to upstream.
-    return apiUrl(`/proxy?to=${encodeURIComponent(`${host}:${port}`)}&path=${encodeURIComponent('/')}&scheme=http`);
+    const hostEnv = env['AGENT_HOST'] || env['HOST'] || env['SERVICE_HOST'] || (s as any).node;
+    // Prefer server-aware route that lets backend resolve target flexibly.
+    // Backend will prefer Env.AGENT_HOST, then server.Node or a Service FQDN heuristic.
+    return apiUrl(`/proxy/server/${encodeURIComponent(s.id)}/`);
   });
 
   return (

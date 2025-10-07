@@ -22,6 +22,8 @@ type Options struct {
 	Timeout   time.Duration
 	Dial      func(ctx context.Context, network, address string) (any, error)
 	Logger    *log.Logger
+	// ResolveServer: given a logical server ID and desired subPath, return target scheme, host:port, and normalized path
+	ResolveServer func(ctx context.Context, serverID string, subPath string) (scheme string, hostport string, path string, err error)
 }
 
 type ReverseProxy struct {
@@ -41,21 +43,46 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if to == "" || subPath == "" {
 		if strings.HasPrefix(r.URL.Path, "/proxy/") {
 			suffix := strings.TrimPrefix(r.URL.Path, "/proxy/")
-			// suffix is "{to}/{rest...}" or just "{to}"
-			// Extract first segment as {to}
-			var rest string
-			if i := strings.IndexByte(suffix, '/'); i >= 0 {
-				to, rest = suffix[:i], suffix[i:]
+			// Support /proxy/server/{id}/<rest> form first
+			if strings.HasPrefix(suffix, "server/") && p.opts.ResolveServer != nil {
+				tail := strings.TrimPrefix(suffix, "server/")
+				var id, rest string
+				if i := strings.IndexByte(tail, '/'); i >= 0 {
+					id, rest = tail[:i], tail[i:]
+				} else {
+					id, rest = tail, "/"
+				}
+				if idu, err := url.PathUnescape(id); err == nil {
+					id = idu
+				}
+				if rest == "" {
+					rest = "/"
+				}
+				// Delegate to resolver
+				sch, hostport, path, err := p.opts.ResolveServer(r.Context(), id, rest)
+				if err != nil {
+					http.Error(w, "server resolution failed: "+err.Error(), http.StatusBadGateway)
+					return
+				}
+				scheme = sch
+				to = hostport
+				subPath = path
 			} else {
-				to, rest = suffix, "/"
+				// legacy path-based: /proxy/{to}/{rest}
+				var rest string
+				if i := strings.IndexByte(suffix, '/'); i >= 0 {
+					to, rest = suffix[:i], suffix[i:]
+				} else {
+					to, rest = suffix, "/"
+				}
+				if uTo, err := url.PathUnescape(to); err == nil {
+					to = uTo
+				}
+				if rest == "" {
+					rest = "/"
+				}
+				subPath = rest
 			}
-			if uTo, err := url.PathUnescape(to); err == nil {
-				to = uTo
-			}
-			if rest == "" {
-				rest = "/"
-			}
-			subPath = rest
 		}
 	}
 

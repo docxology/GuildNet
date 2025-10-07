@@ -25,3 +25,8 @@ export async function fetchUiConfig() {
     return {} as Record<string, unknown>
   }
 }
+
+// Optional: Kubernetes namespace to construct default Service FQDNs
+export const K8S_NS = (import.meta.env.VITE_K8S_NAMESPACE as string) || 'default'
+// Optional: Cluster DNS suffix for Services
+export const K8S_DNS_SUFFIX = (import.meta.env.VITE_K8S_DNS_SUFFIX as string) || 'svc.cluster.local'

@@ -85,3 +85,9 @@ require (
 	gvisor.dev/gvisor v0.0.0-20240306221502-ee1e1f6070e3 // indirect
 	nhooyr.io/websocket v1.8.10 // indirect
 )
+
+require (
+	k8s.io/api v0.30.0
+	k8s.io/apimachinery v0.30.0
+	k8s.io/client-go v0.30.0
+)

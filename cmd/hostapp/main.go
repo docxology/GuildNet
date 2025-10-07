@@ -22,9 +22,11 @@ import (
 	"time"
 
 	httpx "github.com/your/module/internal/httpx"
+	"github.com/your/module/internal/k8s"
 	"github.com/your/module/internal/model"
 	"github.com/your/module/internal/proxy"
-	"github.com/your/module/internal/store"
+
+	//"github.com/your/module/internal/store"
 	"github.com/your/module/internal/ts"
 	"github.com/your/module/pkg/config"
 )
@@ -188,9 +190,12 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	// in-memory store for demo endpoints
-	mem := store.New()
-	mem.SeedDemo()
+	// Kubernetes client (Talos cluster required; no local mode)
+	kcli, err := k8s.New(ctx)
+	if err != nil {
+		log.Fatalf("k8s client: %v", err)
+	}
+	const defaultNS = "default"
 
 	// UI config (optional)
 	mux.HandleFunc("/api/ui-config", func(w http.ResponseWriter, r *http.Request) {
@@ -217,13 +222,18 @@ func main() {
 		httpx.JSON(w, http.StatusOK, resp)
 	})
 
-	// servers list
+	// servers list (from Kubernetes)
 	mux.HandleFunc("/api/servers", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		httpx.JSON(w, http.StatusOK, mem.GetServers())
+		svcs, err := kcli.ListServers(r.Context(), defaultNS)
+		if err != nil {
+			httpx.JSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		httpx.JSON(w, http.StatusOK, svcs)
 	})
 
 	// server detail and logs
@@ -236,11 +246,12 @@ func main() {
 		parts := strings.Split(path, "/")
 		id := parts[0]
 		if len(parts) == 1 && r.Method == http.MethodGet {
-			if srv, ok := mem.GetServer(id); ok {
-				httpx.JSON(w, http.StatusOK, srv)
+			srv, err := kcli.GetServer(r.Context(), defaultNS, id)
+			if err != nil {
+				w.WriteHeader(http.StatusNotFound)
 				return
 			}
-			w.WriteHeader(http.StatusNotFound)
+			httpx.JSON(w, http.StatusOK, srv)
 			return
 		}
 		if len(parts) == 2 && parts[1] == "logs" && r.Method == http.MethodGet {
@@ -253,7 +264,7 @@ func main() {
 			if v := q.Get("limit"); v != "" {
 				fmt.Sscanf(v, "%d", &limit)
 			}
-			lines, err := mem.GetLogs(id, level, limit)
+			lines, err := kcli.GetLogs(r.Context(), defaultNS, id, level, limit)
 			if err != nil {
 				httpx.JSONError(w, http.StatusNotFound, err.Error())
 				return
@@ -309,23 +320,12 @@ func main() {
 			}
 			spec.Env["AGENT_HOST"] = host
 		}
-		// For demo: create a server record with accepted status and echo some logs
-		id := fmt.Sprintf("job-%d", time.Now().UnixNano())
-		srv := &model.Server{ID: id, Name: spec.Name, Image: spec.Image, Status: "pending", Ports: spec.Expose, Resources: spec.Resources, Args: spec.Args, Env: spec.Env}
-		if srv.Name == "" {
-			srv.Name = srv.ID
+		name, id, err := kcli.EnsureDeploymentAndService(r.Context(), spec, k8s.EnsureOpts{Namespace: defaultNS})
+		if err != nil {
+			httpx.JSONError(w, http.StatusInternalServerError, err.Error())
+			return
 		}
-		mem.UpsertServer(srv)
-		_, _ = mem.AppendLog(id, "info", "job accepted")
-		if v := spec.Env["AGENT_HOST"]; v != "" {
-			_, _ = mem.AppendLog(id, "debug", fmt.Sprintf("AGENT_HOST=%s", v))
-		}
-		_, _ = mem.AppendLog(id, "debug", "preparing")
-		go func() {
-			time.Sleep(500 * time.Millisecond)
-			mem.UpsertServer(&model.Server{ID: id, Name: srv.Name, Image: srv.Image, Status: "running", Ports: srv.Ports, Resources: srv.Resources, Args: srv.Args, Env: srv.Env})
-			_, _ = mem.AppendLog(id, "info", "container started")
-		}()
+		_ = name
 		httpx.JSON(w, http.StatusAccepted, model.JobAccepted{ID: id, Status: "pending"})
 	})
 
@@ -355,7 +355,7 @@ func main() {
 			httpx.JSONError(w, http.StatusBadRequest, "missing target")
 			return
 		}
-		if _, ok := mem.GetServer(id); !ok {
+		if _, err := kcli.GetServer(r.Context(), defaultNS, id); err != nil {
 			httpx.JSONError(w, http.StatusNotFound, "unknown target")
 			return
 		}
@@ -373,8 +373,8 @@ func main() {
 		log.Printf("sse/logs open: target=%s level=%s tail=%d from %s", id, level, tail, r.RemoteAddr)
 		enc := json.NewEncoder(w)
 
-		// send tail first (best effort)
-		if lines, err := mem.GetLogs(id, level, tail); err != nil {
+		// send tail first (best effort) via k8s logs
+		if lines, err := kcli.GetLogs(r.Context(), defaultNS, id, level, tail); err != nil {
 			log.Printf("sse/logs tail error: target=%s level=%s err=%v", id, level, err)
 		} else {
 			for _, ln := range lines {
@@ -396,8 +396,9 @@ func main() {
 
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
-		ch, unsub := mem.SubscribeLogs(ctx, id, level)
-		defer unsub()
+		// For now, no live watch wired; send heartbeats and rely on polling logs endpoint in UI when needed.
+		ch := make(chan model.LogLine)
+		defer close(ch)
 		heartbeat := time.NewTicker(20 * time.Second)
 		defer heartbeat.Stop()
 		for {
@@ -458,6 +459,49 @@ func main() {
 			return conn, nil
 		},
 		Logger: httpx.Logger(),
+		ResolveServer: func(ctx context.Context, serverID string, subPath string) (string, string, string, error) {
+			// Derive upstream from Kubernetes server metadata
+			srv, err := kcli.GetServer(ctx, defaultNS, serverID)
+			if err != nil {
+				return "", "", "", fmt.Errorf("unknown server: %s", serverID)
+			}
+			// 1) If Env.AGENT_HOST present, allow host[:port] directly
+			if srv.Env != nil {
+				if v := strings.TrimSpace(srv.Env["AGENT_HOST"]); v != "" {
+					// If no port specified, pick from Ports or default 8080
+					if strings.Contains(v, ":") {
+						return "http", v, subPath, nil
+					}
+					p := 8080
+					for _, pr := range srv.Ports {
+						if pr.Port == 8443 {
+							p = 8443
+							break
+						}
+					}
+					return map[int]string{8443: "https", 8080: "http"}[p], net.JoinHostPort(v, fmt.Sprintf("%d", p)), subPath, nil
+				}
+			}
+			// 2) If Ports include a probable HTTP port, assume loopback on server's node name or Kubernetes Service name when available
+			// Attempt a best-effort heuristic:
+			host := strings.TrimSpace(srv.Node)
+			if host == "" && srv.Name != "" {
+				// dns1123 of name as service in default namespace
+				host = dns1123Name(srv.Name) + ".default.svc.cluster.local"
+			}
+			if host != "" {
+				p := 8080
+				for _, pr := range srv.Ports {
+					if pr.Port == 8443 {
+						p = 8443
+						break
+					}
+				}
+				return map[int]string{8443: "https", 8080: "http"}[p], net.JoinHostPort(host, fmt.Sprintf("%d", p)), subPath, nil
+			}
+			// 3) Otherwise fail with guidance
+			return "", "", "", fmt.Errorf("no upstream hint; set Env.AGENT_HOST to a reachable host[:port] or ensure server.ports and node are populated")
+		},
 	})
 	mux.Handle("/proxy", proxyHandler)
 	mux.Handle("/proxy/", proxyHandler)

@@ -11,6 +11,12 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+
+# Load shared env if present (.env at repo root)
+if [ -f "$ROOT/.env" ]; then
+  # shellcheck disable=SC1090
+  . "$ROOT/.env"
+fi
 GEN_CERTS=1
 ORIGIN=${FRONTEND_ORIGIN:-}
 
@@ -50,11 +56,27 @@ fi
 export FRONTEND_ORIGIN="$ORIGIN"
 log "FRONTEND_ORIGIN=$FRONTEND_ORIGIN"
 
-# Ensure config exists (required for tsnet). If missing, launch interactive init.
+# Ensure config exists (required for tsnet). If missing and env is provided, create non-interactively; otherwise run interactive init.
 CFG="$HOME/.guildnet/config.json"
 if [ ! -f "$CFG" ]; then
-  log "Config not found; launching interactive init (requires Login server URL, Pre-auth key, Hostname)"
-  "$ROOT/bin/hostapp" init
+  if [ -n "${TS_LOGIN_SERVER:-}" ] && [ -n "${TS_AUTHKEY:-}" ] && [ -n "${TS_HOSTNAME:-}" ]; then
+    log "Config not found; creating from environment (.env)"
+    mkdir -p "$(dirname "$CFG")"
+    cat >"$CFG" <<JSON
+{
+  "login_server": "${TS_LOGIN_SERVER}",
+  "auth_key": "${TS_AUTHKEY}",
+  "hostname": "${TS_HOSTNAME}",
+  "listen_local": "${LISTEN_LOCAL}",
+  "dial_timeout_ms": 3000,
+  "allowlist": [],
+  "name": "${CLUSTER_NAME:-}"
+}
+JSON
+  else
+    log "Config not found; launching interactive init (requires Login server URL, Pre-auth key, Hostname)"
+    "$ROOT/bin/hostapp" init
+  fi
 # Tailscale (tsnet) is mandatory; ensure config/init provides LoginServer/AuthKey/Hostname.
 fi
 
