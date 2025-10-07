@@ -53,7 +53,7 @@ func Logging(next http.Handler) http.Handler {
 	})
 }
 
-type respWriter struct{
+type respWriter struct {
 	http.ResponseWriter
 	code int
 }
@@ -78,7 +78,9 @@ const reqIDKey ctxKey = "req_id"
 
 func ReqIDFromCtx(ctx context.Context) string {
 	if v := ctx.Value(reqIDKey); v != nil {
-		if s, ok := v.(string); ok { return s }
+		if s, ok := v.(string); ok {
+			return s
+		}
 	}
 	return ""
 }
