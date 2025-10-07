@@ -5,9 +5,11 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
 	"net"
@@ -15,15 +17,19 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	httpx "github.com/your/module/internal/httpx"
+	"github.com/your/module/internal/model"
 	"github.com/your/module/internal/proxy"
+	"github.com/your/module/internal/store"
 	"github.com/your/module/internal/ts"
-	ws "github.com/your/module/internal/ws"
 	"github.com/your/module/pkg/config"
 )
+
+// WebSocket removed; SSE-only
 
 // ensureSelfSigned creates a minimal self-signed certificate if not present.
 func ensureSelfSigned(dir, certPath, keyPath string) error {
@@ -49,6 +55,10 @@ func ensureSelfSigned(dir, certPath, keyPath string) error {
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 		DNSNames:              []string{"localhost"},
+	}
+	// Add 127.0.0.1 to IP SANs for dev UX
+	if ip := net.ParseIP("127.0.0.1"); ip != nil {
+		tmpl.IPAddresses = append(tmpl.IPAddresses, ip)
 	}
 	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
 	if err != nil {
@@ -126,60 +136,156 @@ func main() {
 		log.Fatalf("tsnet start: %v", err)
 	}
 	tsServer := s
-	defer tsServer.Close()
-
-	// Fetch TS info asynchronously
-	go func() {
-		infoCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		tsInfo, err := ts.Info(infoCtx, tsServer)
-		if err != nil {
-			log.Printf("tsnet info error: %v", err)
-			return
-		}
-		if tsInfo != nil {
-			log.Printf("tailscale up: ip=%s fqdn=%s", tsInfo.IP, tsInfo.FQDN)
-		}
-	}()
 
 	mux := http.NewServeMux()
 
-	// healthz
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		httpx.JSON(w, http.StatusOK, map[string]any{"status": "ok"})
+	// in-memory store for demo endpoints
+	mem := store.New()
+	mem.SeedDemo()
+
+	// UI config (optional)
+	mux.HandleFunc("/api/ui-config", func(w http.ResponseWriter, r *http.Request) {
+		httpx.JSON(w, http.StatusOK, map[string]any{"name": cfg.Name})
 	})
 
-	// ping handler
-	mux.HandleFunc("/api/ping", func(w http.ResponseWriter, r *http.Request) {
-		addr := r.URL.Query().Get("addr")
-		if addr == "" {
-			httpx.JSONError(w, http.StatusBadRequest, "missing addr")
+	// servers list
+	mux.HandleFunc("/api/servers", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		if !al.AllowedAddr(addr) {
-			httpx.JSONError(w, http.StatusForbidden, "addr not allowlisted")
+		httpx.JSON(w, http.StatusOK, mem.GetServers())
+	})
+
+	// server detail and logs
+	mux.HandleFunc("/api/servers/", func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/api/servers/")
+		if path == "" {
+			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		start := time.Now()
-		dctx, cancel := context.WithTimeout(r.Context(), time.Duration(cfg.DialTimeoutMS)*time.Millisecond)
-		defer cancel()
-		conn, err := ts.DialContext(dctx, tsServer, "tcp", addr)
+		parts := strings.Split(path, "/")
+		id := parts[0]
+		if len(parts) == 1 && r.Method == http.MethodGet {
+			if srv, ok := mem.GetServer(id); ok {
+				httpx.JSON(w, http.StatusOK, srv)
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if len(parts) == 2 && parts[1] == "logs" && r.Method == http.MethodGet {
+			q := r.URL.Query()
+			level := q.Get("level")
+			if level == "" {
+				level = "info"
+			}
+			limit := 200
+			if v := q.Get("limit"); v != "" {
+				fmt.Sscanf(v, "%d", &limit)
+			}
+			lines, err := mem.GetLogs(id, level, limit)
+			if err != nil {
+				httpx.JSONError(w, http.StatusNotFound, err.Error())
+				return
+			}
+			httpx.JSON(w, http.StatusOK, lines)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	// jobs
+	mux.HandleFunc("/api/jobs", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		b, err := io.ReadAll(r.Body)
 		if err != nil {
-			httpx.JSON(w, http.StatusBadGateway, map[string]any{
-				"addr":   addr,
-				"ok":     false,
-				"error":  err.Error(),
-				"rtt_ms": int(time.Since(start).Milliseconds()),
-			})
+			httpx.JSONError(w, http.StatusBadRequest, "bad body")
 			return
 		}
-		_ = conn.Close()
-		httpx.JSON(w, http.StatusOK, map[string]any{
-			"addr":   addr,
-			"ok":     true,
-			"error":  "",
-			"rtt_ms": int(time.Since(start).Milliseconds()),
-		})
+		defer r.Body.Close()
+		var spec model.JobSpec
+		if err := json.Unmarshal(b, &spec); err != nil || spec.Image == "" {
+			httpx.JSONError(w, http.StatusBadRequest, "invalid spec")
+			return
+		}
+		// For demo: create a server record with accepted status and echo some logs
+		id := fmt.Sprintf("job-%d", time.Now().UnixNano())
+		srv := &model.Server{ID: id, Name: spec.Name, Image: spec.Image, Status: "pending", Ports: spec.Expose, Resources: spec.Resources, Args: spec.Args, Env: spec.Env}
+		if srv.Name == "" {
+			srv.Name = srv.ID
+		}
+		mem.UpsertServer(srv)
+		_, _ = mem.AppendLog(id, "info", "job accepted")
+		_, _ = mem.AppendLog(id, "debug", "preparing")
+		go func() {
+			time.Sleep(500 * time.Millisecond)
+			mem.UpsertServer(&model.Server{ID: id, Name: srv.Name, Image: srv.Image, Status: "running", Ports: srv.Ports, Resources: srv.Resources, Args: srv.Args, Env: srv.Env})
+			_, _ = mem.AppendLog(id, "info", "container started")
+		}()
+		httpx.JSON(w, http.StatusAccepted, model.JobAccepted{ID: id, Status: "pending"})
+	})
+
+	// logs SSE
+	mux.HandleFunc("/sse/logs", func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+		q := r.URL.Query()
+		id := q.Get("target")
+		level := q.Get("level")
+		if level == "" {
+			level = "info"
+		}
+		tail := 200
+		if v := q.Get("tail"); v != "" {
+			fmt.Sscanf(v, "%d", &tail)
+		}
+		log.Printf("sse/logs open: target=%s level=%s tail=%d from %s", id, level, tail, r.RemoteAddr)
+		enc := json.NewEncoder(w)
+		// send tail first
+		if id != "" {
+			if lines, err := mem.GetLogs(id, level, tail); err == nil {
+				for _, ln := range lines {
+					_, _ = w.Write([]byte("data: "))
+					_ = enc.Encode(ln)
+					_, _ = w.Write([]byte("\n"))
+					flusher.Flush()
+				}
+			}
+		}
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+		ch, unsub := mem.SubscribeLogs(ctx, id, level)
+		defer unsub()
+		heartbeat := time.NewTicker(20 * time.Second)
+		defer heartbeat.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-heartbeat.C:
+				_, _ = w.Write([]byte(": ping\n\n")) // comment as heartbeat
+				flusher.Flush()
+			case ln, ok := <-ch:
+				if !ok {
+					return
+				}
+				_, _ = w.Write([]byte("data: "))
+				_ = enc.Encode(ln)
+				_, _ = w.Write([]byte("\n"))
+				flusher.Flush()
+			}
+		}
 	})
 
 	// proxy handler
@@ -198,9 +304,6 @@ func main() {
 	})
 	mux.Handle("/proxy", proxyHandler)
 
-	// websocket echo
-	mux.HandleFunc("/ws/echo", ws.EchoHandler)
-
 	// Wrap with middleware (logging, request id, CORS)
 	corsOrigin := os.Getenv("FRONTEND_ORIGIN")
 	if corsOrigin == "" {
@@ -208,13 +311,15 @@ func main() {
 	}
 	handler := httpx.RequestID(httpx.Logging(httpx.CORS(corsOrigin)(mux)))
 
-	// Certs: prefer repo ./certs/dev.crt|dev.key if present; else use ~/.guildnet/state/certs
-	repoCert := filepath.Join("certs", "dev.crt")
-	repoKey := filepath.Join("certs", "dev.key")
+	// Certs: prefer repo CA-signed ./certs/server.crt|server.key, then ./certs/dev.crt|dev.key; else use ~/.guildnet/state/certs
 	var certFile, keyFile string
-	if _, err := os.Stat(repoCert); err == nil {
-		certFile = repoCert
-		keyFile = repoKey
+	if _, err := os.Stat(filepath.Join("certs", "server.crt")); err == nil {
+		certFile = filepath.Join("certs", "server.crt")
+		keyFile = filepath.Join("certs", "server.key")
+		log.Printf("using repo server certs: %s", certFile)
+	} else if _, err := os.Stat(filepath.Join("certs", "dev.crt")); err == nil {
+		certFile = filepath.Join("certs", "dev.crt")
+		keyFile = filepath.Join("certs", "dev.key")
 		log.Printf("using repo dev certs: %s", certFile)
 	} else {
 		certDir := filepath.Join(config.StateDir(), "certs")
@@ -225,13 +330,25 @@ func main() {
 		}
 	}
 
-	// local server (TLS only)
+	// local server (TLS only) - also try an IPv6 localhost listener if applicable
 	localSrv := &http.Server{
 		Addr:         cfg.ListenLocal,
 		Handler:      handler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  60 * time.Second,
+	}
+	var v6Srv *http.Server
+	if host, port, err := net.SplitHostPort(cfg.ListenLocal); err == nil {
+		if host == "127.0.0.1" || strings.EqualFold(host, "localhost") {
+			v6Srv = &http.Server{
+				Addr:         net.JoinHostPort("::1", port),
+				Handler:      handler,
+				ReadTimeout:  10 * time.Second,
+				WriteTimeout: 10 * time.Second,
+				IdleTimeout:  60 * time.Second,
+			}
+		}
 	}
 
 	// tsnet listener server
@@ -252,8 +369,11 @@ func main() {
 		}
 	}
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 	go func() { errCh <- localSrv.ListenAndServeTLS(certFile, keyFile) }()
+	if v6Srv != nil {
+		go func() { errCh <- v6Srv.ListenAndServeTLS(certFile, keyFile) }()
+	}
 	go func() { errCh <- tsSrv.ServeTLS(ln, certFile, keyFile) }()
 	log.Printf("serving TLS on local %s and tailscale listener :443", cfg.ListenLocal)
 
@@ -262,6 +382,9 @@ func main() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = localSrv.Shutdown(shutdownCtx)
+		if v6Srv != nil {
+			_ = v6Srv.Shutdown(shutdownCtx)
+		}
 		_ = tsSrv.Shutdown(shutdownCtx)
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {

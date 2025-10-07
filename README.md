@@ -18,12 +18,12 @@ It includes:
   - `GET /healthz` – liveness
   - `GET /api/ping?addr=<host-or-ip>:<port>` – TCP dial RTT over tsnet dialer with allowlist enforcement
   - `GET /proxy?to=<ip:port>&path=/...` – reverse proxy to in-cluster HTTP, allowlist-gated
-  - `WS /ws/echo` – WebSocket echo (dev/test)
+  - `GET /sse/logs` – Server-Sent Events stream for logs
 - UI features (SolidJS):
   - Servers list and detail pages
-  - Logs stream (WebSocket) and historic log fetch
+  - Logs stream (SSE) and historic log fetch
   - Launch form with presets (includes the GuildNet Agent image), env/labels, ports, and resource hints
-  - API/WS base configurable via `VITE_API_BASE`/`VITE_WS_BASE`
+  - API base configurable via `VITE_API_BASE`
 - Agent image (images/agent):
   - code-server behind Caddy with iframe-friendly headers (CSP frame-ancestors, removes X-Frame-Options)
   - Single port (default 8080) exposed; code-server listens on loopback and is proxied by Caddy
@@ -32,8 +32,8 @@ It includes:
   - Volumes: `/workspace` and `/data`
   - Example K8s manifest: `k8s/agent-example.yaml`
 - HTTPS-first dev experience:
-  - Backend serves HTTPS locally with a self-signed cert (or your own)
-  - Vite dev server uses HTTPS (self-signed or provided)
+  - Backend serves HTTPS locally with repo CA-signed certs (or self-signed fallback)
+  - Vite dev server uses HTTPS with the same repo certs when available
   - Script to generate a shared local CA and issue certs for both sides
 
 ## Quick start (Tailscale required)
@@ -59,9 +59,7 @@ make build && scripts/generate-certs.sh && FRONTEND_ORIGIN=https://localhost:517
 ```bash
 cd ui
 npm install
-VITE_API_BASE=https://127.0.0.1:8080 \
-VITE_WS_BASE=wss://127.0.0.1:8080 \
-npm run dev
+VITE_API_BASE=https://127.0.0.1:8080 npm run dev
 ```
 
 4) Verify it works
@@ -73,7 +71,6 @@ curl -k https://127.0.0.1:8080/healthz
 ```
 
 - `VITE_API_BASE=https://127.0.0.1:8080` (or your host app URL)
-- `VITE_WS_BASE=wss://127.0.0.1:8080`
 
 ## Agent image (code-server + Caddy)
 
@@ -119,11 +116,11 @@ Reverse proxy:
 curl -k 'https://127.0.0.1:8080/proxy?to=10.96.0.1:443&path=/'
 ```
 
-WebSocket echo:
+Logs SSE stream:
 
 ```bash
-# Using wscat (install with npm i -g wscat)
-wscat -c wss://127.0.0.1:8080/ws/echo --no-check
+# Tail and stream logs for a target server id
+curl -Nk 'https://127.0.0.1:8080/sse/logs?target=demo-1&level=info&tail=50'
 ```
 
 ## Optional: run a local Headscale (dev only)

@@ -8,16 +8,15 @@ export default defineConfig({
   server: {
     port: 5173,
     https: (() => {
-      // Prefer repo certs if present
-      const repoCrt = path.resolve(process.cwd(), '../certs/dev.crt')
-      const repoKey = path.resolve(process.cwd(), '../certs/dev.key')
+      const repoCrt = path.resolve(process.cwd(), '../certs/server.crt')
+      const repoKey = path.resolve(process.cwd(), '../certs/server.key')
       if (fs.existsSync(repoCrt) && fs.existsSync(repoKey)) {
         return {
           cert: fs.readFileSync(repoCrt),
           key: fs.readFileSync(repoKey)
         } as any
       }
-      return true // Vite will create a self-signed cert
+      return true // Last resort: Vite self-signed
     })()
   },
   build: {

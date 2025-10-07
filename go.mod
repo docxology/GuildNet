@@ -2,10 +2,7 @@ module github.com/your/module
 
 go 1.22.0
 
-require (
-	nhooyr.io/websocket v1.8.11
-	tailscale.com v1.66.4
-)
+require tailscale.com v1.66.4
 
 require (
 	filippo.io/edwards25519 v1.1.0 // indirect
@@ -86,4 +83,5 @@ require (
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	golang.zx2c4.com/wireguard/windows v0.5.3 // indirect
 	gvisor.dev/gvisor v0.0.0-20240306221502-ee1e1f6070e3 // indirect
+	nhooyr.io/websocket v1.8.10 // indirect
 )

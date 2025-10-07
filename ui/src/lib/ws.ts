@@ -1,5 +1,5 @@
 import type { LogLine } from './types';
-import { wsUrl } from './config';
+import { apiUrl } from './config';
 
 type WSState = 'connecting' | 'open' | 'closed' | 'reconnecting' | 'error';
 
@@ -22,7 +22,7 @@ class Emitter {
 
 export class WSManager extends Emitter {
   private url: string;
-  private ws?: WebSocket;
+  private es?: EventSource; // SSE only
   private state: WSState = 'closed';
   private retries = 0;
   private maxRetries = 10;
@@ -45,33 +45,40 @@ export class WSManager extends Emitter {
     this.state = this.retries > 0 ? 'reconnecting' : 'connecting';
     this.emit('state', this.state, this.retries);
     try {
-      this.ws = new WebSocket(this.url);
+      // Dev diagnostics
+      try { console.info('[SSE] connecting', this.url); } catch {}
+      this.es = new EventSource(this.url);
     } catch (e) {
       this.fail(e instanceof Error ? e.message : String(e));
       return;
     }
-    this.ws.onopen = () => {
+    // Mark open on first message, since EventSource has no explicit onopen in all browsers
+    const markOpenOnce = () => {
+      if (this.state !== 'open') {
+        this.state = 'open';
+        this.retries = 0;
+        this.emit('state', this.state, this.retries);
+      }
+    };
+    (this.es as EventSource).onopen = () => {
+      try { console.info('[SSE] open', this.url); } catch {}
       this.state = 'open';
       this.retries = 0;
       this.emit('state', this.state, this.retries);
-      this.startHeartbeat();
     };
-    this.ws.onmessage = (ev) => {
-      if (typeof ev.data === 'string') {
-        if (ev.data === 'pong') { this.lastPong = Date.now(); return; }
-        try {
-          const obj = JSON.parse(ev.data);
-          this.emit('message', obj);
-        } catch {
-          // ignore malformed line
-        }
-      }
+    const onMessage = (text: string) => {
+      markOpenOnce();
+      try {
+        const obj = JSON.parse(text);
+        this.emit('message', obj);
+      } catch {}
     };
-    this.ws.onerror = () => {
-      this.fail('ws error');
+    if (this.es) this.es.onmessage = (ev) => {
+      if (typeof ev.data === 'string') onMessage(ev.data);
     };
-    this.ws.onclose = () => {
-      this.fail('ws closed');
+    if (this.es) this.es.onerror = (ev) => {
+      try { console.error('[SSE] error', ev); } catch {}
+      this.fail('sse error');
     };
   }
 
@@ -92,15 +99,8 @@ export class WSManager extends Emitter {
   }
 
   private startHeartbeat() {
-    this.stopHeartbeat();
-    this.lastPong = Date.now();
-    this.heartbeatTimer = window.setInterval(() => {
-      if (!this.ws || this.state !== 'open') return;
-      try { this.ws.send('ping'); } catch {}
-      if (Date.now() - this.lastPong > this.heartbeatInterval * 2) {
-        try { this.ws.close(); } catch {}
-      }
-    }, this.heartbeatInterval) as unknown as number;
+  // No-op for SSE (kept for API compatibility). The server sends a heartbeat comment.
+  this.stopHeartbeat();
   }
 
   private stopHeartbeat() {
@@ -111,20 +111,20 @@ export class WSManager extends Emitter {
   close() {
     this.cleanup();
     this.state = 'closed';
-    try { this.ws?.close(); } catch {}
+  try { this.es?.close(); } catch {}
     this.emit('state', this.state, this.retries);
   }
 
   private cleanup() {
     if (this.connectTimer) window.clearTimeout(this.connectTimer);
     this.connectTimer = undefined;
-    this.stopHeartbeat();
+  this.es = undefined;
   }
 }
 
 export function openLogsStream(params: { target: string; level: 'info' | 'debug' | 'error'; tail?: number }) {
   const qs = new URLSearchParams({ target: params.target, level: params.level, tail: String(params.tail ?? 200) });
-  const url = wsUrl(`/ws/logs?${qs.toString()}`);
+  const url = apiUrl(`/sse/logs?${qs.toString()}`);
   const ws = new WSManager(url);
   return ws;
 }
