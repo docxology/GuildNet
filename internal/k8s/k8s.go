@@ -10,6 +10,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
@@ -248,7 +249,95 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 			return "", "", err
 		}
 	}
+	// Optionally ensure an Ingress per workspace if domain is configured
+	if dom := strings.TrimSpace(os.Getenv("WORKSPACE_DOMAIN")); dom != "" {
+		host := fmt.Sprintf("%s.%s", id, dom)
+		tlsSec := strings.TrimSpace(os.Getenv("WORKSPACE_TLS_SECRET"))
+		iclass := strings.TrimSpace(os.Getenv("INGRESS_CLASS_NAME"))
+		anns := map[string]string{
+			"nginx.ingress.kubernetes.io/enable-websocket":   "true",
+			"nginx.ingress.kubernetes.io/proxy-read-timeout": "3600",
+			"nginx.ingress.kubernetes.io/proxy-send-timeout": "3600",
+			"nginx.ingress.kubernetes.io/backend-protocol":   "HTTP",
+		}
+		// If a cert-manager issuer is provided, request a per-host cert
+		if iss := strings.TrimSpace(os.Getenv("CERT_MANAGER_ISSUER")); iss != "" && tlsSec == "" {
+			anns["cert-manager.io/cluster-issuer"] = iss
+			tlsSec = fmt.Sprintf("workspace-%s-tls", id)
+		}
+		if v := strings.TrimSpace(os.Getenv("INGRESS_AUTH_URL")); v != "" {
+			anns["nginx.ingress.kubernetes.io/auth-url"] = v
+		}
+		if v := strings.TrimSpace(os.Getenv("INGRESS_AUTH_SIGNIN")); v != "" {
+			anns["nginx.ingress.kubernetes.io/auth-signin"] = v
+		}
+		// OwnerRef to the Deployment
+		owner := metav1.OwnerReference{APIVersion: "apps/v1", Kind: "Deployment", Name: name, UID: ""}
+		_ = owner
+		// We can’t easily get UID without a get; do a best-effort without owner for MVP
+		if err := c.EnsureIngress(ctx, ns, name, host, name, 8080, tlsSec, anns, iclass, metav1.OwnerReference{}); err != nil {
+			return name, id, err
+		}
+	}
 	return name, id, nil
+}
+
+// EnsureIngress creates/updates an Ingress mapping host -> service:port with optional TLS and annotations.
+func (c *Client) EnsureIngress(ctx context.Context, ns, name, host, service string, port int32, tlsSecret string, annotations map[string]string, ingressClass string, owner metav1.OwnerReference) error {
+	ing := &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        name,
+			Namespace:   ns,
+			Annotations: annotations,
+			Labels:      map[string]string{"app": name, "guildnet.io/managed": "true"},
+			OwnerReferences: func() []metav1.OwnerReference {
+				if owner.Name == "" {
+					return nil
+				}
+				ow := owner
+				ow.Controller = func() *bool { b := true; return &b }()
+				ow.BlockOwnerDeletion = func() *bool { b := true; return &b }()
+				return []metav1.OwnerReference{ow}
+			}(),
+		},
+		Spec: networkingv1.IngressSpec{
+			IngressClassName: func() *string {
+				if ingressClass == "" {
+					return nil
+				}
+				v := ingressClass
+				return &v
+			}(),
+			Rules: []networkingv1.IngressRule{{
+				Host: host,
+				IngressRuleValue: networkingv1.IngressRuleValue{HTTP: &networkingv1.HTTPIngressRuleValue{Paths: []networkingv1.HTTPIngressPath{{
+					Path: "/",
+				}}}},
+			}},
+		},
+	}
+	// Build backend and TLS separately to keep code readable
+	pt := networkingv1.PathTypePrefix
+	ing.Spec.Rules[0].HTTP.Paths[0].PathType = &pt
+	ing.Spec.Rules[0].HTTP.Paths[0].Backend = networkingv1.IngressBackend{
+		Service: &networkingv1.IngressServiceBackend{
+			Name: service,
+			Port: networkingv1.ServiceBackendPort{Number: port},
+		},
+	}
+	if tlsSecret != "" {
+		ing.Spec.TLS = []networkingv1.IngressTLS{{
+			Hosts:      []string{host},
+			SecretName: tlsSecret,
+		}}
+	}
+
+	if _, err := c.K.NetworkingV1().Ingresses(ns).Get(ctx, name, metav1.GetOptions{}); err == nil {
+		_, err = c.K.NetworkingV1().Ingresses(ns).Update(ctx, ing, metav1.UpdateOptions{})
+		return err
+	}
+	_, err := c.K.NetworkingV1().Ingresses(ns).Create(ctx, ing, metav1.CreateOptions{})
+	return err
 }
 
 // ListServers returns Deployments managed by GuildNet mapped into model.Server.
@@ -284,14 +373,19 @@ func (c *Client) ListServers(ctx context.Context, ns string) ([]*model.Server, e
 				env[e.Name] = e.Value
 			}
 		}
-		out = append(out, &model.Server{
+		s := &model.Server{
 			ID:     id,
 			Name:   d.Name,
 			Image:  firstImage(d),
 			Status: status,
 			Ports:  ports,
 			Env:    env,
-		})
+		}
+		// Compute URL if workspace domain configured via env (read here to avoid config import)
+		if dom := strings.TrimSpace(os.Getenv("WORKSPACE_DOMAIN")); dom != "" {
+			s.URL = fmt.Sprintf("https://%s.%s/", id, dom)
+		}
+		out = append(out, s)
 	}
 	return out, nil
 }

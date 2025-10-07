@@ -4,20 +4,24 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
 )
 
 type Config struct {
-	LoginServer   string   `json:"login_server"`
-	AuthKey       string   `json:"auth_key"`
-	Hostname      string   `json:"hostname"`
-	ListenLocal   string   `json:"listen_local"`
-	DialTimeoutMS int      `json:"dial_timeout_ms"`
-	Allowlist     []string `json:"allowlist"`
-	Name          string   `json:"name,omitempty"`
+	LoginServer   string `json:"login_server"`
+	AuthKey       string `json:"auth_key"`
+	Hostname      string `json:"hostname"`
+	ListenLocal   string `json:"listen_local"`
+	DialTimeoutMS int    `json:"dial_timeout_ms"`
+	Name          string `json:"name,omitempty"`
+	// Optional: per-workspace ingress exposure
+	WorkspaceDomain    string `json:"workspace_domain,omitempty"`
+	IngressClassName   string `json:"ingress_class_name,omitempty"`
+	WorkspaceTLSSecret string `json:"workspace_tls_secret,omitempty"`
+	IngressAuthURL     string `json:"ingress_auth_url,omitempty"`
+	IngressAuthSignin  string `json:"ingress_auth_signin,omitempty"`
 }
 
 func homeDir() string {
@@ -41,6 +45,22 @@ func Load() (*Config, error) {
 	var c Config
 	if err := json.Unmarshal(b, &c); err != nil {
 		return nil, err
+	}
+	// Environment overrides for convenience
+	if v := strings.TrimSpace(os.Getenv("WORKSPACE_DOMAIN")); v != "" {
+		c.WorkspaceDomain = v
+	}
+	if v := strings.TrimSpace(os.Getenv("INGRESS_CLASS_NAME")); v != "" {
+		c.IngressClassName = v
+	}
+	if v := strings.TrimSpace(os.Getenv("WORKSPACE_TLS_SECRET")); v != "" {
+		c.WorkspaceTLSSecret = v
+	}
+	if v := strings.TrimSpace(os.Getenv("INGRESS_AUTH_URL")); v != "" {
+		c.IngressAuthURL = v
+	}
+	if v := strings.TrimSpace(os.Getenv("INGRESS_AUTH_SIGNIN")); v != "" {
+		c.IngressAuthSignin = v
 	}
 	return &c, nil
 }
@@ -69,22 +89,6 @@ func (c *Config) Validate() error {
 	}
 	if c.DialTimeoutMS <= 0 || c.DialTimeoutMS > 60000 {
 		return fmt.Errorf("dial_timeout_ms out of range: %d", c.DialTimeoutMS)
-	}
-	// validate allowlist entries
-	for _, it := range c.Allowlist {
-		it = strings.TrimSpace(it)
-		if it == "" {
-			continue
-		}
-		if strings.Contains(it, "/") {
-			if _, _, err := net.ParseCIDR(it); err != nil {
-				return fmt.Errorf("invalid cidr %q", it)
-			}
-			continue
-		}
-		if h, p, ok := strings.Cut(it, ":"); !ok || h == "" || p == "" {
-			return fmt.Errorf("invalid allowlist item %q", it)
-		}
 	}
 	return nil
 }

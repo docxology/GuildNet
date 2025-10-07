@@ -14,14 +14,11 @@ export default function ServerDetail() {
   const [tab, setTab] = createSignal<'info'|'debug'|'error'|'ide'>('info');
   const [srv] = createResource(() => params.id, (id: string) => getServer(id));
 
-  // Always use 8080 for agent iframe unless 8443 is explicitly open (rare in dev)
+  // Prefer external ingress URL when present; fallback to internal proxy
   const ideUrl = createMemo(() => {
     const s = srv();
     if (!s) return '';
-    const env = s.env ?? ({} as Record<string, string>);
-    const hostEnv = env['AGENT_HOST'] || env['HOST'] || env['SERVICE_HOST'] || (s as any).node;
-    // Prefer server-aware route that lets backend resolve target flexibly.
-    // Backend will prefer Env.AGENT_HOST, then server.Node or a Service FQDN heuristic.
+    if (s.url && s.url.startsWith('https://')) return s.url;
     return apiUrl(`/proxy/server/${encodeURIComponent(s.id)}/`);
   });
 
@@ -68,18 +65,27 @@ export default function ServerDetail() {
                 <LogViewer serverId={server().id} level="error" />
               )}
               {tab() === 'ide' && (
-                <Show when={ideUrl()} fallback={<div class="text-sm text-neutral-500">IDE not available. Ensure this agent exposes port 8443 and has a node address.</div>}>
-                  {(url) => (
-                    <div class="border rounded-md overflow-hidden h-[70vh]">
-                      <iframe
-                        src={url()}
-                        title="code-server"
-                        class="w-full h-full bg-white"
-                        referrerpolicy="no-referrer"
-                        allow="clipboard-read; clipboard-write;"
-                      />
-                    </div>
-                  )}
+                <Show when={ideUrl()} fallback={<div class="text-sm text-neutral-500">IDE not available.</div>}>
+                  {(url) => {
+                    const [loaded, setLoaded] = createSignal(false);
+                    return (
+                      <div class="relative border rounded-md overflow-hidden h-[70vh]">
+                        <iframe
+                          src={url()}
+                          title="code-server"
+                          class="w-full h-full bg-white"
+                          referrerpolicy="no-referrer"
+                          allow="clipboard-read; clipboard-write;"
+                          onLoad={() => setLoaded(true)}
+                        />
+                        <Show when={!loaded()}>
+                          <div class="absolute inset-0 flex items-center justify-center bg-white/70 text-sm text-neutral-600">
+                            Opening IDE…
+                          </div>
+                        </Show>
+                      </div>
+                    );
+                  }}
                 </Show>
               )}
           </Card>

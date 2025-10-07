@@ -193,6 +193,11 @@ func main() {
 		defaultNS = "default"
 	}
 
+	// Default workspace ingress knobs for dev: don't force a domain; use UI internal proxy unless explicitly configured.
+	if os.Getenv("INGRESS_CLASS_NAME") == "" {
+		os.Setenv("INGRESS_CLASS_NAME", "nginx")
+	}
+
 	// UI config (optional)
 	mux.HandleFunc("/api/ui-config", func(w http.ResponseWriter, r *http.Request) {
 		httpx.JSON(w, http.StatusOK, map[string]any{"name": cfg.Name})

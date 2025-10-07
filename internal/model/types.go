@@ -25,6 +25,7 @@ type Server struct {
 	Args      []string          `json:"args,omitempty"`
 	Env       map[string]string `json:"env,omitempty"`
 	Events    []Event           `json:"events,omitempty"`
+	URL       string            `json:"url,omitempty"`
 }
 
 type Event struct {

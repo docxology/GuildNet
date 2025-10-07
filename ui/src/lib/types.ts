@@ -8,6 +8,7 @@ export type Server = {
   node?: string;
   created_at?: string;
   updated_at?: string;
+  url?: string;
   ports?: Port[];
   resources?: { cpu?: string; memory?: string };
   args?: string[];

@@ -1,0 +1,38 @@
+# MVP prerequisites for per-workspace ingress
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: you@example.com
+    privateKeySecretRef:
+      name: letsencrypt-staging
+    solvers:
+    - http01:
+        ingress:
+          class: nginx
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: workspaces-wildcard
+  namespace: default
+spec:
+  secretName: workspaces-wildcard-tls
+  issuerRef:
+    name: letsencrypt-staging
+    kind: ClusterIssuer
+  commonName: "*.workspaces.dev.example.com"
+  dnsNames:
+  - "*.workspaces.dev.example.com"
+---
+# oauth2-proxy is assumed deployed and exposed at oauth2-proxy.workspaces.dev.example.com
+# Set these envs for the backend before running:
+#   WORKSPACE_DOMAIN=workspaces.dev.example.com
+#   INGRESS_CLASS_NAME=nginx
+#   WORKSPACE_TLS_SECRET=workspaces-wildcard-tls
+#   INGRESS_AUTH_URL=https://oauth2-proxy.workspaces.dev.example.com/oauth2/auth
+#   INGRESS_AUTH_SIGNIN=https://oauth2-proxy.workspaces.dev.example.com/oauth2/start?rd=$scheme://$host$request_uri

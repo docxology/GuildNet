@@ -158,8 +158,9 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					if serverIDForAPI != "" {
 						dummy.Header.Set("X-Guild-Server-ID", serverIDForAPI)
 					}
-					setDirector(dummy, c.sch, c.hp, "/healthz")
-					headReq, _ := http.NewRequestWithContext(ctx, http.MethodHead, dummy.URL.String(), nil)
+					// Probe root path so it's valid whether Caddy is up or code-server serves directly
+					setDirector(dummy, c.sch, c.hp, "/")
+					headReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, dummy.URL.String(), nil)
 					headReq.Header = make(http.Header)
 					if serverIDForAPI != "" {
 						headReq.Header.Set("X-Guild-Server-ID", serverIDForAPI)
@@ -181,8 +182,9 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 						dummy2.Header.Set("X-Guild-Server-ID", serverIDForAPI)
 					}
 					dummy2.Header.Set("X-Guild-Prefer-Pod", "1")
-					setDirector(dummy2, c.sch, c.hp, "/healthz")
-					headReq2, _ := http.NewRequestWithContext(ctx, http.MethodHead, dummy2.URL.String(), nil)
+					// Probe root path on pods proxy as well
+					setDirector(dummy2, c.sch, c.hp, "/")
+					headReq2, _ := http.NewRequestWithContext(ctx, http.MethodGet, dummy2.URL.String(), nil)
 					headReq2.Header = make(http.Header)
 					if serverIDForAPI != "" {
 						headReq2.Header.Set("X-Guild-Server-ID", serverIDForAPI)
