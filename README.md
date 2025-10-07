@@ -94,6 +94,19 @@ docker run --rm \
 
 Open http://localhost:8080 for code-server; check /healthz. Headers allow iframe embedding (`frame-ancestors 'self' *`).
 
+### Default dev allowlist
+
+
+**Default agent port:** The agent always exposes code-server via Caddy on port 8080 (HTTP, iframe-friendly). The UI and backend will auto-detect and use this port.
+
+**Agent host normalization:** If the server record provides a bare `AGENT_HOST` like `agent`, the UI will resolve it as `agent.<namespace>.svc.cluster.local` (default namespace `default`, override with `VITE_K8S_NAMESPACE`). You can also set `AGENT_HOST` to a FQDN (Service DNS or Pod IP) explicitly in deployments.
+
+**Allowlist disabled (prototype mode):**
+
+For prototyping, the allowlist is disabled and any agent/port is reachable via the proxy and ping endpoints. When you need security, re-enable the allowlist in the backend.
+
+To customize, edit `~/.guildnet/config.json` and set `allowlist` explicitly (CIDRs and/or `host:port` entries). When present, your explicit list replaces the dev default.
+
 Kubernetes example (Deployment + Service): see `k8s/agent-example.yaml`.
 
 ## API usage examples
@@ -194,6 +207,7 @@ Notes:
 - [x] Build & run Code Server image inside Talos cluster
 - [x] Create dashboard server to run scripts and report status
 - [x] Create UI for dashboard server to join/create network, manage clusters and observe code servers
+- [ ] Fully generic and configurable docker deploys via subdomain on tailnet
 - [ ] Ensure multi-user support with orgs/clusters
 - [ ] Run Ollama on host machine and OpenAI Codex inside code servers, opening terminal to interact with agent via web UI
 - [ ] Event bus for agent-host communication (e.g. notify users of PR created, code pushed, etc) with web UI

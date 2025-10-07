@@ -147,6 +147,15 @@ func main() {
 		log.Fatalf("invalid config: %v", err)
 	}
 
+	// Dev default: if no allowlist configured, allow local agent on 127.0.0.1:8443
+	// This makes the demo agent/code-server iframe work out-of-the-box in local dev.
+	if len(cfg.Allowlist) == 0 {
+		cfg.Allowlist = []string{
+			"127.0.0.1:8080", "::1:8080", "localhost:8080",
+		}
+		log.Printf("dev default allowlist applied: %v", cfg.Allowlist)
+	}
+
 	al, err := proxy.NewAllowlist(cfg.Allowlist)
 	if err != nil {
 		log.Fatalf("allowlist: %v", err)
@@ -430,6 +439,18 @@ func main() {
 		MaxBody:   10 * 1024 * 1024,
 		Timeout:   10 * time.Second,
 		Dial: func(ctx context.Context, network, address string) (any, error) {
+			// For loopback targets in local dev, bypass tsnet and dial OS loopback directly.
+			host, _, err := net.SplitHostPort(address)
+			if err == nil {
+				if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+					var d net.Dialer
+					return d.DialContext(ctx, network, address)
+				}
+				if strings.EqualFold(host, "localhost") {
+					var d net.Dialer
+					return d.DialContext(ctx, network, address)
+				}
+			}
 			conn, err := ts.DialContext(ctx, tsServer, network, address)
 			if err != nil {
 				return nil, err

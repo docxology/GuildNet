@@ -79,7 +79,7 @@ fi
 # Start code-server (listen on loopback only), workspace at /workspace
 CODE_SERVER_ADDR="127.0.0.1:8080"
 
-log "Starting code-server on ${CODE_SERVER_ADDR}, proxy ports http:${PORT} https:${HTTPS_PORT}, workspace /workspace"
+log "Starting code-server on ${CODE_SERVER_ADDR}, proxy http:${PORT}, workspace /workspace"
 
 CODE_SERVER_CMD="code-server --bind-addr ${CODE_SERVER_ADDR} \
   --user-data-dir /data/user-data \

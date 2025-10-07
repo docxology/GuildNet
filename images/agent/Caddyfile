@@ -2,8 +2,8 @@
 	admin off
 }
 
-# Serve code-server on plain HTTP 8443 with embed-friendly headers
-:{$HTTPS_PORT} {
+# Serve code-server on plain HTTP $PORT with embed-friendly headers
+:{$PORT} {
 	encode zstd gzip
 
 	header {

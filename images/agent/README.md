@@ -29,6 +29,10 @@ docker run --rm \
 
 Open http://localhost:8080 to access code-server. Health at http://localhost:8080/healthz.
 
+**Default port:** The agent always exposes code-server via Caddy on port 8080 (HTTP, iframe-friendly). For most use cases, only 8080 needs to be mapped/exposed. Advanced users can set the PORT env var to change this.
+
+**Kubernetes:** The example manifest exposes both 8080 and 8443, but only 8080 is required for the UI to work out-of-the-box. Set AGENT_HOST to the pod/service DNS name for best results.
+
 If `PASSWORD` is not set, the container will generate one on first run and store it at `/data/.code-server-password` (printed once at startup). Persist `/data` to keep the password, user settings, and extensions.
 
 ## Kubernetes example

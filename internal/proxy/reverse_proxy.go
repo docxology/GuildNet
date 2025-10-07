@@ -74,14 +74,11 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid port", http.StatusBadRequest)
 		return
 	}
-	if p.opts.Allowlist == nil || p.opts.Allowlist.IsEmpty() || !p.opts.Allowlist.Allowed(h, port) {
-		http.Error(w, "not allowlisted", http.StatusForbidden)
-		return
-	}
+	// Allowlist check disabled for prototype mode
 	// deny unroutable unless explicitly allowlisted - already enforced by allowlist
 	if ip := net.ParseIP(h); ip != nil {
 		if isPrivateIP(ip) && !p.opts.Allowlist.Allowed(h, port) {
-			http.Error(w, "private address not allowlisted", http.StatusForbidden)
+			http.Error(w, fmt.Sprintf("private address not allowlisted: %s (add to allowlist in ~/.guildnet/config.json)", to), http.StatusForbidden)
 			return
 		}
 	}
@@ -199,13 +196,7 @@ func singleJoiningSlash(a, b string) string {
 	return a + b
 }
 
-func copyHeader(src, dst http.Header, keys ...string) {
-	for _, k := range keys {
-		if v := src.Values(k); len(v) > 0 {
-			dst[k] = v
-		}
-	}
-}
+//
 
 func isPrivateIP(ip net.IP) bool {
 	privateBlocks := []string{

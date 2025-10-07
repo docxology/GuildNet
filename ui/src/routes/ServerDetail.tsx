@@ -14,17 +14,18 @@ export default function ServerDetail() {
   const [tab, setTab] = createSignal<'info'|'debug'|'error'|'ide'>('info');
   const [srv] = createResource(() => params.id, (id: string) => getServer(id));
 
+  // Always use 8080 for agent iframe unless 8443 is explicitly open (rare in dev)
   const ideUrl = createMemo(() => {
     const s = srv();
     if (!s) return '';
-    const has8443 = (s.ports ?? []).some((p) => p.port === 8443);
-    if (!has8443) return '';
-    // Pick a host: prefer node; otherwise try env-derived hints.
-    const env = s.env ?? {} as Record<string, string>;
+    const env = s.env ?? ({} as Record<string, string>);
     const host = (s as any).node || env['AGENT_HOST'] || env['HOST'] || env['SERVICE_HOST'];
     if (!host) return '';
-    // Agent 8443 currently serves HTTP (Caddy without TLS inside container)
-    return apiUrl(`/proxy?to=${encodeURIComponent(`${host}:8443`)}&path=${encodeURIComponent('/')}&scheme=http`);
+    const ports = (s.ports ?? []).map((p) => p.port);
+    // Use 8080 unless 8443 is explicitly open (for advanced/production use)
+    const port = ports.includes(8443) ? 8443 : 8080;
+    // Agent Caddy serves HTTP; the host reverse proxy sets TLS to the browser. Use scheme=http to upstream.
+    return apiUrl(`/proxy?to=${encodeURIComponent(`${host}:${port}`)}&path=${encodeURIComponent('/')}&scheme=http`);
   });
 
   return (
