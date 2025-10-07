@@ -20,7 +20,8 @@ import (
 )
 
 type Client struct {
-	K *kubernetes.Clientset
+	K    *kubernetes.Clientset
+	Rest *rest.Config
 }
 
 func kubeconfigDefault() string {
@@ -52,8 +53,11 @@ func New(ctx context.Context) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{K: cs}, nil
+	return &Client{K: cs, Rest: cfg}, nil
 }
+
+// Config returns the REST config used to reach the API server.
+func (c *Client) Config() *rest.Config { return c.Rest }
 
 func dns1123Name(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
@@ -125,8 +129,11 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 		cports = append(cports, cp)
 	}
 	if len(cports) == 0 {
-		// Ensure at least 8080 is declared to match health probes and Service default
-		cports = append(cports, corev1.ContainerPort{Name: "http", ContainerPort: 8080})
+		// Default to both 8080 (http) and 8443 (https). Readiness will target 8080.
+		cports = append(cports,
+			corev1.ContainerPort{Name: "http", ContainerPort: 8080},
+			corev1.ContainerPort{Name: "https", ContainerPort: 8443},
+		)
 	}
 
 	// env
@@ -156,6 +163,11 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 	// Optional imagePullSecret name
 	imgPullSecret := strings.TrimSpace(os.Getenv("K8S_IMAGE_PULL_SECRET"))
 
+	// pick probe port: first declared container port or 8080
+	probePort := int32(8080)
+	if len(cports) > 0 {
+		probePort = cports[0].ContainerPort
+	}
 	dep := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: labels},
 		Spec: appsv1.DeploymentSpec{
@@ -164,6 +176,10 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
 				Spec: corev1.PodSpec{
+					Tolerations: []corev1.Toleration{
+						{Key: "node-role.kubernetes.io/control-plane", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
+						{Key: "node-role.kubernetes.io/master", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
+					},
 					ImagePullSecrets: func() []corev1.LocalObjectReference {
 						if imgPullSecret == "" {
 							return nil
@@ -176,8 +192,8 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 						Args:           spec.Args,
 						Env:            env,
 						Ports:          cports,
-						ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromInt(8080)}}},
-						LivenessProbe:  &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromInt(8080)}}},
+						ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstr.FromInt(int(probePort))}}},
+						LivenessProbe:  &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstr.FromInt(int(probePort))}}},
 					}},
 				},
 			},
@@ -198,6 +214,7 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 	// Service ports
 	sports := []corev1.ServicePort{}
 	if len(spec.Expose) == 0 && len(cports) == 0 {
+		// Should not happen due to defaults above, but keep a sane default.
 		sports = append(sports, corev1.ServicePort{Name: "http", Port: 8080, TargetPort: intstr.FromInt(8080)})
 	} else {
 		for _, p := range spec.Expose {
@@ -211,6 +228,7 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 			sports = append(sports, corev1.ServicePort{Name: nm, Port: int32(p.Port), TargetPort: intstr.FromInt(p.Port)})
 		}
 		if len(sports) == 0 {
+			// Mirror container ports (both 8080 and 8443 by default)
 			for _, cp := range cports {
 				sports = append(sports, corev1.ServicePort{Name: cp.Name, Port: cp.ContainerPort, TargetPort: intstr.FromInt(int(cp.ContainerPort))})
 			}
@@ -219,7 +237,7 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: labels},
-		Spec:       corev1.ServiceSpec{Selector: map[string]string{"app": name}, Ports: sports},
+		Spec:       corev1.ServiceSpec{Selector: map[string]string{"app": name}, Ports: sports, PublishNotReadyAddresses: true},
 	}
 	if _, err := c.K.CoreV1().Services(ns).Get(ctx, name, metav1.GetOptions{}); err == nil {
 		if _, err := c.K.CoreV1().Services(ns).Update(ctx, svc, metav1.UpdateOptions{}); err != nil {
@@ -303,20 +321,21 @@ func (c *Client) ResolveServiceAddress(ctx context.Context, ns, idOrName string)
 	if svc.Spec.ClusterIP == "" || svc.Spec.ClusterIP == "None" {
 		return "", 0, false, fmt.Errorf("service has no clusterIP")
 	}
-	// choose port: prefer 8443/https else 8080 else first
+	// choose port: prefer 8080/http (agent default) else 8443/https else first
 	var p int32
 	https = false
 	for _, sp := range svc.Spec.Ports {
-		if sp.Port == 8443 {
+		if sp.Port == 8080 {
 			p = sp.Port
-			https = true
+			https = false
 			break
 		}
 	}
 	if p == 0 {
 		for _, sp := range svc.Spec.Ports {
-			if sp.Port == 8080 {
+			if sp.Port == 8443 {
 				p = sp.Port
+				https = true
 				break
 			}
 		}

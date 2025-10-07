@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -14,6 +15,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -29,6 +31,12 @@ import (
 	//"github.com/your/module/internal/store"
 	"github.com/your/module/internal/ts"
 	"github.com/your/module/pkg/config"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/rest"
+
+	// no direct transport import; use rest.TransportFor
+
+	corev1 "k8s.io/api/core/v1"
 )
 
 // WebSocket removed; SSE-only
@@ -446,6 +454,108 @@ func main() {
 			return conn, nil
 		},
 		Logger: httpx.Logger(),
+		APIProxy: func() (http.RoundTripper, func(req *http.Request, scheme, hostport, subPath string), bool) {
+			// Build a transport using the k8s rest config to go through the API server proxy
+			cfg := kcli.Config()
+			if cfg == nil {
+				return nil, nil, false
+			}
+			rt, err := restTransport(cfg)
+			if err != nil {
+				return nil, nil, false
+			}
+			set := func(req *http.Request, scheme, hostport, subPath string) {
+				// Expect hostport either as ClusterIP:port or service DNS name + port
+				host, pstr, _ := net.SplitHostPort(hostport)
+				p := pstr
+				name := host
+				// Prefer explicit server id header to determine service name
+				if sid := req.Header.Get("X-Guild-Server-ID"); sid != "" {
+					// Try exact Service name first, else map from label guildnet.io/id
+					ns := defaultNS
+					sname := dns1123Name(sid)
+					if svc, err := kcli.K.CoreV1().Services(ns).Get(context.Background(), sname, metav1.GetOptions{}); err == nil && svc != nil {
+						name = svc.Name
+					} else if list, err := kcli.K.CoreV1().Services(ns).List(context.Background(), metav1.ListOptions{LabelSelector: fmt.Sprintf("guildnet.io/id=%s", sid)}); err == nil && len(list.Items) > 0 {
+						name = list.Items[0].Name
+					} else {
+						name = sname
+					}
+				} else if strings.Contains(host, ".svc") {
+					// If host looks like a service FQDN, take first segment as name
+					parts := strings.Split(host, ".")
+					if len(parts) > 0 {
+						name = parts[0]
+					}
+				} else if ip := net.ParseIP(host); ip != nil {
+					// Try to resolve ClusterIP to service name
+					ns := defaultNS
+					if svcList, err := kcli.K.CoreV1().Services(ns).List(context.Background(), metav1.ListOptions{}); err == nil {
+						for _, s := range svcList.Items {
+							if s.Spec.ClusterIP == host {
+								name = s.Name
+								break
+							}
+						}
+					}
+				}
+				// Debug: trace director inputs and resolved values
+				log.Printf("api-proxy director: hostport=%s host=%s port=%s sid=%q resolved_name=%s subPath=%s", hostport, host, p, req.Header.Get("X-Guild-Server-ID"), name, subPath)
+				// kube API path for service proxy: /api/v1/namespaces/{ns}/services/{name}:{port}/proxy{subPath}
+				// If scheme is https, prefix service name with "https:" per k8s API conventions.
+				// Respect kubeconfig scheme and any base path present in cfg.Host
+				baseURL, _ := url.Parse(cfg.Host)
+				if baseURL == nil {
+					baseURL = &url.URL{Scheme: "https"}
+				}
+				if baseURL.Scheme == "" {
+					baseURL.Scheme = "https"
+				}
+				req.URL.Scheme = baseURL.Scheme
+				req.URL.Host = baseURL.Host
+				req.Host = req.URL.Host
+				basePrefix := strings.TrimSuffix(baseURL.Path, "/")
+				// Prefer pod proxy if requested via header
+				if strings.TrimSpace(req.Header.Get("X-Guild-Prefer-Pod")) != "" {
+					ns := defaultNS
+					podName := ""
+					if pods, err := kcli.K.CoreV1().Pods(ns).List(context.Background(), metav1.ListOptions{LabelSelector: fmt.Sprintf("app=%s", name)}); err == nil && len(pods.Items) > 0 {
+						pick := 0
+						for i, pod := range pods.Items {
+							if pod.Status.Phase == corev1.PodRunning {
+								ready := false
+								for _, c := range pod.Status.Conditions {
+									if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
+										ready = true
+										break
+									}
+								}
+								if ready {
+									pick = i
+									break
+								}
+							}
+						}
+						podName = pods.Items[pick].Name
+					}
+					if podName != "" {
+						basePath := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s:%s/proxy", defaultNS, podName, p)
+						fullBase := singleJoiningSlash(basePrefix, basePath)
+						req.URL.Path = singleJoiningSlash("", fullBase) + subPath
+						return
+					}
+				}
+				// Default to service proxy
+				svcIdent := name
+				if strings.EqualFold(scheme, "https") {
+					svcIdent = "https:" + name
+				}
+				basePath := fmt.Sprintf("/api/v1/namespaces/%s/services/%s:%s/proxy", defaultNS, svcIdent, p)
+				fullBase := singleJoiningSlash(basePrefix, basePath)
+				req.URL.Path = singleJoiningSlash("", fullBase) + subPath
+			}
+			return rt, set, true
+		},
 		ResolveServer: func(ctx context.Context, serverID string, subPath string) (string, string, string, error) {
 			// Prefer resolving to ClusterIP to make CIDR allowlisting effective
 			if host, port, https, err := kcli.ResolveServiceAddress(ctx, defaultNS, serverID); err == nil && host != "" && port > 0 {
@@ -474,14 +584,30 @@ func main() {
 						}
 						return scheme, v, subPath, nil
 					}
-					p := 8080
+					// Prefer 8080 (http) if present, else 8443 (https)
+					p := 0
 					for _, pr := range srv.Ports {
-						if pr.Port == 8443 {
-							p = 8443
+						if pr.Port == 8080 {
+							p = 8080
 							break
 						}
 					}
-					return map[int]string{8443: "https", 8080: "http"}[p], net.JoinHostPort(v, fmt.Sprintf("%d", p)), subPath, nil
+					if p == 0 {
+						for _, pr := range srv.Ports {
+							if pr.Port == 8443 {
+								p = 8443
+								break
+							}
+						}
+					}
+					if p == 0 && len(srv.Ports) > 0 {
+						p = srv.Ports[0].Port
+					}
+					scheme := map[int]string{8443: "https"}[p]
+					if scheme == "" {
+						scheme = "http"
+					}
+					return scheme, net.JoinHostPort(v, fmt.Sprintf("%d", p)), subPath, nil
 				}
 			}
 			// 2) Heuristic: node or service FQDN
@@ -490,14 +616,30 @@ func main() {
 				host = dns1123Name(srv.Name) + ".default.svc.cluster.local"
 			}
 			if host != "" {
-				p := 8080
+				// Prefer 8080 (http) if present, else 8443 (https)
+				p := 0
 				for _, pr := range srv.Ports {
-					if pr.Port == 8443 {
-						p = 8443
+					if pr.Port == 8080 {
+						p = 8080
 						break
 					}
 				}
-				return map[int]string{8443: "https", 8080: "http"}[p], net.JoinHostPort(host, fmt.Sprintf("%d", p)), subPath, nil
+				if p == 0 {
+					for _, pr := range srv.Ports {
+						if pr.Port == 8443 {
+							p = 8443
+							break
+						}
+					}
+				}
+				if p == 0 && len(srv.Ports) > 0 {
+					p = srv.Ports[0].Port
+				}
+				scheme := map[int]string{8443: "https"}[p]
+				if scheme == "" {
+					scheme = "http"
+				}
+				return scheme, net.JoinHostPort(host, fmt.Sprintf("%d", p)), subPath, nil
 			}
 			return "", "", "", fmt.Errorf("no upstream hint; set Env.AGENT_HOST or ensure service exists and ports are populated")
 		},
@@ -592,4 +734,44 @@ func main() {
 			log.Fatalf("server error: %v", err)
 		}
 	}
+}
+
+// restTransport builds an http.RoundTripper from a kube rest.Config
+// and forces HTTP/1.1 when talking to the API server to avoid sporadic
+// HTTP/2 INTERNAL_ERROR on the /services/.../proxy endpoints.
+func restTransport(cfg *rest.Config) (http.RoundTripper, error) {
+	// Build TLS config from rest.Config
+	tlsConfig, err := rest.TLSConfigFor(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if tlsConfig == nil {
+		tlsConfig = &tls.Config{}
+	}
+	// Force HTTP/1.1 by disabling HTTP/2 via NextProtos and ForceAttemptHTTP2
+	tlsConfig.NextProtos = []string{"http/1.1"}
+	base := &http.Transport{
+		Proxy:              http.ProxyFromEnvironment,
+		TLSClientConfig:    tlsConfig,
+		ForceAttemptHTTP2:  false,
+		DisableKeepAlives:  true,
+		MaxIdleConns:       100,
+		IdleConnTimeout:    90 * time.Second,
+		DisableCompression: false,
+	}
+	// Wrap with client-go auth/impersonation handlers
+	return rest.HTTPWrappersForConfig(cfg, base)
+}
+
+// join path helper
+func singleJoiningSlash(a, b string) string {
+	aslash := strings.HasSuffix(a, "/")
+	bslash := strings.HasPrefix(b, "/")
+	switch {
+	case aslash && bslash:
+		return a + b[1:]
+	case !aslash && !bslash:
+		return a + "/" + b
+	}
+	return a + b
 }
