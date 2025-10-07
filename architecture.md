@@ -1,12 +1,12 @@
 ## GuildNet architecture
 
-This document explains the end-to-end flow for launching agent containers in a Talos Kubernetes cluster and securely accessing each agent’s code-server UI in the browser via an iframe, with the Host App acting as a reverse-proxy over the Tailscale network (tsnet).
+This document explains the end-to-end flow for launching agent workloads into a Talos Kubernetes cluster and securely accessing each agent’s code-server UI in the browser via an iframe. The Host App acts as a single HTTPS origin and reverse-proxy over the tailnet using embedded Tailscale (tsnet).
 
 Goals
-- Launch multiple agent containers dynamically in the Talos cluster (one per “workload”).
-- Reach each agent over the tailnet without exposing it publicly.
-- The Host App is the single HTTPS origin for the browser, brokering traffic to agents via tsnet.
-- The UI embeds code-server from the agent in an iframe through the Host App’s reverse-proxy.
+- Launch multiple agent containers dynamically in the Talos cluster (one Deployment + Service per “workload”).
+- Reach each agent privately over the tailnet without exposing public ingress.
+- Use the Host App as the sole browser-visible HTTPS origin; it brokers traffic to agents via tsnet.
+- The UI embeds each agent’s code-server via an iframe pointing to the Host App’s proxy.
 
 
 ## Components
@@ -17,23 +17,23 @@ Goals
   - Calls the Host App at VITE_API_BASE (HTTPS)
 
 - Host App (Go)
-  - HTTPS server for API and reverse proxy (runs locally or on a reachable host)
-  - Embeds Tailscale using tsnet for network transport to private destinations
+  - HTTPS server for API and reverse proxy (local TLS listener + tsnet listener)
+  - Embeds Tailscale via tsnet for tailnet transport (Headscale/Tailscale control plane)
   - Endpoints:
-    - /api/jobs: accepts a “launch agent” request (future: creates K8s Deployment + Service)
-    - /api/servers, /api/servers/:id, /api/servers/:id/logs, /sse/logs
-    - /proxy and /proxy/{to}/…: reverse proxy to agent addresses via tsnet
-    - /proxy/server/{id}/…: server-aware proxy that resolves the correct upstream automatically
-  - Allowlist (CIDR, host:port) governs which upstreams /proxy can reach
+    - POST /api/jobs: creates/updates a K8s Deployment + Service from a JobSpec
+    - GET /api/servers, GET /api/servers/:id, GET /api/servers/:id/logs, GET /sse/logs
+    - GET /proxy and GET /proxy/{to}/…: direct reverse proxy (allowlist-gated)
+    - GET /proxy/server/{id}/…: server-aware proxy (resolves upstream from K8s metadata)
+  - Allowlist (CIDR, host:port) governs which upstreams /proxy may reach
 
 - Tailscale control plane (Headscale or Tailscale)
   - Authenticates nodes (Host App and cluster nodes)
   - Distributes routes and DNS/MagicDNS for the tailnet
 
 - Talos Kubernetes cluster (inside the tailnet)
-  - One or more nodes running a Tailscale client
-  - A Tailscale Subnet Router advertising cluster CIDRs (recommended), so tsnet can dial Pod/Service IPs
-  - Kubernetes API (Host App will talk to it to deploy agents; design target)
+  - One control-plane node (dev) or multi-node (prod)
+  - Tailscale Subnet Router DaemonSet advertising cluster CIDRs (Pod/Service ranges)
+  - Kubernetes API used by the Host App for Deployments/Services/Logs
 
 - Agent container image (images/agent)
   - Runs code-server bound to 127.0.0.1:8080
@@ -82,12 +82,13 @@ flowchart LR
 
 Notes
 - Browser only talks to the Host App over HTTPS.
-- Host App proxies to agents using tsnet, which rides the tailnet to reach cluster IPs via a Subnet Router.
-- Between the Host App and the agent, the hop is HTTP (Caddy -> code-server), but the browser-facing hop remains HTTPS.
+- Host App proxies to agents using tsnet over the tailnet and reaches cluster IPs via the Subnet Router.
+- Host App → Agent hop is typically HTTP (Caddy → code-server) while Browser ↔ Host App is HTTPS.
 
 Environment assumptions
-- Talos Kubernetes cluster is required (e.g., running as a VM on the host). There is no “local mode.”
-- The backend owns workload metadata by reading from Kubernetes (Deployments/Services/Pods). The UI does not persist server state.
+- Talos Kubernetes cluster is required (no “local mode”). Use the bootstrap script to provision it.
+- The backend owns workload metadata by reading from Kubernetes (Deployments/Services/Pods). The UI does not persist state.
+- A shared `.env` at the repo root provides TS_LOGIN_SERVER/TS_AUTHKEY/TS_HOSTNAME/TS_ROUTES for both Host App and Talos.
 
 
 ## Launch flow (UI → Host App → Kubernetes → Agent)
@@ -116,11 +117,11 @@ sequenceDiagram
 
 Important choices
 - Upstream resolution model (generic, any image)
-  - Primary hint: server Env.AGENT_HOST (may include optional :port)
-  - Secondary hints: server.Node (tailscale/DNS-resolvable host) or derived Service FQDN from server.Name and a configured namespace/suffix
-  - Port/scheme inference: prefer 8443 if exposed, otherwise 8080; scheme https for 8443, http otherwise
-  - The UI uses /proxy/server/{id}/… so the backend decides the best upstream automatically
-- Expose ports: For the code-server agent, HTTP 8080 is sufficient (Caddy → code-server). Other images can declare ports in server metadata.
+  - 1) Env.AGENT_HOST (honors optional :port)
+  - 2) Node hint or derived Service FQDN: <dns1123(name)>.default.svc.cluster.local
+  - Port/scheme inference: prefer 8443→https, else 8080→http
+  - The UI uses /proxy/server/{id}/… so the backend decides the upstream automatically
+- Expose ports: For the code-server agent, HTTP 8080 is sufficient (Caddy → code-server). Other images can declare ports.
 
 
 ## Access flow (iframe via reverse-proxy over tsnet)
@@ -149,21 +150,17 @@ sequenceDiagram
 ```
 
 Why this works in a browser
-- The iframe src is the Host App origin (HTTPS), so there’s no mixed-content issue.
-- Caddy in the agent sets CSP headers to allow embedding; X-Frame-Options is removed.
+- The iframe src is the Host App origin (HTTPS), avoiding mixed-content issues.
+- Caddy in the agent sets CSP to allow embedding; X-Frame-Options is removed.
 - WebSockets used by code-server are proxied transparently by the Host App.
 
 
 ## Addressing model and allowlist
 
 - Addressing and resolution
-  - The UI uses /proxy/server/{id}/… so the backend can resolve the upstream generically for any workload
-  - Backend resolution order:
-    1. Env.AGENT_HOST (honors optional :port)
-    2. server.Node (if resolvable/reachable) with inferred port
-    3. Service FQDN heuristic from server.Name: <dns1123(name)>.<namespace>.<suffix> with inferred port
-  - If all hints fail, backend responds with guidance to set Env.AGENT_HOST or provide ports/node in server metadata
-  - Advanced: still supports /proxy?to=host:port&path=/… when you want explicit targets
+  - The UI uses /proxy/server/{id}/… and the backend resolves the upstream per the order above.
+  - If all hints fail, the backend returns guidance to set Env.AGENT_HOST or provide ports/node.
+  - Advanced: /proxy?to=host:port&path=/… remains available for explicit targets.
 
 - Allowlist
   - The Host App enforces an allowlist for /proxy requests: CIDRs and/or host:port entries in ~/.guildnet/config.json
@@ -173,18 +170,15 @@ Why this works in a browser
 ## Kubernetes responsibilities (target design)
 
 When the UI posts /api/jobs:
-- The Host App uses Kubernetes credentials to create:
-  - A Deployment for the agent image (guildnet/agent) with:
-    - env: PASSWORD (optional), AGENT_HOST (optional hint), PORT=8080
-    - probes: GET /healthz
-    - volumes: /data and /workspace (PVCs recommended in prod)
-  - A Service (ClusterIP) exposing port 8080 (and optionally 8443)
-- The Host App registers a “server” record and can later resolve an upstream from its metadata without requiring the UI to supply AGENT_HOST.
-- Logs/events are streamed back to the UI (SSE) as the Deployment progresses.
+- The Host App creates/updates a Deployment and Service with labels `guildnet.io/managed=true` and `guildnet.io/id=<id>`.
+- Container defaults include health probes on /healthz and exposing HTTP:8080 if not specified.
+- The backend lists servers from K8s (Deployments) and queries logs from pods.
 
-Today’s state in repo
-- /api/jobs currently accepts and seeds an in-memory server record (no real K8s call yet), for local/demo flows.
-- The networking, proxying, and iframe integration are implemented; wiring to Kubernetes is the next step.
+Current implementation
+- /api/jobs: creates real K8s Deployment + Service (client-go)
+- /api/servers and details/logs: read from K8s
+- /sse/logs: streams initial tail via K8s logs + heartbeat
+- /proxy/server/{id}/: resolves upstream via K8s hints (Env.AGENT_HOST > Node > Service FQDN)
 
 
 ## Security and TLS
@@ -227,9 +221,19 @@ Today’s state in repo
 ## What “multiple agents” means here
 
 - Each agent is an independent Deployment+Service pair in Kubernetes (or one Deployment with multiple replicas and per-tenant routing)
-- The UI lists all “servers” and their statuses
-- The IDE tab for a selected server points the iframe to /proxy targeting that server’s AGENT_HOST:8080
-- The Host App’s /proxy simply needs the to=host:port; tsnet handles reachability over the tailnet
+- The UI lists all “servers” from K8s and their statuses.
+- The IDE tab for a selected server points the iframe to /proxy/server/{id}/.
+- The Host App resolves the upstream and tsnet handles reachability over the tailnet.
+
+## Talos bootstrap and shared env
+
+- Use `scripts/talos-vm-up.sh` to provision a local Talos cluster. The script:
+  - Installs prerequisites idempotently (talosctl, kubectl, QEMU/Docker as needed)
+  - Creates a cluster (Docker on macOS by default) with a safe CIDR and merges kubeconfig
+  - Deploys a Tailscale Subnet Router DaemonSet
+  - Sources `.env` at the repo root for TS_LOGIN_SERVER/TS_AUTHKEY/TS_HOSTNAME/TS_ROUTES
+- Use `scripts/dev-host-run.sh` to run the Host App; it sources `.env` and can generate `~/.guildnet/config.json` from env.
+- `scripts/sync-env-from-config.sh` can create `.env` from an existing `~/.guildnet/config.json` to keep both sides in sync.
 
 
 ## Appendix: minimal example values

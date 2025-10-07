@@ -7,17 +7,19 @@ It includes:
 - A Go Host App that embeds Tailscale (tsnet) to proxy traffic and expose simple APIs.
 - A SolidJS web UI (Vite + Tailwind) to list servers, view details/logs, and launch new workloads.
 - A containerized Agent image (code-server + Caddy) that serves an embeddable VS Code UI over one HTTP port.
+- Kubernetes client integration to deploy workloads (Deployments + Services) and read logs.
 - A Kubernetes Deployment + Service example for the agent.
 - HTTPS-by-default for local dev, plus a helper script to generate shared certificates.
   Note: Tailscale (tsnet) is mandatory; the host app always runs via Tailscale.
 
 ## Features
 
-- tsnet-powered connectivity (no external tailscaled): listens on a local TCP address and a Tailscale listener.
+- tsnet-powered connectivity (no external tailscaled): listens on a local TLS address and a Tailscale listener.
 - Minimal HTTP APIs:
   - `GET /healthz` – liveness
   - `GET /api/ping?addr=<host-or-ip>:<port>` – TCP dial RTT over tsnet dialer with allowlist enforcement
-  - `GET /proxy?to=<ip:port>&path=/...` – reverse proxy to in-cluster HTTP, allowlist-gated
+  - `GET /proxy?to=<ip:port>&path=/...` – reverse proxy to in-cluster HTTP, allowlist-gated (explicit)
+  - `GET /proxy/server/{id}/...` – server-aware proxy; backend resolves the upstream from K8s metadata
   - `GET /sse/logs` – Server-Sent Events stream for logs
 - UI features (SolidJS):
   - Servers list and detail pages
@@ -36,16 +38,31 @@ It includes:
   - Vite dev server uses HTTPS with the same repo certs when available
   - Script to generate a shared local CA and issue certs for both sides
 
-## Quick start (Tailscale required)
+## Quick start (Tailscale/Headscale required)
 
-1) Initialize configuration (Headscale/Tailscale)
+1) Share Tailscale/Headscale config via .env
+
+Create a `.env` at the repo root or generate it from your existing host config:
+
+```bash
+# Option A: generate from ~/.guildnet/config.json
+scripts/sync-env-from-config.sh
+
+# Option B: create manually
+cp .env.example .env
+vi .env  # set TS_LOGIN_SERVER, TS_AUTHKEY, TS_HOSTNAME, TS_ROUTES
+```
+
+2) Initialize or run the backend
 
 ```bash
 make build
-./bin/hostapp init  # prompts: Login server URL, Pre-auth key, Hostname, Listen local, etc.
+# Non-interactive init from .env (if config missing)
+scripts/dev-host-run.sh --no-certs --origin https://localhost:5173 & sleep 1; kill %1 || true
+./bin/hostapp init  # optional interactive init
 ```
 
-2) Build and run backend (TLS, CORS prepped, tsnet mandatory)
+3) Build and run backend (TLS, CORS prepped, tsnet mandatory)
 
 ```bash
 # one-liner helper (build + certs + CORS + serve)
@@ -54,7 +71,7 @@ make dev-run ORIGIN=https://localhost:5173
 make build && scripts/generate-server-cert.sh -f && FRONTEND_ORIGIN=https://localhost:5173 ./bin/hostapp serve
 ```
 
-3) Run the UI (HTTPS)
+4) Run the UI (HTTPS)
 
 ```bash
 cd ui
@@ -62,7 +79,7 @@ npm install
 VITE_API_BASE=https://127.0.0.1:8080 npm run dev
 ```
 
-4) Verify it works
+5) Verify it works
 
 ```bash
 # API health (self-signed):
@@ -101,11 +118,9 @@ Open http://localhost:8080 for code-server; check /healthz. Headers allow iframe
 
 **Agent host normalization:** If the server record provides a bare `AGENT_HOST` like `agent`, the UI will resolve it as `agent.<namespace>.svc.cluster.local` (default namespace `default`, override with `VITE_K8S_NAMESPACE`). You can also set `AGENT_HOST` to a FQDN (Service DNS or Pod IP) explicitly in deployments.
 
-**Allowlist disabled (prototype mode):**
+Allowlist is enforced. For dev convenience, a permissive loopback default is injected if empty.
 
-For prototyping, the allowlist is disabled and any agent/port is reachable via the proxy and ping endpoints. When you need security, re-enable the allowlist in the backend.
-
-To customize, edit `~/.guildnet/config.json` and set `allowlist` explicitly (CIDRs and/or `host:port` entries). When present, your explicit list replaces the dev default.
+To customize, edit `~/.guildnet/config.json` and set `allowlist` explicitly (CIDRs and/or `host:port` entries).
 
 Kubernetes example (Deployment + Service): see `k8s/agent-example.yaml`.
 
@@ -126,7 +141,11 @@ curl -k 'https://127.0.0.1:8080/api/ping?addr=10.96.0.1:443'
 Reverse proxy:
 
 ```bash
+# Explicit target
 curl -k 'https://127.0.0.1:8080/proxy?to=10.96.0.1:443&path=/'
+
+# Server-aware target
+curl -k 'https://127.0.0.1:8080/proxy/server/<id>/'
 ```
 
 Logs SSE stream:
@@ -202,19 +221,12 @@ Notes:
 
 # Progress
 
-- [x] Join/create Headscale/Tailscale network
-- [x] Create Talos cluster inside Tailnet
-- [x] Build & run Code Server image inside Talos cluster
-- [x] Create dashboard server to run scripts and report status
-- [x] Create UI for dashboard server to join/create network, manage clusters and observe code servers
-- [ ] Fully generic and configurable docker deploys via subdomain on tailnet
-- [ ] Ensure multi-user support with orgs/clusters
-- [ ] Run Ollama on host machine and OpenAI Codex inside code servers, opening terminal to interact with agent via web UI
-- [ ] Event bus for agent-host communication (e.g. notify users of PR created, code pushed, etc) with web UI
-- [ ] Add persistent storage to cluster via Longhorn, save code server data there
-- [ ] Add Radicle for git hosting inside cluster, hook up to agent workflow for PR creation
-- [ ] Create UI for code review and PR management
-- [ ] Prompt engineering for agent workflows, provide templates and examples
-- [ ] Add MCPs for agent integration/interaction/memory/thinking etc
-- [ ] Add Obsidian or similar for personal and collective knowledge management inside cluster
-- [ ] Add task management system inside cluster, hook up to agent workflows, with 2D/3D graphical interface
+- [x] Shared .env drives Tailscale/Headscale for both Host App and Talos
+- [x] Talos VM bootstrap with Tailscale Subnet Router (scripts/talos-vm-up.sh)
+- [x] Server-aware reverse proxy (/proxy/server/{id}/) over tsnet
+- [x] K8s-backed /api/jobs, /api/servers, details, and logs
+- [x] UI iframe loads code-server via Host App proxy
+- [ ] Namespace configurability and UI exposure
+- [ ] Robust startup checks and error guidance when K8s missing/unready
+- [ ] Live log streaming via watches/informers
+- [ ] Harden allowlist and production defaults
