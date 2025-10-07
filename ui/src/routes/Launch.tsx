@@ -82,12 +82,12 @@ export default function Launch() {
                   if (v) {
                     setImage(v);
                     // Load defaults for selected image
-          const d: ImageDefaults = await getImageDefaults(v).catch(() => ({} as ImageDefaults));
-          if ((ports()?.length ?? 0) === 0 && Array.isArray(d.ports)) setPorts(d.ports.map((p) => ({ name: p.name || '', port: p.port })));
-          const existing: Record<string, string> = Object.fromEntries(env().map((e) => [e.k, e.v] as const));
-          const merged: Record<string, string> = { ...(d.env || {}), ...existing };
-          const arr = Object.entries(merged).map(([k, v]) => ({ k, v }));
-          setEnv(arr);
+                    const d: ImageDefaults = await getImageDefaults(v).catch(() => ({} as ImageDefaults));
+                    if ((ports()?.length ?? 0) === 0 && Array.isArray(d.ports)) setPorts(d.ports.map((p) => ({ name: p.name || '', port: p.port })));
+                    const existing: Record<string, string> = Object.fromEntries(env().map((e) => [e.k, e.v] as const));
+                    const merged: Record<string, string> = { ...(d.env || {}), ...existing };
+                    const arr = Object.entries(merged).map(([k, v]) => ({ k, v }));
+                    setEnv(arr);
                   }
                 }}>
                 <option value="">Custom (enter URL below)</option>
@@ -112,7 +112,7 @@ export default function Launch() {
             </div>
           </div>
           <div class="space-y-3">
-      <label class="block text-sm">Env
+          <label class="block text-sm">Env
               <div class="space-y-2">
                 {env().map((p, i) => (
                   <div class="flex gap-2">

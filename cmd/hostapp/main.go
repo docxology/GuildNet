@@ -93,27 +93,27 @@ func dns1123Name(s string) string {
 	prevDash := false
 	for _, r := range s {
 		switch {
- 		case r >= 'a' && r <= 'z':
- 			b.WriteRune(r)
- 			prevDash = false
- 		case r >= '0' && r <= '9':
- 			b.WriteRune(r)
- 			prevDash = false
- 		case r == '-' || r == '_' || r == ' ':
- 			if !prevDash && b.Len() > 0 {
- 				b.WriteByte('-')
- 				prevDash = true
- 			}
- 		default:
- 			// drop
- 		}
- 	}
- 	res := strings.Trim(b.String(), "-")
- 	// trim repeated dashes
- 	for strings.Contains(res, "--") {
- 		res = strings.ReplaceAll(res, "--", "-")
- 	}
- 	return res
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+			prevDash = false
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+			prevDash = false
+		case r == '-' || r == '_' || r == ' ':
+			if !prevDash && b.Len() > 0 {
+				b.WriteByte('-')
+				prevDash = true
+			}
+		default:
+			// drop
+		}
+	}
+	res := strings.Trim(b.String(), "-")
+	// trim repeated dashes
+	for strings.Contains(res, "--") {
+		res = strings.ReplaceAll(res, "--", "-")
+	}
+	return res
 }
 
 func main() {

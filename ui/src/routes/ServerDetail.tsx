@@ -1,4 +1,4 @@
-import { Tabs, TabPanel } from '../components/Tabs';
+import { Tabs } from '../components/Tabs';
 import Card from '../components/Card';
 import StatusPill from '../components/StatusPill';
 import KeyValueList from '../components/KeyValueList';
@@ -60,16 +60,16 @@ export default function ServerDetail() {
                 value={tab()}
                 onChange={(t) => setTab(t as any)}
               />
-              <TabPanel when={tab() === 'info'}>
+              {tab() === 'info' && (
                 <LogViewer serverId={server().id} level="info" />
-              </TabPanel>
-              <TabPanel when={tab() === 'debug'}>
+              )}
+              {tab() === 'debug' && (
                 <LogViewer serverId={server().id} level="debug" />
-              </TabPanel>
-              <TabPanel when={tab() === 'error'}>
+              )}
+              {tab() === 'error' && (
                 <LogViewer serverId={server().id} level="error" />
-              </TabPanel>
-              <TabPanel when={tab() === 'ide'}>
+              )}
+              {tab() === 'ide' && (
                 <Show when={ideUrl()} fallback={<div class="text-sm text-neutral-500">IDE not available. Ensure this agent exposes port 8443 and has a node address.</div>}>
                   {(url) => (
                     <div class="border rounded-md overflow-hidden h-[70vh]">
@@ -83,8 +83,8 @@ export default function ServerDetail() {
                     </div>
                   )}
                 </Show>
-              </TabPanel>
-            </Card>
+              )}
+          </Card>
 
             <Card title="Events">
               <div class="text-sm text-neutral-500">No events stream connected.</div>
