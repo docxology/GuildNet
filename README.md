@@ -17,8 +17,8 @@ It includes:
 - tsnet-powered connectivity (no external tailscaled): listens on a local TLS address and a Tailscale listener.
 - Minimal HTTP APIs:
   - `GET /healthz` – liveness
-  - `GET /api/ping?addr=<host-or-ip>:<port>` – TCP dial RTT over tsnet dialer with allowlist enforcement
-  - `GET /proxy?to=<ip:port>&path=/...` – reverse proxy to in-cluster HTTP, allowlist-gated (explicit)
+  - `GET /api/ping?addr=<host-or-ip>:<port>` – TCP dial RTT over tsnet dialer
+  - `GET /proxy?to=<ip:port>&path=/...` – reverse proxy to in-cluster HTTP (explicit)
   - `GET /proxy/server/{id}/...` – server-aware proxy; backend resolves the upstream from K8s metadata
   - `GET /sse/logs` – Server-Sent Events stream for logs
 - UI features (SolidJS):
@@ -111,16 +111,14 @@ docker run --rm \
 
 Open http://localhost:8080 for code-server; check /healthz. Headers allow iframe embedding (`frame-ancestors 'self' *`).
 
-### Default dev allowlist
+### Defaults
 
 
 **Default agent port:** The agent always exposes code-server via Caddy on port 8080 (HTTP, iframe-friendly). The UI and backend will auto-detect and use this port.
 
 **Agent host normalization:** If the server record provides a bare `AGENT_HOST` like `agent`, the UI will resolve it as `agent.<namespace>.svc.cluster.local` (default namespace `default`, override with `VITE_K8S_NAMESPACE`). You can also set `AGENT_HOST` to a FQDN (Service DNS or Pod IP) explicitly in deployments.
 
-Allowlist is enforced. For dev convenience, a permissive loopback default is injected if empty.
-
-To customize, edit `~/.guildnet/config.json` and set `allowlist` explicitly (CIDRs and/or `host:port` entries).
+Allowlist has been removed; proxying relies on your trusted Tailnet. The `allowlist` setting in config is ignored.
 
 Kubernetes example (Deployment + Service): see `k8s/agent-example.yaml`.
 
@@ -185,7 +183,7 @@ Notes:
 
 ## Security notes
 
-- The host app enforces an allowlist for `/api/ping` and `/proxy`.
+- The host app does not enforce an allowlist for `/api/ping` or `/proxy`.
 - The agent image runs as non-root and doesn’t bundle secrets; set `PASSWORD` or persist `/data`.
 - For production, use proper certificates (or terminate TLS at ingress) and PVCs for `/data` and `/workspace`.
 - Tailscale (tsnet) is required; disabling it is not supported.
@@ -221,12 +219,19 @@ Notes:
 
 # Progress
 
-- [x] Shared .env drives Tailscale/Headscale for both Host App and Talos
-- [x] Talos VM bootstrap with Tailscale Subnet Router (scripts/talos-vm-up.sh)
-- [x] Server-aware reverse proxy (/proxy/server/{id}/) over tsnet
-- [x] K8s-backed /api/jobs, /api/servers, details, and logs
-- [x] UI iframe loads code-server via Host App proxy
-- [ ] Namespace configurability and UI exposure
-- [ ] Robust startup checks and error guidance when K8s missing/unready
-- [ ] Live log streaming via watches/informers
-- [ ] Harden allowlist and production defaults
+- [ ] Join/create Headscale/Tailscale network
+- [ ] Create Talos cluster inside Tailnet
+- [ ] Build & run Code Server image inside Talos cluster
+- [ ] Create dashboard server to run scripts and report status
+- [ ] Create UI for dashboard server to join/create network, manage clusters and observe code servers
+- [ ] Fully generic and configurable docker deploys via subdomain on tailnet
+- [ ] Ensure multi-user support with orgs/clusters
+- [ ] Run Ollama on host machine and OpenAI Codex inside code servers, opening terminal to interact with agent via web UI
+- [ ] Event bus for agent-host communication (e.g. notify users of PR created, code pushed, etc) with web UI
+- [ ] Add persistent storage to cluster via Longhorn, save code server data there
+- [ ] Add Radicle for git hosting inside cluster, hook up to agent workflow for PR creation
+- [ ] Create UI for code review and PR management
+- [ ] Prompt engineering for agent workflows, provide templates and examples
+- [ ] Add MCPs for agent integration/interaction/memory/thinking etc
+- [ ] Add Obsidian or similar for personal and collective knowledge management inside cluster
+- [ ] Add task management system inside cluster, hook up to agent workflows, with 2D/3D graphical interface

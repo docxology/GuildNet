@@ -194,7 +194,7 @@ Current implementation
 ## Failure modes and troubleshooting
 
 - IDE iframe doesn’t load
-  - Check that /proxy to the agent Service is allowlisted and reachable
+  - Check that /proxy to the agent Service is reachable (allowlist removed)
   - Verify tailscale/tsnet connectivity and that a Subnet Router advertises cluster CIDRs
   - Confirm AGENT_HOST resolves from the Host App’s perspective (or switch to a literal ClusterIP)
   - Ensure the agent is Ready; /healthz should return ok

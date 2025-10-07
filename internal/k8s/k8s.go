@@ -124,9 +124,28 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 		}
 		cports = append(cports, cp)
 	}
+	if len(cports) == 0 {
+		// Ensure at least 8080 is declared to match health probes and Service default
+		cports = append(cports, corev1.ContainerPort{Name: "http", ContainerPort: 8080})
+	}
 
 	// env
 	env := []corev1.EnvVar{}
+	if spec.Env == nil {
+		spec.Env = map[string]string{}
+	}
+	// Ensure PORT=8080 by default
+	if strings.TrimSpace(spec.Env["PORT"]) == "" {
+		spec.Env["PORT"] = "8080"
+	}
+	// Ensure PASSWORD for code-server (dev default); can be overridden by spec.Env["PASSWORD"]
+	if strings.TrimSpace(spec.Env["PASSWORD"]) == "" {
+		if pw := os.Getenv("AGENT_DEFAULT_PASSWORD"); strings.TrimSpace(pw) != "" {
+			spec.Env["PASSWORD"] = pw
+		} else {
+			spec.Env["PASSWORD"] = "changeme"
+		}
+	}
 	for k, v := range spec.Env {
 		env = append(env, corev1.EnvVar{Name: k, Value: v})
 	}
@@ -134,6 +153,9 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 
 	// Deployment
 	replicas := int32(1)
+	// Optional imagePullSecret name
+	imgPullSecret := strings.TrimSpace(os.Getenv("K8S_IMAGE_PULL_SECRET"))
+
 	dep := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: labels},
 		Spec: appsv1.DeploymentSpec{
@@ -141,15 +163,23 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": name}},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
-				Spec: corev1.PodSpec{Containers: []corev1.Container{{
-					Name:           "app",
-					Image:          spec.Image,
-					Args:           spec.Args,
-					Env:            env,
-					Ports:          cports,
-					ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromInt(8080)}}},
-					LivenessProbe:  &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromInt(8080)}}},
-				}}},
+				Spec: corev1.PodSpec{
+					ImagePullSecrets: func() []corev1.LocalObjectReference {
+						if imgPullSecret == "" {
+							return nil
+						}
+						return []corev1.LocalObjectReference{{Name: imgPullSecret}}
+					}(),
+					Containers: []corev1.Container{{
+						Name:           "app",
+						Image:          spec.Image,
+						Args:           spec.Args,
+						Env:            env,
+						Ports:          cports,
+						ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromInt(8080)}}},
+						LivenessProbe:  &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromInt(8080)}}},
+					}},
+				},
 			},
 		},
 	}

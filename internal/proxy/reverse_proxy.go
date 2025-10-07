@@ -17,11 +17,10 @@ import (
 )
 
 type Options struct {
-	Allowlist *Allowlist
-	MaxBody   int64
-	Timeout   time.Duration
-	Dial      func(ctx context.Context, network, address string) (any, error)
-	Logger    *log.Logger
+	MaxBody int64
+	Timeout time.Duration
+	Dial    func(ctx context.Context, network, address string) (any, error)
+	Logger  *log.Logger
 	// ResolveServer: given a logical server ID and desired subPath, return target scheme, host:port, and normalized path
 	ResolveServer func(ctx context.Context, serverID string, subPath string) (scheme string, hostport string, path string, err error)
 }
@@ -91,24 +90,18 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// validate target
-	h, ps, ok := strings.Cut(to, ":")
-	if !ok {
+	host, ps, err := net.SplitHostPort(to)
+	if err != nil {
 		http.Error(w, "invalid to", http.StatusBadRequest)
 		return
 	}
+	_ = host
 	port, err := strconv.Atoi(ps)
 	if err != nil || port <= 0 || port > 65535 {
 		http.Error(w, "invalid port", http.StatusBadRequest)
 		return
 	}
-	// Allowlist check disabled for prototype mode
-	// deny unroutable unless explicitly allowlisted - already enforced by allowlist
-	if ip := net.ParseIP(h); ip != nil {
-		if isPrivateIP(ip) && !p.opts.Allowlist.Allowed(h, port) {
-			http.Error(w, fmt.Sprintf("private address not allowlisted: %s (add to allowlist in ~/.guildnet/config.json)", to), http.StatusForbidden)
-			return
-		}
-	}
+	// Allowlist removed: no special restriction on private addresses.
 
 	// Default scheme by port if not provided
 	if scheme == "" {
@@ -224,20 +217,3 @@ func singleJoiningSlash(a, b string) string {
 }
 
 //
-
-func isPrivateIP(ip net.IP) bool {
-	privateBlocks := []string{
-		"10.0.0.0/8",
-		"172.16.0.0/12",
-		"192.168.0.0/16",
-		"127.0.0.0/8",
-		"::1/128",
-	}
-	for _, cidr := range privateBlocks {
-		_, block, _ := net.ParseCIDR(cidr)
-		if block.Contains(ip) {
-			return true
-		}
-	}
-	return false
-}

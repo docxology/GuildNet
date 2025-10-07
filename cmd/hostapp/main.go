@@ -149,22 +149,7 @@ func main() {
 		log.Fatalf("invalid config: %v", err)
 	}
 
-	// Dev default: if no allowlist configured, allow local agent on 127.0.0.1:8443
-	// This makes the demo agent/code-server iframe work out-of-the-box in local dev.
-	if len(cfg.Allowlist) == 0 {
-		cfg.Allowlist = []string{
-			"127.0.0.1:8080", "::1:8080", "localhost:8080",
-		}
-		log.Printf("dev default allowlist applied: %v", cfg.Allowlist)
-	}
-
-	al, err := proxy.NewAllowlist(cfg.Allowlist)
-	if err != nil {
-		log.Fatalf("allowlist: %v", err)
-	}
-	if al.IsEmpty() {
-		log.Printf("warning: allowlist empty; /api/ping and /proxy will deny all")
-	}
+	// Allowlist removed: no gating of /proxy by CIDR/host:port.
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -195,7 +180,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("k8s client: %v", err)
 	}
-	const defaultNS = "default"
+	defaultNS := strings.TrimSpace(os.Getenv("K8S_NAMESPACE"))
+	if defaultNS == "" {
+		defaultNS = "default"
+	}
 
 	// UI config (optional)
 	mux.HandleFunc("/api/ui-config", func(w http.ResponseWriter, r *http.Request) {
@@ -436,9 +424,8 @@ func main() {
 
 	// proxy handler
 	proxyHandler := proxy.NewReverseProxy(proxy.Options{
-		Allowlist: al,
-		MaxBody:   10 * 1024 * 1024,
-		Timeout:   10 * time.Second,
+		MaxBody: 10 * 1024 * 1024,
+		Timeout: 10 * time.Second,
 		Dial: func(ctx context.Context, network, address string) (any, error) {
 			// For loopback targets in local dev, bypass tsnet and dial OS loopback directly.
 			host, _, err := net.SplitHostPort(address)
@@ -460,7 +447,15 @@ func main() {
 		},
 		Logger: httpx.Logger(),
 		ResolveServer: func(ctx context.Context, serverID string, subPath string) (string, string, string, error) {
-			// Derive upstream from Kubernetes server metadata
+			// Prefer resolving to ClusterIP to make CIDR allowlisting effective
+			if host, port, https, err := kcli.ResolveServiceAddress(ctx, defaultNS, serverID); err == nil && host != "" && port > 0 {
+				scheme := "http"
+				if https {
+					scheme = "https"
+				}
+				return scheme, net.JoinHostPort(host, fmt.Sprintf("%d", port)), subPath, nil
+			}
+			// Fallback to server metadata
 			srv, err := kcli.GetServer(ctx, defaultNS, serverID)
 			if err != nil {
 				return "", "", "", fmt.Errorf("unknown server: %s", serverID)
@@ -468,9 +463,16 @@ func main() {
 			// 1) If Env.AGENT_HOST present, allow host[:port] directly
 			if srv.Env != nil {
 				if v := strings.TrimSpace(srv.Env["AGENT_HOST"]); v != "" {
-					// If no port specified, pick from Ports or default 8080
 					if strings.Contains(v, ":") {
-						return "http", v, subPath, nil
+						// assume scheme by port if specified
+						_, sp, _ := strings.Cut(v, ":")
+						pp := 8080
+						fmt.Sscanf(sp, "%d", &pp)
+						scheme := map[int]string{8443: "https"}[pp]
+						if scheme == "" {
+							scheme = "http"
+						}
+						return scheme, v, subPath, nil
 					}
 					p := 8080
 					for _, pr := range srv.Ports {
@@ -482,11 +484,9 @@ func main() {
 					return map[int]string{8443: "https", 8080: "http"}[p], net.JoinHostPort(v, fmt.Sprintf("%d", p)), subPath, nil
 				}
 			}
-			// 2) If Ports include a probable HTTP port, assume loopback on server's node name or Kubernetes Service name when available
-			// Attempt a best-effort heuristic:
+			// 2) Heuristic: node or service FQDN
 			host := strings.TrimSpace(srv.Node)
 			if host == "" && srv.Name != "" {
-				// dns1123 of name as service in default namespace
 				host = dns1123Name(srv.Name) + ".default.svc.cluster.local"
 			}
 			if host != "" {
@@ -499,8 +499,7 @@ func main() {
 				}
 				return map[int]string{8443: "https", 8080: "http"}[p], net.JoinHostPort(host, fmt.Sprintf("%d", p)), subPath, nil
 			}
-			// 3) Otherwise fail with guidance
-			return "", "", "", fmt.Errorf("no upstream hint; set Env.AGENT_HOST to a reachable host[:port] or ensure server.ports and node are populated")
+			return "", "", "", fmt.Errorf("no upstream hint; set Env.AGENT_HOST or ensure service exists and ports are populated")
 		},
 	})
 	mux.Handle("/proxy", proxyHandler)

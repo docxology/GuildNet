@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: tailscale-subnet-router
+  namespace: kube-system
+  labels:
+    app: tailscale-subnet-router
+spec:
+  selector:
+    matchLabels:
+      app: tailscale-subnet-router
+  template:
+    metadata:
+      labels:
+        app: tailscale-subnet-router
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: tailscale
+        image: tailscale/tailscale:stable
+        securityContext:
+          capabilities:
+            add: ["NET_ADMIN", "NET_RAW"]
+          privileged: true
+        env:
+        - name: TS_AUTHKEY
+          value: "${TS_AUTHKEY}"
+        - name: TS_LOGIN_SERVER
+          value: "${TS_LOGIN_SERVER}"
+        - name: TS_ROUTES
+          value: "${TS_ROUTES}"
+        - name: TS_HOSTNAME
+          value: "${TS_HOSTNAME}"
+        volumeMounts:
+        - name: state
+          mountPath: /var/lib/tailscale
+        - name: tun
+          mountPath: /dev/net/tun
+        args:
+        - /bin/sh
+        - -c
+        - |
+          set -e
+          /usr/sbin/tailscaled --state=/var/lib/tailscale/tailscaled.state &
+          sleep 2
+          HOSTNAME_ARG="--hostname=${TS_HOSTNAME:-talos-subnet-router-$(hostname)}"
+          tailscale up --authkey="${TS_AUTHKEY}" --login-server="${TS_LOGIN_SERVER}" --advertise-routes="${TS_ROUTES}" $HOSTNAME_ARG --accept-routes
+          tail -f /dev/null
+      volumes:
+      - name: state
+        emptyDir: {}
+      - name: tun
+        hostPath:
+          path: /dev/net/tun
+          type: CharDevice
