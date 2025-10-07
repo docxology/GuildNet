@@ -36,10 +36,10 @@ log "Building hostapp..."
 
 # TLS certs
 if [ $GEN_CERTS -eq 1 ]; then
-  if [ -x "$ROOT/scripts/generate-certs.sh" ]; then
-    "$ROOT/scripts/generate-certs.sh"
+  if [ -x "$ROOT/scripts/generate-server-cert.sh" ]; then
+    "$ROOT/scripts/generate-server-cert.sh" -f
   else
-    sh "$ROOT/scripts/generate-certs.sh"
+    sh "$ROOT/scripts/generate-server-cert.sh" -f
   fi
 fi
 

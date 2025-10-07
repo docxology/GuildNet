@@ -50,8 +50,8 @@ make build
 ```bash
 # one-liner helper (build + certs + CORS + serve)
 make dev-run ORIGIN=https://localhost:5173
-# or manually
-make build && scripts/generate-certs.sh && FRONTEND_ORIGIN=https://localhost:5173 ./bin/hostapp serve
+# or manually (ensure CA-signed server cert is present)
+make build && scripts/generate-server-cert.sh -f && FRONTEND_ORIGIN=https://localhost:5173 ./bin/hostapp serve
 ```
 
 3) Run the UI (HTTPS)
