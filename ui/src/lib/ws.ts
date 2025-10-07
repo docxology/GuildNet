@@ -30,6 +30,7 @@ export class WSManager extends Emitter {
   private heartbeatTimer?: number;
   private connectTimer?: number;
   private lastPong = Date.now();
+  private didProbe = false; // single-shot status probe on error
 
   constructor(url: string, opts?: { maxRetries?: number; heartbeatInterval?: number }) {
     super();
@@ -46,7 +47,7 @@ export class WSManager extends Emitter {
     this.emit('state', this.state, this.retries);
     try {
       // Dev diagnostics
-      try { console.info('[SSE] connecting', this.url); } catch {}
+  try { console.info('[SSE] connecting', this.url); } catch {}
       this.es = new EventSource(this.url);
     } catch (e) {
       this.fail(e instanceof Error ? e.message : String(e));
@@ -76,8 +77,27 @@ export class WSManager extends Emitter {
     if (this.es) this.es.onmessage = (ev) => {
       if (typeof ev.data === 'string') onMessage(ev.data);
     };
-    if (this.es) this.es.onerror = (ev) => {
-      try { console.error('[SSE] error', ev); } catch {}
+    if (this.es) this.es.onerror = async (ev) => {
+      try { console.error('[SSE] error event', { readyState: (this.es as EventSource).readyState, ev }); } catch {}
+      // Best-effort: try to fetch the same URL once to surface HTTP status/body when server rejects (e.g., 400/404/500)
+      if (!this.didProbe) {
+        this.didProbe = true;
+        try {
+          const res = await fetch(this.url, { method: 'GET', headers: { Accept: 'application/json' } });
+          const ct = res.headers.get('content-type') || '';
+          let body: any = undefined;
+          if (ct.includes('application/json')) {
+            try { body = await res.json(); } catch {}
+          } else {
+            try { body = await res.text(); } catch {}
+          }
+          console.error('[SSE] probe status', { status: res.status, statusText: res.statusText, body });
+          this.emit('error', { status: res.status, statusText: res.statusText, body });
+        } catch (e) {
+          console.error('[SSE] probe failed', e);
+          this.emit('error', { probeFailed: true, message: e instanceof Error ? e.message : String(e) });
+        }
+      }
       this.fail('sse error');
     };
   }
@@ -118,6 +138,7 @@ export class WSManager extends Emitter {
   private cleanup() {
     if (this.connectTimer) window.clearTimeout(this.connectTimer);
     this.connectTimer = undefined;
+  this.es?.close?.();
   this.es = undefined;
   }
 }

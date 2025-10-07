@@ -63,6 +63,14 @@ func (w *respWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
+// Ensure wrapped writer still supports streaming when the underlying does.
+// This lets handlers like SSE do `w.(http.Flusher)` successfully through middleware.
+func (w *respWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // request id context key
 type ctxKey string
 

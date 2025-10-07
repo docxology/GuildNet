@@ -139,6 +139,13 @@ func main() {
 
 	mux := http.NewServeMux()
 
+	// health check
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
 	// in-memory store for demo endpoints
 	mem := store.New()
 	mem.SeedDemo()
@@ -231,15 +238,14 @@ func main() {
 
 	// logs SSE
 	mux.HandleFunc("/sse/logs", func(w http.ResponseWriter, r *http.Request) {
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Accel-Buffering", "no")
+		// Panic guard to surface 500s with context
+		defer func(start time.Time) {
+			if rec := recover(); rec != nil {
+				log.Printf("sse/logs panic: target=%s level=%s remote=%s err=%v duration=%s", r.URL.Query().Get("target"), r.URL.Query().Get("level"), r.RemoteAddr, rec, time.Since(start))
+				http.Error(w, "internal error", http.StatusInternalServerError)
+			}
+		}(time.Now())
+
 		q := r.URL.Query()
 		id := q.Get("target")
 		level := q.Get("level")
@@ -250,19 +256,51 @@ func main() {
 		if v := q.Get("tail"); v != "" {
 			fmt.Sscanf(v, "%d", &tail)
 		}
+
+		// Validate before switching to SSE
+		if id == "" {
+			httpx.JSONError(w, http.StatusBadRequest, "missing target")
+			return
+		}
+		if _, ok := mem.GetServer(id); !ok {
+			httpx.JSONError(w, http.StatusNotFound, "unknown target")
+			return
+		}
+
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			httpx.JSONError(w, http.StatusInternalServerError, "streaming unsupported")
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+
 		log.Printf("sse/logs open: target=%s level=%s tail=%d from %s", id, level, tail, r.RemoteAddr)
 		enc := json.NewEncoder(w)
-		// send tail first
-		if id != "" {
-			if lines, err := mem.GetLogs(id, level, tail); err == nil {
-				for _, ln := range lines {
-					_, _ = w.Write([]byte("data: "))
-					_ = enc.Encode(ln)
-					_, _ = w.Write([]byte("\n"))
-					flusher.Flush()
+
+		// send tail first (best effort)
+		if lines, err := mem.GetLogs(id, level, tail); err != nil {
+			log.Printf("sse/logs tail error: target=%s level=%s err=%v", id, level, err)
+		} else {
+			for _, ln := range lines {
+				if _, err := w.Write([]byte("data: ")); err != nil {
+					log.Printf("sse/logs write error: %v", err)
+					return
 				}
+				if err := enc.Encode(ln); err != nil {
+					log.Printf("sse/logs encode error: %v", err)
+					return
+				}
+				if _, err := w.Write([]byte("\n")); err != nil {
+					log.Printf("sse/logs write error: %v", err)
+					return
+				}
+				flusher.Flush()
 			}
 		}
+
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
 		ch, unsub := mem.SubscribeLogs(ctx, id, level)
@@ -272,17 +310,31 @@ func main() {
 		for {
 			select {
 			case <-ctx.Done():
+				log.Printf("sse/logs close: target=%s level=%s from=%s reason=context-done", id, level, r.RemoteAddr)
 				return
 			case <-heartbeat.C:
-				_, _ = w.Write([]byte(": ping\n\n")) // comment as heartbeat
+				if _, err := w.Write([]byte(": ping\n\n")); err != nil {
+					log.Printf("sse/logs heartbeat write error: %v", err)
+					return
+				}
 				flusher.Flush()
 			case ln, ok := <-ch:
 				if !ok {
+					log.Printf("sse/logs close: target=%s level=%s from=%s reason=channel-closed", id, level, r.RemoteAddr)
 					return
 				}
-				_, _ = w.Write([]byte("data: "))
-				_ = enc.Encode(ln)
-				_, _ = w.Write([]byte("\n"))
+				if _, err := w.Write([]byte("data: ")); err != nil {
+					log.Printf("sse/logs write error: %v", err)
+					return
+				}
+				if err := enc.Encode(ln); err != nil {
+					log.Printf("sse/logs encode error: %v", err)
+					return
+				}
+				if _, err := w.Write([]byte("\n")); err != nil {
+					log.Printf("sse/logs write error: %v", err)
+					return
+				}
 				flusher.Flush()
 			}
 		}

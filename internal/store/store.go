@@ -121,6 +121,9 @@ func (s *Store) GetLogs(id, level string, limit int) ([]model.LogLine, error) {
 
 func (s *Store) SubscribeLogs(ctx context.Context, id, level string) (<-chan model.LogLine, func()) {
 	ch := make(chan model.LogLine, 64)
+	var once sync.Once
+	closeCh := func() { once.Do(func() { close(ch) }) }
+
 	k := key(id, level)
 	s.mu.Lock()
 	if _, ok := s.subs[k]; !ok {
@@ -128,12 +131,14 @@ func (s *Store) SubscribeLogs(ctx context.Context, id, level string) (<-chan mod
 	}
 	s.subs[k][ch] = struct{}{}
 	s.mu.Unlock()
+
 	cancel := func() {
 		s.mu.Lock()
 		delete(s.subs[k], ch)
 		s.mu.Unlock()
-		close(ch)
+		closeCh()
 	}
+
 	go func() {
 		<-ctx.Done()
 		cancel()
