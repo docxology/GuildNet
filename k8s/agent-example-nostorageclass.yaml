@@ -19,25 +19,30 @@ spec:
         runAsNonRoot: true
         fsGroup: 10001
         fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      tolerations:
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "node-role.kubernetes.io/master"
+          operator: "Exists"
+          effect: "NoSchedule"
       containers:
         - name: agent
-          image: guildnet/agent:dev
+          image: ghcr.io/hexafield/guildnet-agent:latest
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           env:
             - name: PORT
               value: "8080"
             - name: HTTPS_PORT
               value: "8443"
-            # Optional hint for UI when node hostname is not available in API payload
-            # Set to the Kubernetes Service DNS name or Pod IP as appropriate
             - name: AGENT_HOST
               value: "agent-demo"
-            # OPTIONAL: set PASSWORD explicitly; else it will be generated and stored in /data
-            #- name: PASSWORD
-            #  valueFrom:
-            #    secretKeyRef:
-            #      name: agent-demo-secret
-            #      key: PASSWORD
           ports:
             - containerPort: 8080
               name: http
@@ -47,11 +52,11 @@ spec:
             requests:
               cpu: "250m"
               memory: "1Gi"
-              ephemeral-storage: "4Gi"
+              ephemeral-storage: "8Gi"
             limits:
               cpu: "1"
               memory: "2Gi"
-              ephemeral-storage: "8Gi"
+              ephemeral-storage: "16Gi"
           volumeMounts:
             - name: data
               mountPath: /data
@@ -73,11 +78,11 @@ spec:
             failureThreshold: 5
       volumes:
         - name: data
-          persistentVolumeClaim:
-            claimName: agent-demo-data
+          emptyDir:
+            sizeLimit: 20Gi
         - name: workspace
-          persistentVolumeClaim:
-            claimName: agent-demo-workspace
+          emptyDir:
+            sizeLimit: 50Gi
 ---
 apiVersion: v1
 kind: Service
@@ -89,35 +94,9 @@ spec:
   selector:
     app: agent-demo
   ports:
-  - name: http
-    port: 8080
-    targetPort: http
-  - name: https
-    port: 8443
-    targetPort: https
-
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: agent-demo-data
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 20Gi
-  # storageClassName: <your-storage-class>  # Uncomment to pin a non-default class
-
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: agent-demo-workspace
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 50Gi
-  # storageClassName: <your-storage-class>  # Uncomment to pin a non-default class
+    - name: http
+      port: 8080
+      targetPort: http
+    - name: https
+      port: 8443
+      targetPort: https

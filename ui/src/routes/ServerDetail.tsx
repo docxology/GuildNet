@@ -4,7 +4,7 @@ import StatusPill from '../components/StatusPill';
 import KeyValueList from '../components/KeyValueList';
 import LogViewer from '../components/LogViewer';
 import { useParams } from '@solidjs/router';
-import { Show, createMemo, createResource, createSignal } from 'solid-js';
+import { Show, createEffect, createMemo, createResource, createSignal, onCleanup } from 'solid-js';
 import { getServer } from '../lib/api';
 import { formatDate } from '../lib/format';
 import { apiUrl } from '../lib/config';
@@ -20,6 +20,77 @@ export default function ServerDetail() {
     if (!s) return '';
     if (s.url && s.url.startsWith('https://')) return s.url;
     return apiUrl(`/proxy/server/${encodeURIComponent(s.id)}/`);
+  });
+
+  // Preflight: poll IDE URL until it responds, then set iframe src
+  const [frameSrc, setFrameSrc] = createSignal<string | null>(null);
+  const [ideChecking, setIdeChecking] = createSignal(false);
+  const [ideError, setIdeError] = createSignal<string | null>(null);
+
+  createEffect(() => {
+    // Reset when switching tabs or server changes
+    const url = ideUrl();
+    const active = tab() === 'ide' && !!url;
+    if (!active) {
+      setFrameSrc(null);
+      setIdeChecking(false);
+      setIdeError(null);
+      return;
+    }
+
+    let cancelled = false;
+    setIdeChecking(true);
+    setIdeError(null);
+
+    const controller = new AbortController();
+    const start = Date.now();
+
+    const rand = Math.random().toString(36).slice(2, 10);
+
+    const check = async (attempt = 0) => {
+      if (cancelled) return;
+      try {
+        // Use GET to ensure we mimic the iframe navigation and avoid cache
+        const res = await fetch(url, {
+          method: 'GET',
+          credentials: 'include',
+          cache: 'no-store',
+          headers: {
+            'Pragma': 'no-cache',
+            'Cache-Control': 'no-cache',
+            'Accept': 'text/html',
+          },
+          signal: controller.signal,
+        });
+        if (res.ok || (res.status >= 200 && res.status < 400)) {
+          // Ready: set iframe src with a correlation id to bust caches
+          const q = url.includes('?') ? '&' : '?';
+          setFrameSrc(`${url}${q}xid=${rand}`);
+          setIdeChecking(false);
+          return;
+        }
+        // Not ready yet; fall through to retry
+      } catch (e) {
+        // Network/abort errors: retry unless cancelled
+        if (cancelled) return;
+      }
+      const elapsed = Date.now() - start;
+      const backoff = Math.min(1500 + attempt * 250, 2500);
+      if (elapsed > 15000) {
+        setIdeError('IDE is taking longer than expected to start. You can retry switching tabs or wait a moment.');
+        setIdeChecking(false);
+        return;
+      }
+      setTimeout(() => check(attempt + 1), backoff);
+    };
+
+    // Kick off checks
+    check(0);
+
+    onCleanup(() => {
+      cancelled = true;
+      controller.abort();
+    });
   });
 
   return (
@@ -71,16 +142,16 @@ export default function ServerDetail() {
                     return (
                       <div class="relative border rounded-md overflow-hidden h-[70vh]">
                         <iframe
-                          src={url()}
+                          src={frameSrc() || ''}
                           title="code-server"
                           class="w-full h-full bg-white"
                           referrerpolicy="no-referrer"
                           allow="clipboard-read; clipboard-write;"
                           onLoad={() => setLoaded(true)}
                         />
-                        <Show when={!loaded()}>
+                        <Show when={!loaded() || ideChecking()}>
                           <div class="absolute inset-0 flex items-center justify-center bg-white/70 text-sm text-neutral-600">
-                            Opening IDE…
+                            {ideError() || 'Opening IDE…'}
                           </div>
                         </Show>
                       </div>

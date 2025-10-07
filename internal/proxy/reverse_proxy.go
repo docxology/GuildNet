@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"html"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -127,255 +125,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	targetURL := &url.URL{Scheme: scheme, Host: to, Path: subPath}
 
 	// If using API server proxy and destination looks like a Service, route via API instead of direct dial.
-	if p.opts.APIProxy != nil {
-		hostOnly, _, _ := net.SplitHostPort(to)
-		useAPI := strings.Contains(hostOnly, ".svc")
-		if ip := net.ParseIP(hostOnly); ip != nil {
-			// heuristically treat RFC1918 as cluster-internal
-			useAPI = useAPI || (ip.IsPrivate())
-		}
-		if useAPI {
-			if rt, setDirector, ok := p.opts.APIProxy(); ok && rt != nil && setDirector != nil {
-				// Preflight: check readiness and pick a working port
-				resolvedScheme := scheme
-				resolvedTo := to
-				// Try http:8080 then https:8443 if original was http:8080
-				hostOnly, _, _ := net.SplitHostPort(to)
-				candidates := []struct{ sch, hp string }{}
-				// prefer 8080 then 8443
-				candidates = append(candidates, struct{ sch, hp string }{"http", net.JoinHostPort(hostOnly, "8080")})
-				candidates = append(candidates, struct{ sch, hp string }{"https", net.JoinHostPort(hostOnly, "8443")})
-				// If the original to has an explicit port not in candidates, include it first
-				if to != candidates[0].hp && to != candidates[1].hp {
-					candidates = append([]struct{ sch, hp string }{{scheme, to}}, candidates...)
-				}
-				picked := false
-				pickedViaPod := false
-				for _, c := range candidates {
-					// Build a HEAD request to /healthz via API proxy to test basic reachability
-					dummy := &http.Request{URL: &url.URL{}, Header: make(http.Header)}
-					if serverIDForAPI != "" {
-						dummy.Header.Set("X-Guild-Server-ID", serverIDForAPI)
-					}
-					// Probe root path so it's valid whether Caddy is up or code-server serves directly
-					setDirector(dummy, c.sch, c.hp, "/")
-					headReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, dummy.URL.String(), nil)
-					headReq.Header = make(http.Header)
-					if serverIDForAPI != "" {
-						headReq.Header.Set("X-Guild-Server-ID", serverIDForAPI)
-					}
-					headReq.Close = true
-					cli := &http.Client{Transport: rt, Timeout: 3 * time.Second}
-					if resp, err := cli.Do(headReq); err == nil {
-						resp.Body.Close()
-						if resp.StatusCode < 500 { // consider 2xx/3xx/4xx as reachable
-							resolvedScheme = c.sch
-							resolvedTo = c.hp
-							picked = true
-							break
-						}
-					}
-					// Try pods proxy as a fallback probe
-					dummy2 := &http.Request{URL: &url.URL{}, Header: make(http.Header)}
-					if serverIDForAPI != "" {
-						dummy2.Header.Set("X-Guild-Server-ID", serverIDForAPI)
-					}
-					dummy2.Header.Set("X-Guild-Prefer-Pod", "1")
-					// Probe root path on pods proxy as well
-					setDirector(dummy2, c.sch, c.hp, "/")
-					headReq2, _ := http.NewRequestWithContext(ctx, http.MethodGet, dummy2.URL.String(), nil)
-					headReq2.Header = make(http.Header)
-					if serverIDForAPI != "" {
-						headReq2.Header.Set("X-Guild-Server-ID", serverIDForAPI)
-					}
-					headReq2.Header.Set("X-Guild-Prefer-Pod", "1")
-					headReq2.Close = true
-					if resp2, err2 := cli.Do(headReq2); err2 == nil {
-						resp2.Body.Close()
-						if resp2.StatusCode < 500 {
-							resolvedScheme = c.sch
-							resolvedTo = c.hp
-							picked = true
-							pickedViaPod = true
-							break
-						}
-					}
-				}
-				if !picked {
-					// Not ready: render a small HTML auto-retry page instead of raw JSON
-					w.Header().Set("Content-Type", "text/html; charset=utf-8")
-					w.Header().Set("Cache-Control", "no-store")
-					w.WriteHeader(http.StatusServiceUnavailable)
-					fmt.Fprintf(w, "<html><head><meta http-equiv=refresh content=2><style>body{font-family:system-ui;margin:2rem;color:#444}</style></head><body><h3>Server is starting…</h3><p>Upstream not reachable yet. Retrying…</p></body></html>")
-					return
-				}
-				// Update scheme/hostport per probe result
-				scheme = resolvedScheme
-				to = resolvedTo
-				// Build target URL using director on a dummy request
-				dummy := &http.Request{URL: &url.URL{}, Header: make(http.Header)}
-				if serverIDForAPI != "" {
-					dummy.Header.Set("X-Guild-Server-ID", serverIDForAPI)
-				}
-				setDirector(dummy, scheme, to, subPath)
-				// Construct outbound request with same method/body
-				// Note: body may be nil for GET; otherwise reuse.
-				outReq, err := http.NewRequestWithContext(ctx, r.Method, dummy.URL.String(), r.Body)
-				if err != nil {
-					http.Error(w, fmt.Sprintf("build upstream request: %v", err), http.StatusBadGateway)
-					return
-				}
-				// Ensure client-side request fields are sane
-				outReq.RequestURI = ""
-				outReq.Host = ""
-				outReq.Close = true
-				// Copy headers (excluding hop-by-hop)
-				outReq.Header = make(http.Header, len(r.Header))
-				for k, vv := range r.Header {
-					switch strings.ToLower(k) {
-					case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
-						continue
-					}
-					for _, v := range vv {
-						outReq.Header.Add(k, v)
-					}
-				}
-				// Prevent conditional requests that can yield 304 (iframe + empty body issues)
-				outReq.Header.Del("If-None-Match")
-				outReq.Header.Del("If-Modified-Since")
-				outReq.Header.Del("If-Match")
-				outReq.Header.Del("If-Unmodified-Since")
-				outReq.Header.Del("If-Range")
-				if serverIDForAPI != "" {
-					outReq.Header.Set("X-Guild-Server-ID", serverIDForAPI)
-				}
-				if pickedViaPod {
-					outReq.Header.Set("X-Guild-Prefer-Pod", "1")
-				}
-				if p.opts.Logger != nil {
-					p.opts.Logger.Printf("api-proxy dispatch url=%s requestURI=%q host=%s sid=%q", outReq.URL.String(), outReq.RequestURI, outReq.Host, serverIDForAPI)
-				}
-				// Execute via API transport with a small retry on transient connection errors
-				cli := &http.Client{Transport: rt, Timeout: p.opts.Timeout}
-				var resp *http.Response
-				var doErr error
-				for attempt := 0; attempt < 2; attempt++ {
-					resp, doErr = cli.Do(outReq)
-					if doErr == nil {
-						break
-					}
-					// Retry only for idempotent methods and transient errors
-					if r.Method != http.MethodGet && r.Method != http.MethodHead {
-						break
-					}
-					es := strings.ToLower(doErr.Error())
-					if strings.Contains(es, "eof") || strings.Contains(es, "connection reset") || strings.Contains(es, "broken pipe") {
-						time.Sleep(100 * time.Millisecond)
-						continue
-					}
-					break
-				}
-				if doErr != nil {
-					http.Error(w, fmt.Sprintf("upstream error: %v", doErr), http.StatusBadGateway)
-					return
-				}
-				// Removed http->https fallback: trust preflight-selected upstream to avoid erroneous 8443 attempts
-				defer resp.Body.Close()
-
-				// If the service proxy returns a 5xx (commonly 503 with "connection refused"),
-				// try a one-shot fallback via pods proxy for GET/HEAD, then either return that
-				// response or render a friendly readiness gate.
-				if resp.StatusCode >= 500 && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
-					// Peek small body to detect typical kube error
-					peek, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-					resp.Body.Close()
-					errStr := strings.ToLower(string(peek))
-					shouldTryPod := !pickedViaPod && (strings.Contains(errStr, "connection refused") || strings.Contains(errStr, "dial tcp") || strings.Contains(errStr, "no endpoints") || strings.Contains(errStr, "error trying to reach service"))
-					if shouldTryPod {
-						// Rebuild request targeting pods-proxy
-						dmy := &http.Request{URL: &url.URL{}, Header: make(http.Header)}
-						if serverIDForAPI != "" {
-							dmy.Header.Set("X-Guild-Server-ID", serverIDForAPI)
-						}
-						dmy.Header.Set("X-Guild-Prefer-Pod", "1")
-						setDirector(dmy, scheme, to, subPath)
-						// GET/HEAD have no body for retry here
-						outReq2, _ := http.NewRequestWithContext(ctx, r.Method, dmy.URL.String(), nil)
-						outReq2.Header = make(http.Header)
-						if serverIDForAPI != "" {
-							outReq2.Header.Set("X-Guild-Server-ID", serverIDForAPI)
-						}
-						outReq2.Header.Set("X-Guild-Prefer-Pod", "1")
-						outReq2.Close = true
-						resp2, err2 := cli.Do(outReq2)
-						if err2 == nil && resp2 != nil {
-							defer resp2.Body.Close()
-							if resp2.StatusCode < 500 {
-								// Swap to pods-proxy response handling below
-								resp = resp2
-								pickedViaPod = true
-								// Continue to header/body copy below
-							} else {
-								// Replace with friendly gate
-								w.Header().Set("Content-Type", "text/html; charset=utf-8")
-								w.Header().Set("Cache-Control", "no-store")
-								w.WriteHeader(http.StatusServiceUnavailable)
-								fmt.Fprintf(w, "<html><head><meta http-equiv=refresh content=2><style>body{font-family:system-ui;margin:2rem;color:#444}</style></head><body><h3>Server is starting…</h3><pre style=white-space:pre-wrap>Upstream not ready yet. Retrying…\n%s</pre></body></html>", htmlEscapeTrunc(string(peek), 200))
-								return
-							}
-						} else {
-							// Transport error trying pod proxy; show gate
-							w.Header().Set("Content-Type", "text/html; charset=utf-8")
-							w.Header().Set("Cache-Control", "no-store")
-							w.WriteHeader(http.StatusServiceUnavailable)
-							fmt.Fprintf(w, "<html><head><meta http-equiv=refresh content=2><style>body{font-family:system-ui;margin:2rem;color:#444}</style></head><body><h3>Server is starting…</h3><p>Upstream not reachable yet. Retrying…</p></body></html>")
-							return
-						}
-					} else {
-						// Unknown 5xx; show friendly gate with snippet
-						w.Header().Set("Content-Type", "text/html; charset=utf-8")
-						w.Header().Set("Cache-Control", "no-store")
-						w.WriteHeader(http.StatusServiceUnavailable)
-						fmt.Fprintf(w, "<html><head><meta http-equiv=refresh content=2><style>body{font-family:system-ui;margin:2rem;color:#444}</style></head><body><h3>Server is starting…</h3><pre style=white-space:pre-wrap>%s</pre></body></html>", htmlEscapeTrunc(string(peek), 200))
-						return
-					}
-				}
-				// Copy headers and status
-				for k, vv := range resp.Header {
-					for _, v := range vv {
-						w.Header().Add(k, v)
-					}
-				}
-				// Enforce no-store to avoid browser caching and conditional revalidation
-				w.Header().Del("ETag")
-				w.Header().Set("Cache-Control", "no-store")
-				w.Header().Set("Pragma", "no-cache")
-				w.Header().Set("Expires", "0")
-				// Allow embedding in iframe by relaxing frame headers but preserve other CSP directives
-				w.Header().Del("X-Frame-Options")
-				if csp := w.Header().Get("Content-Security-Policy"); csp != "" {
-					w.Header().Set("Content-Security-Policy", relaxFrameAncestors(csp))
-				} else {
-					w.Header().Set("Content-Security-Policy", "frame-ancestors *")
-				}
-
-				// Rewrite Location header to stay within proxy base
-				if loc := resp.Header.Get("Location"); loc != "" {
-					baseHref := "/proxy/" + to + "/"
-					if serverIDForAPI != "" {
-						baseHref = "/proxy/server/" + url.PathEscape(serverIDForAPI) + "/"
-					}
-					newLoc := rewriteLocation(loc, baseHref)
-					w.Header().Set("Location", newLoc)
-				}
-
-				// Stream body as-is (avoid brittle HTML rewriting)
-				w.WriteHeader(resp.StatusCode)
-				_, _ = io.Copy(w, resp.Body)
-				return
-			}
-		}
-	}
+	// Simplified: always use ReverseProxy below; APIProxy will be used via Transport/Director when configured.
 
 	// custom transport using tsnet dialer
 	// Choose transport: use API server proxy when available for cluster destinations.
@@ -413,7 +163,14 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// Preserve original method, body, and most headers. Adjust URL.
 			if p.opts.APIProxy != nil {
 				if rt, setDirector, ok := p.opts.APIProxy(); ok && rt != nil && setDirector != nil {
-					// Let APIProxy set the URL to API server proxy path
+					// Prefer pods proxy to avoid Service readiness/endpoint races
+					// and include the logical server ID for better pod/service discovery.
+					// These must be set BEFORE computing the API path so setDirector can read them.
+					req.Header.Set("X-Guild-Prefer-Pod", "1")
+					if serverIDForAPI != "" {
+						req.Header.Set("X-Guild-Server-ID", serverIDForAPI)
+					}
+					// Let APIProxy set the URL to API server proxy path based on headers.
 					setDirector(req, targetURL.Scheme, targetURL.Host, targetURL.Path)
 				} else {
 					req.URL.Scheme = targetURL.Scheme
@@ -438,16 +195,9 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Transport: transport,
 		ModifyResponse: func(resp *http.Response) error {
 			if p.opts.Logger != nil {
-				p.opts.Logger.Printf("proxy to=%s path=%s status=%d", to, subPath, resp.StatusCode)
+				p.opts.Logger.Printf("proxy resp status=%d method=%s to=%s path=%s url=%s", resp.StatusCode, r.Method, to, subPath, r.URL.String())
 			}
-			// Relax frame restrictions for embedding while preserving other CSP directives
-			resp.Header.Del("X-Frame-Options")
-			if csp := resp.Header.Get("Content-Security-Policy"); csp != "" {
-				resp.Header.Set("Content-Security-Policy", relaxFrameAncestors(csp))
-			} else {
-				resp.Header.Set("Content-Security-Policy", "frame-ancestors *")
-			}
-			// Rewrite Location to stay under proxy base
+			// Only rewrite Location to stay under proxy base; avoid CSP/cookie changes.
 			if loc := resp.Header.Get("Location"); loc != "" && strings.HasPrefix(r.URL.Path, "/proxy/") {
 				baseHref := "/proxy/" + to + "/"
 				if serverIDForAPI != "" {
@@ -455,17 +205,12 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				resp.Header.Set("Location", rewriteLocation(loc, baseHref))
 			}
-			// Ensure cookies are usable within an iframe by adding Secure and SameSite=None if missing
-			if cookies := resp.Header["Set-Cookie"]; len(cookies) > 0 {
-				adj := make([]string, 0, len(cookies))
-				for _, c := range cookies {
-					adj = append(adj, ensureCookieIframeOK(c))
-				}
-				resp.Header["Set-Cookie"] = adj
-			}
 			return nil
 		},
 		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, err error) {
+			if p.opts.Logger != nil {
+				p.opts.Logger.Printf("proxy error method=%s url=%s err=%v", req.Method, req.URL.String(), err)
+			}
 			http.Error(rw, fmt.Sprintf("upstream error: %v", err), http.StatusBadGateway)
 		},
 		FlushInterval: 100 * time.Millisecond,
@@ -516,16 +261,7 @@ func rewriteLocation(loc string, baseHref string) string {
 // Note: We no longer rewrite Set-Cookie to avoid interfering with upstream auth flows.
 
 // htmlEscapeTrunc returns an HTML-escaped version of s, truncated to n runes with an ellipsis if needed.
-func htmlEscapeTrunc(s string, n int) string {
-	if n <= 0 {
-		return ""
-	}
-	rs := []rune(s)
-	if len(rs) > n {
-		rs = append(rs[:n], '…')
-	}
-	return html.EscapeString(string(rs))
-}
+// (no-op) readiness HTML removed, so htmlEscapeTrunc not needed anymore.
 
 // relaxFrameAncestors updates a CSP string to allow embedding while preserving other directives.
 // If frame-ancestors exists, it's replaced with frame-ancestors *; otherwise it's appended.
