@@ -1,0 +1,19 @@
+# Example MetalLB config: use a private IP pool for workspaces
+---
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: workspaces
+  namespace: metallb-system
+spec:
+  addresses:
+    - 10.0.0.200-10.0.0.250  # adjust to your RFC1918 range
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: workspaces-l2
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - workspaces

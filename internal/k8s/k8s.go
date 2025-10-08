@@ -236,9 +236,33 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 		}
 	}
 
+	// Service type: default ClusterIP; when WORKSPACE_LB is set, expose as LoadBalancer (MetalLB expected)
+	svcType := corev1.ServiceTypeClusterIP
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("WORKSPACE_LB")), "1") ||
+		strings.EqualFold(strings.TrimSpace(os.Getenv("WORKSPACE_LB")), "true") {
+		svcType = corev1.ServiceTypeLoadBalancer
+	}
+
 	svc := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: labels},
-		Spec:       corev1.ServiceSpec{Selector: map[string]string{"app": name}, Ports: sports, PublishNotReadyAddresses: true},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: ns,
+			Labels:    labels,
+			Annotations: func() map[string]string {
+				m := map[string]string{}
+				if pool := strings.TrimSpace(os.Getenv("WORKSPACE_LB_POOL")); pool != "" {
+					// MetalLB pool selection
+					m["metallb.universe.tf/address-pool"] = pool
+				}
+				return m
+			}(),
+		},
+		Spec: corev1.ServiceSpec{
+			Selector:                 map[string]string{"app": name},
+			Ports:                    sports,
+			PublishNotReadyAddresses: true,
+			Type:                     svcType,
+		},
 	}
 	if _, err := c.K.CoreV1().Services(ns).Get(ctx, name, metav1.GetOptions{}); err == nil {
 		if _, err := c.K.CoreV1().Services(ns).Update(ctx, svc, metav1.UpdateOptions{}); err != nil {
@@ -249,8 +273,10 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 			return "", "", err
 		}
 	}
-	// Optionally ensure an Ingress per workspace if domain is configured
-	if dom := strings.TrimSpace(os.Getenv("WORKSPACE_DOMAIN")); dom != "" {
+	// Optionally ensure an Ingress per workspace if domain is configured and LoadBalancer exposure is not requested
+	if strings.TrimSpace(os.Getenv("WORKSPACE_DOMAIN")) != "" &&
+		!(strings.EqualFold(strings.TrimSpace(os.Getenv("WORKSPACE_LB")), "1") || strings.EqualFold(strings.TrimSpace(os.Getenv("WORKSPACE_LB")), "true")) {
+		dom := strings.TrimSpace(os.Getenv("WORKSPACE_DOMAIN"))
 		host := fmt.Sprintf("%s.%s", id, dom)
 		tlsSec := strings.TrimSpace(os.Getenv("WORKSPACE_TLS_SECRET"))
 		iclass := strings.TrimSpace(os.Getenv("INGRESS_CLASS_NAME"))
@@ -381,8 +407,45 @@ func (c *Client) ListServers(ctx context.Context, ns string) ([]*model.Server, e
 			Ports:  ports,
 			Env:    env,
 		}
-		// Compute URL if workspace domain configured via env (read here to avoid config import)
-		if dom := strings.TrimSpace(os.Getenv("WORKSPACE_DOMAIN")); dom != "" {
+		// Prefer LoadBalancer IP if assigned (MetalLB), else domain URL
+		if svc != nil && svc.Status.LoadBalancer.Ingress != nil && len(svc.Status.LoadBalancer.Ingress) > 0 {
+			ip := svc.Status.LoadBalancer.Ingress[0].IP
+			if ip == "" {
+				ip = svc.Status.LoadBalancer.Ingress[0].Hostname
+			}
+			// Pick a port, preferring HTTPS (8443/443), then 8080, then first
+			p := 0
+			if len(svc.Spec.Ports) > 0 {
+				for _, sp := range svc.Spec.Ports {
+					if sp.Port == 8443 || sp.Port == 443 {
+						p = int(sp.Port)
+						break
+					}
+				}
+				if p == 0 {
+					for _, sp := range svc.Spec.Ports {
+						if sp.Port == 8080 {
+							p = int(sp.Port)
+							break
+						}
+					}
+				}
+				if p == 0 {
+					p = int(svc.Spec.Ports[0].Port)
+				}
+			} else if len(d.Spec.Template.Spec.Containers) > 0 && len(d.Spec.Template.Spec.Containers[0].Ports) > 0 {
+				p = int(d.Spec.Template.Spec.Containers[0].Ports[0].ContainerPort)
+			} else {
+				p = 8080
+			}
+			if ip != "" {
+				scheme := "http"
+				if p == 8443 || p == 443 {
+					scheme = "https"
+				}
+				s.URL = fmt.Sprintf("%s://%s:%d/", scheme, ip, p)
+			}
+		} else if dom := strings.TrimSpace(os.Getenv("WORKSPACE_DOMAIN")); dom != "" {
 			s.URL = fmt.Sprintf("https://%s.%s/", id, dom)
 		}
 		out = append(out, s)
@@ -415,21 +478,21 @@ func (c *Client) ResolveServiceAddress(ctx context.Context, ns, idOrName string)
 	if svc.Spec.ClusterIP == "" || svc.Spec.ClusterIP == "None" {
 		return "", 0, false, fmt.Errorf("service has no clusterIP")
 	}
-	// choose port: prefer 8080/http (agent default) else 8443/https else first
+	// choose port: prefer HTTPS (8443/443), else 8080, else first
 	var p int32
 	https = false
 	for _, sp := range svc.Spec.Ports {
-		if sp.Port == 8080 {
+		if sp.Port == 8443 || sp.Port == 443 {
 			p = sp.Port
-			https = false
+			https = true
 			break
 		}
 	}
 	if p == 0 {
 		for _, sp := range svc.Spec.Ports {
-			if sp.Port == 8443 {
+			if sp.Port == 8080 {
 				p = sp.Port
-				https = true
+				https = false
 				break
 			}
 		}

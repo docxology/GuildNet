@@ -28,6 +28,8 @@ spec:
               value: "8080"
             - name: HTTPS_PORT
               value: "8443"
+            - name: AGENT_TLS_SELF_SIGNED
+              value: "1"
             # Optional hint for UI when node hostname is not available in API payload
             # Set to the Kubernetes Service DNS name or Pod IP as appropriate
             - name: AGENT_HOST

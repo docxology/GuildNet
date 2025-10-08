@@ -662,7 +662,7 @@ func main() {
 				if isHTTPS {
 					scheme = "https"
 				}
-				log.Printf("resolve server: %s -> %s:%d scheme=%s sub=%s", serverID, host, port, scheme, subPath)
+				log.Printf("resolve server: direct svc ip match id=%s target=%s:%d scheme=%s sub=%s", serverID, host, port, scheme, subPath)
 				return scheme, net.JoinHostPort(host, fmt.Sprintf("%d", port)), subPath, nil
 			}
 			srv, err := kcli.GetServer(ctx, defaultNS, serverID)
@@ -680,7 +680,7 @@ func main() {
 						if scheme == "" {
 							scheme = "http"
 						}
-						log.Printf("resolve server: env hostport=%s scheme=%s sub=%s", v, scheme, subPath)
+						log.Printf("resolve server: env hostport=%s scheme=%s sub=%s id=%s", v, scheme, subPath, serverID)
 						return scheme, v, subPath, nil
 					}
 					p := 0
@@ -705,7 +705,7 @@ func main() {
 					if scheme == "" {
 						scheme = "http"
 					}
-					log.Printf("resolve server: env host=%s port=%d scheme=%s sub=%s", v, p, scheme, subPath)
+					log.Printf("resolve server: env host=%s port=%d scheme=%s sub=%s id=%s", v, p, scheme, subPath, serverID)
 					return scheme, net.JoinHostPort(v, fmt.Sprintf("%d", p)), subPath, nil
 				}
 			}
@@ -736,11 +736,26 @@ func main() {
 				if scheme == "" {
 					scheme = "http"
 				}
-				log.Printf("resolve server: node host=%s port=%d scheme=%s sub=%s", host, p, scheme, subPath)
+				log.Printf("resolve server: fallback host=%s port=%d scheme=%s sub=%s id=%s", host, p, scheme, subPath, serverID)
 				return scheme, net.JoinHostPort(host, fmt.Sprintf("%d", p)), subPath, nil
 			}
 			return "", "", "", fmt.Errorf("no upstream hint; set Env.AGENT_HOST or ensure service exists and ports are populated")
 		},
+	})
+	// Lightweight debug endpoint to check routing without hitting upstream
+	mux.HandleFunc("/api/proxy-debug", func(w http.ResponseWriter, r *http.Request) {
+		// Echo common fields for quick diagnosis
+		q := r.URL.Query()
+		server := q.Get("server")
+		sub := q.Get("path")
+		if sub == "" {
+			sub = "/"
+		}
+		httpx.JSON(w, 200, map[string]any{
+			"server": server,
+			"path":   sub,
+			"rid":    r.Header.Get("X-Request-Id"),
+		})
 	})
 	mux.Handle("/proxy", proxyHandler)
 	mux.Handle("/proxy/", proxyHandler)

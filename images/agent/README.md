@@ -1,12 +1,13 @@
 # GuildNet Agent Image
 
-A lightweight container that runs VS Code in the browser (code-server) behind Caddy with iframe-friendly headers. Exposes a single configurable HTTP port (default 8080). Includes a tiny landing page and a /healthz endpoint.
+A lightweight container that runs VS Code in the browser (code-server) behind Caddy with iframe-friendly headers. Exposes HTTP on 8080 and HTTPS on 8443 (enabled by default with a self-signed cert). Includes a /healthz endpoint.
 
 - Non-root user `app` (uid 10001)
 - code-server bound to loopback, proxied by Caddy
 - Iframe embeddable: `Content-Security-Policy: frame-ancestors 'self' *` and `X-Frame-Options` removed
-- Single port via `$PORT` (default 8080)
+- Single HTTP port via `$PORT` (default 8080), HTTPS via `$HTTPS_PORT` (default 8443, enabled by default)
 - Volumes: `/workspace` for projects, `/data` for settings, extensions, and password persistence
+- TLS: provide cert/key or enable self-signed via env (see below)
 
 ## Build
 
@@ -27,21 +28,37 @@ docker run --rm \
   guildnet/agent:dev
 ```
 
-Open http://localhost:8080 to access code-server. Health at http://localhost:8080/healthz.
+Open https://localhost:8443 (self-signed) or http://localhost:8080 to access code-server. Health at http(s)://localhost:8443/healthz.
 
-**Default port:** The agent always exposes code-server via Caddy on port 8080 (HTTP, iframe-friendly). For most use cases, only 8080 needs to be mapped/exposed. Advanced users can set the PORT env var to change this.
+**Default ports:** The agent exposes code-server via Caddy on port 8080 (HTTP) and 8443 (HTTPS). HTTPS is enabled by default with a self-signed certificate. Set `PORT` and `HTTPS_PORT` to change these.
 
 **Kubernetes:** The example manifest exposes both 8080 and 8443, but only 8080 is required for the UI to work out-of-the-box. Set AGENT_HOST to the pod/service DNS name for best results.
 
-If `PASSWORD` is not set, the container will generate one on first run and store it at `/data/.code-server-password` (printed once at startup). Persist `/data` to keep the password, user settings, and extensions.
+Auth modes:
+
+- `AGENT_AUTH=password` (default): code-server enforces password auth. Set `PASSWORD` or the agent will generate one and store it at `/data/.code-server-password`.
+- `AGENT_AUTH=none`: no auth at code-server layer (use only in trusted/private networks).
+
+Persist `/data` to keep the password, user settings, and extensions.
+
+TLS:
+
+- HTTPS is on by default using a self-signed cert persisted under `/data/tls`.
+- Provide `AGENT_TLS_CERT` and `AGENT_TLS_KEY` to use your own certs.
+- Set `AGENT_TLS_DISABLE=1` to turn HTTPS off.
 
 ## Kubernetes example
 
-See `k8s/agent-example.yaml` for a minimal Deployment + Service with liveness/readiness probes and volumes.
+See `k8s/agent-example.yaml` for a minimal Deployment + Service with liveness/readiness probes and volumes. Exposes both 8080 and 8443 by default.
 
 ## Iframe embedding
 
-The embedded Caddy reverse proxy removes `X-Frame-Options` and sets `Content-Security-Policy: frame-ancestors 'self' *`, allowing your UI to embed the service in an `<iframe>`. Ensure your outer site uses same-origin or terminates TLS at an ingress/gateway as appropriate.
+The embedded Caddy reverse proxy removes `X-Frame-Options` and sets `Content-Security-Policy: frame-ancestors 'self' *`, allowing your UI to embed the service in an `<iframe>`. Ensure your outer site uses same-origin or terminates TLS at an ingress/gateway as appropriate. The agent routes directly to code-server.
+
+## Verify externally
+
+- Port check (inside cluster with LoadBalancer IP): `curl -k https://<lb-ip>:8443/healthz`
+- Browser: Open `https://<lb-ip>:8443/` and accept the self-signed certificate once.
 
 ## Security notes
 

@@ -188,6 +188,30 @@ Notes:
 - For production, use proper certificates (or terminate TLS at ingress) and PVCs for `/data` and `/workspace`.
 - Tailscale (tsnet) is required; disabling it is not supported.
 
+## Private IP access with MetalLB (no DNS, no public ingress)
+
+This mode exposes each workspace on a private RFC1918 IP using MetalLB. The UI opens the IDE directly by IP; no reverse proxy is used.
+
+Prereqs:
+- MetalLB installed in the cluster (L2 mode or BGP).
+- A private IP range reserved (e.g., `10.0.0.200-10.0.0.250`).
+
+Example pool: `k8s/metallb-example.yaml` (adjust addresses for your network).
+
+Backend envs:
+- `WORKSPACE_LB=1` — create Services as `LoadBalancer`.
+- `WORKSPACE_LB_POOL=workspaces` — optional MetalLB pool selection.
+- `AGENT_DEFAULT_PASSWORD` — optional default code-server password.
+
+Behavior:
+- For each workspace, the Service is type LoadBalancer. When MetalLB assigns an IP, the backend populates `server.url` as `http://<ip>:<port>/`.
+- The UI uses `server.url` directly; if missing, it falls back to the legacy proxy.
+
+Testing:
+1) Ensure MetalLB is deployed and the pool/advertisement applied.
+2) Run the backend with `WORKSPACE_LB=1` in env.
+3) Launch a workspace. Verify the Service has a LoadBalancer IP and the IDE opens at `http://<lb-ip>:<port>/`.
+
 ## Development
 
 - Makefile targets: `build`, `run`, `tidy`, `test`, `dev-run`, `talos-fresh`, `talos-upgrade`.

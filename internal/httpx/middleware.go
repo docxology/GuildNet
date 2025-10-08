@@ -36,8 +36,11 @@ func RequestID(next http.Handler) http.Handler {
 			rid = genID()
 		}
 		w.Header().Set("X-Request-Id", rid)
+		// Propagate the request id via context and header downstream
 		ctx := context.WithValue(r.Context(), reqIDKey, rid)
-		next.ServeHTTP(w, r.WithContext(ctx))
+		r2 := r.WithContext(ctx)
+		r2.Header.Set("X-Request-Id", rid)
+		next.ServeHTTP(w, r2)
 	})
 }
 
@@ -49,7 +52,13 @@ func Logging(next http.Handler) http.Handler {
 		rw := &respWriter{ResponseWriter: w, code: http.StatusOK}
 		next.ServeHTTP(rw, r)
 		rid := ReqIDFromCtx(r.Context())
-		logger.Printf("method=%s path=%s status=%d dur_ms=%d req_id=%s", r.Method, r.URL.Path, rw.code, time.Since(start).Milliseconds(), rid)
+		// Include basic diagnostics: path+query, remote addr, UA
+		path := r.URL.Path
+		if q := r.URL.RawQuery; q != "" {
+			path += "?" + q
+		}
+		ua := r.Header.Get("User-Agent")
+		logger.Printf("req_id=%s method=%s path=%s status=%d dur_ms=%d remote=%s ua=%q", rid, r.Method, path, rw.code, time.Since(start).Milliseconds(), r.RemoteAddr, ua)
 	})
 }
 

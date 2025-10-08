@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
@@ -33,6 +34,8 @@ type ReverseProxy struct {
 func NewReverseProxy(opts Options) *ReverseProxy { return &ReverseProxy{opts: opts} }
 
 func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Attach a request id if available for correlation
+	reqID := r.Header.Get("X-Request-Id")
 	q := r.URL.Query()
 	to := q.Get("to")
 	subPath := q.Get("path")
@@ -89,18 +92,27 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if subPath == "" || !strings.HasPrefix(subPath, "/") || to == "" {
+		if p.opts.Logger != nil {
+			p.opts.Logger.Printf("proxy bad-request req_id=%s to=%q path=%q url=%s", reqID, to, subPath, r.URL.String())
+		}
 		http.Error(w, "missing or invalid to/path", http.StatusBadRequest)
 		return
 	}
 	// validate target
 	host, ps, err := net.SplitHostPort(to)
 	if err != nil {
+		if p.opts.Logger != nil {
+			p.opts.Logger.Printf("proxy invalid-to req_id=%s to=%q err=%v", reqID, to, err)
+		}
 		http.Error(w, "invalid to", http.StatusBadRequest)
 		return
 	}
 	_ = host
 	port, err := strconv.Atoi(ps)
 	if err != nil || port <= 0 || port > 65535 {
+		if p.opts.Logger != nil {
+			p.opts.Logger.Printf("proxy invalid-port req_id=%s to=%q err=%v", reqID, to, err)
+		}
 		http.Error(w, "invalid port", http.StatusBadRequest)
 		return
 	}
@@ -154,7 +166,10 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			},
 			TLSHandshakeTimeout:   10 * time.Second,
 			ResponseHeaderTimeout: p.opts.Timeout,
-			// WebSocket over HTTPS needs HTTP/2 disabled for some servers; leave defaults.
+			// Disable HTTP/2 to avoid sporadic INTERNAL_ERROR on some upstreams
+			ForceAttemptHTTP2: false,
+			// Allow self-signed certs for in-cluster agents
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		}
 	}
 
@@ -195,7 +210,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Transport: transport,
 		ModifyResponse: func(resp *http.Response) error {
 			if p.opts.Logger != nil {
-				p.opts.Logger.Printf("proxy resp status=%d method=%s to=%s path=%s url=%s", resp.StatusCode, r.Method, to, subPath, r.URL.String())
+				p.opts.Logger.Printf("proxy resp req_id=%s status=%d method=%s to=%s path=%s url=%s", reqID, resp.StatusCode, r.Method, to, subPath, r.URL.String())
 			}
 			// Only rewrite Location to stay under proxy base; avoid CSP/cookie changes.
 			if loc := resp.Header.Get("Location"); loc != "" && strings.HasPrefix(r.URL.Path, "/proxy/") {
@@ -205,11 +220,25 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				resp.Header.Set("Location", rewriteLocation(loc, baseHref))
 			}
+			// Tweak Set-Cookie for iframe compatibility when proxied: drop Domain, ensure Secure+SameSite=None, and add Partitioned.
+			if strings.HasPrefix(r.URL.Path, "/proxy/") {
+				cookies := resp.Header.Values("Set-Cookie")
+				if len(cookies) > 0 {
+					resp.Header.Del("Set-Cookie")
+					baseHref := "/proxy/" + to + "/"
+					if serverIDForAPI != "" {
+						baseHref = "/proxy/server/" + url.PathEscape(serverIDForAPI) + "/"
+					}
+					for _, c := range cookies {
+						resp.Header.Add("Set-Cookie", rewriteSetCookieForIframe(c, baseHref))
+					}
+				}
+			}
 			return nil
 		},
 		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, err error) {
 			if p.opts.Logger != nil {
-				p.opts.Logger.Printf("proxy error method=%s url=%s err=%v", req.Method, req.URL.String(), err)
+				p.opts.Logger.Printf("proxy error req_id=%s method=%s url=%s to=%s path=%s err=%v", reqID, req.Method, req.URL.String(), to, subPath, err)
 			}
 			http.Error(rw, fmt.Sprintf("upstream error: %v", err), http.StatusBadGateway)
 		},
@@ -305,4 +334,80 @@ func ensureCookieIframeOK(header string) string {
 		header += "; SameSite=None"
 	}
 	return header
+}
+
+// rewriteSetCookieForIframe adjusts Set-Cookie for proxied iframe contexts:
+// - removes Domain attribute to scope to current host
+// - ensures Secure and SameSite=None
+// - adds Partitioned when supported by browsers
+// - coerces Path to the proxy base (best effort) when upstream sets root
+func rewriteSetCookieForIframe(h string, baseHref string) string {
+	if h == "" {
+		return h
+	}
+	// Split attributes
+	parts := strings.Split(h, ";")
+	out := make([]string, 0, len(parts)+3)
+	// First part is name=value
+	if len(parts) > 0 {
+		nv := strings.TrimSpace(parts[0])
+		out = append(out, nv)
+	}
+	hasSecure := false
+	hasSameSite := false
+	hasPath := false
+	for i := 1; i < len(parts); i++ {
+		p := strings.TrimSpace(parts[i])
+		if p == "" {
+			continue
+		}
+		lp := strings.ToLower(p)
+		if strings.HasPrefix(lp, "domain=") {
+			// drop Domain
+			continue
+		}
+		if strings.HasPrefix(lp, "samesite=") {
+			hasSameSite = true
+			// force None
+			continue
+		}
+		if lp == "secure" {
+			hasSecure = true
+			continue
+		}
+		if strings.HasPrefix(lp, "path=") {
+			hasPath = true
+			// Normalize path to baseHref path only (strip scheme/host)
+			path := baseHref
+			if u, err := url.Parse(baseHref); err == nil {
+				path = u.Path
+			}
+			if path == "" {
+				path = "/"
+			}
+			out = append(out, "Path="+path)
+			continue
+		}
+		// keep other attributes
+		out = append(out, p)
+	}
+	if !hasSecure {
+		out = append(out, "Secure")
+	}
+	if !hasSameSite {
+		out = append(out, "SameSite=None")
+	}
+	// Add Partitioned to allow third-party cookie partitioning in iframes when available
+	out = append(out, "Partitioned")
+	if !hasPath {
+		path := baseHref
+		if u, err := url.Parse(baseHref); err == nil {
+			path = u.Path
+		}
+		if path == "" {
+			path = "/"
+		}
+		out = append(out, "Path="+path)
+	}
+	return strings.Join(out, "; ")
 }

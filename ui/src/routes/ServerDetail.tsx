@@ -14,11 +14,12 @@ export default function ServerDetail() {
   const [tab, setTab] = createSignal<'info'|'debug'|'error'|'ide'>('info');
   const [srv] = createResource(() => params.id, (id: string) => getServer(id));
 
-  // Prefer external ingress URL when present; fallback to internal proxy
+  // Prefer direct URL (LB IP or ingress) when present; fallback to internal proxy
   const ideUrl = createMemo(() => {
     const s = srv();
     if (!s) return '';
-    if (s.url && s.url.startsWith('https://')) return s.url;
+    console.log(s)
+    if (s.url) return s.url;
     return apiUrl(`/proxy/server/${encodeURIComponent(s.id)}/`);
   });
 
@@ -62,6 +63,15 @@ export default function ServerDetail() {
           },
           signal: controller.signal,
         });
+        if (!res.ok) {
+          // Log non-OK for diagnostics
+          console.warn('IDE preflight non-OK', {
+            url,
+            status: res.status,
+            statusText: res.statusText,
+            attempt,
+          });
+        }
         if (res.ok || (res.status >= 200 && res.status < 400)) {
           // Ready: set iframe src with a correlation id to bust caches
           const q = url.includes('?') ? '&' : '?';
@@ -72,6 +82,7 @@ export default function ServerDetail() {
         // Not ready yet; fall through to retry
       } catch (e) {
         // Network/abort errors: retry unless cancelled
+        console.warn('IDE preflight error', { url, error: e, attempt });
         if (cancelled) return;
       }
       const elapsed = Date.now() - start;
