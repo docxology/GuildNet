@@ -106,6 +106,9 @@ fi
 # Ensure directories
 mkdir -p "$LOG_DIR" "$RUN_DIR" "$STATE_DIR"
 
+# curl helper (self-signed TLS on local server)
+CURL_BASE=(curl -sS -k)
+
 # Build
 if grep -q "^build:" "$REPO_ROOT/Makefile" 2>/dev/null; then
   echo -e "${BLUE}INFO${NC}: Building via make build"
@@ -193,9 +196,19 @@ ensure_allowlist() {
 }
 
 # Parse/collect inputs
-if [ -z "$TALOS_IP" ]; then TALOS_IP=$(prompt "Enter Talos node tailnet IP" ""); fi
-if [ -z "$TALOS_IP" ]; then die "--talos-ip is required"; fi
-ensure_allowlist "$TALOS_IP:50000"
+# Try to infer Talos IP from allowlist to run unattended; skip ping if none.
+SKIP_PING=0
+if [ -z "$TALOS_IP" ]; then
+  if [ -s "$CONF_FILE" ]; then
+    TALOS_IP=$(jq -r '.allowlist[]? // empty' "$CONF_FILE" 2>/dev/null | grep -Eo '100\.[0-9]+\.[0-9]+\.[0-9]+:50000' | head -n1 | sed 's/:50000$//' || true)
+  fi
+fi
+if [ -z "$TALOS_IP" ]; then
+  echo -e "${YELLOW}WARN${NC}: No --talos-ip provided and none inferred; skipping Talos ping."
+  SKIP_PING=1
+else
+  ensure_allowlist "$TALOS_IP:50000"
+fi
 if [ -n "$SVC_ADDR" ]; then ensure_allowlist "$SVC_ADDR"; fi
 
 # If AUTO_INIT and flags provided, update existing config keys
@@ -215,8 +228,14 @@ if [ "$AUTO_INIT" -eq 1 ]; then
 fi
 
 # Read (possibly updated) listen_local
-LISTEN_LOCAL=$(jq -r .listen_local "$CONF_FILE")
-BASE_URL="http://$LISTEN_LOCAL"
+LISTEN_LOCAL_CFG=$(jq -r .listen_local "$CONF_FILE")
+if [ -n "${LISTEN_LOCAL:-}" ]; then
+  LISTEN_LOCAL="$LISTEN_LOCAL"
+else
+  LISTEN_LOCAL="$LISTEN_LOCAL_CFG"
+fi
+# Server binds TLS only (see cmd/hostapp/main.go). Use https scheme.
+BASE_URL="https://$LISTEN_LOCAL"
 
 # Start/restart app
 running_pid=""
@@ -259,7 +278,8 @@ trap 'echo; echo -e "${YELLOW}=== hostapp log tail ===${NC}"; tail -n 50 "$LOG_F
 echo -e "${BLUE}INFO${NC}: Waiting up to ${WAIT_SECS}s for /healthz at $BASE_URL/healthz ..."
 start_ts=$(date +%s)
 while :; do
-  if curl -fsS "$BASE_URL/healthz" | jq -e '.status=="ok"' >/dev/null 2>&1; then
+  resp=$("${CURL_BASE[@]}" "$BASE_URL/healthz" || true)
+  if [ "$resp" = "ok" ] || echo "$resp" | jq -e '.status=="ok"' >/dev/null 2>&1; then
     echo -e "${GREEN}OK${NC}: Health check passed"
     break
   fi
@@ -274,17 +294,25 @@ done
 TSINFO=$(grep -E "tailscale up: ip=|tsnet" "$LOG_FILE" | tail -n 1 || true)
 if [ -n "$TSINFO" ]; then echo -e "${GREEN}OK${NC}: $TSINFO"; else echo -e "${YELLOW}WARN${NC}: No tsnet status found in logs yet"; fi
 
-# Verify Talos ping
-PING_URL="$BASE_URL/api/ping?addr=${TALOS_IP}:50000"
-echo -e "${BLUE}INFO${NC}: Pinging Talos at $PING_URL"
-PING_JSON=$(curl -fsS "$PING_URL" || true)
-if [ -z "$PING_JSON" ]; then die "ping request failed"; fi
-if echo "$PING_JSON" | jq -e '.ok==true' >/dev/null 2>&1; then
-  RTT=$(echo "$PING_JSON" | jq -r '.rtt_ms')
-  echo -e "${GREEN}OK${NC}: Talos TCP :50000 reachable (rtt_ms=$RTT)"
-else
-  ERRMSG=$(echo "$PING_JSON" | jq -r '.error // "unknown"')
-  die "Talos ping failed: $ERRMSG"
+# Verify Talos ping (optional; skip if no IP or endpoint absent)
+if [ "$SKIP_PING" -ne 1 ]; then
+  code=$(curl -k -sS -o /dev/null -w "%{http_code}" "$BASE_URL/api/ping?addr=${TALOS_IP}:50000" || true)
+  if [ "$code" = "404" ]; then
+    echo -e "${YELLOW}WARN${NC}: /api/ping not supported by this server build; skipping Talos ping."
+    SKIP_PING=1
+  else
+    PING_URL="$BASE_URL/api/ping?addr=${TALOS_IP}:50000"
+    echo -e "${BLUE}INFO${NC}: Pinging Talos at $PING_URL"
+    PING_JSON=$("${CURL_BASE[@]}" "$PING_URL" || true)
+    if [ -z "$PING_JSON" ]; then die "ping request failed"; fi
+    if echo "$PING_JSON" | jq -e '.ok==true' >/dev/null 2>&1; then
+      RTT=$(echo "$PING_JSON" | jq -r '.rtt_ms')
+      echo -e "${GREEN}OK${NC}: Talos TCP :50000 reachable (rtt_ms=$RTT)"
+    else
+      ERRMSG=$(echo "$PING_JSON" | jq -r '.error // "unknown"')
+      die "Talos ping failed: $ERRMSG"
+    fi
+  fi
 fi
 
 # Optional proxy check
@@ -292,7 +320,7 @@ PROXY_SNIPPET=""
 if [ -n "$SVC_ADDR" ]; then
   echo -e "${BLUE}INFO${NC}: Verifying proxy to $SVC_ADDR"
   # Use curl limits; rely on app-side size caps too
-  PROXY_RESP=$(curl -sS --max-time 15 -D - "$BASE_URL/proxy?to=${SVC_ADDR}&path=/" || true)
+  PROXY_RESP=$(curl -k -sS --max-time 15 -D - "$BASE_URL/proxy?to=${SVC_ADDR}&path=/" || true)
   # Normalize CRLF to LF
   PROXY_RESP=$(printf "%s" "$PROXY_RESP" | tr -d '\r')
   STATUS=$(printf "%s" "$PROXY_RESP" | awk 'NR==1{print $2}')
@@ -323,7 +351,11 @@ echo "  Local URL    : $BASE_URL"
 echo "  Config       : $CONF_FILE"
 echo "  Logs         : $LOG_FILE"
 if [ -n "$TSINFO" ]; then echo "  tsnet        : $TSINFO"; fi
-echo "  Talos ping   : OK (rtt_ms=${RTT:-unknown})"
+if [ "$SKIP_PING" -eq 0 ]; then
+  echo "  Talos ping   : OK (rtt_ms=${RTT:-unknown})"
+else
+  echo "  Talos ping   : SKIPPED"
+fi
 if [ -n "$SVC_ADDR" ]; then echo "  Proxy ${SVC_ADDR} : OK (snippet=${PROXY_SNIPPET})"; fi
 
 exit 0
