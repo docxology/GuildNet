@@ -58,3 +58,10 @@ type JobAccepted struct {
 	ID     string `json:"id"`
 	Status string `json:"status"`
 }
+
+// DeployImage describes an image option the backend exposes for the UI to list.
+type DeployImage struct {
+	Label       string `json:"label"`
+	Image       string `json:"image"`
+	Description string `json:"description,omitempty"`
+}

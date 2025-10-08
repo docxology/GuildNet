@@ -40,3 +40,9 @@ export type JobSpec = {
 };
 
 export type JobAccepted = { id: string; status: 'pending' | string };
+
+export type DeployImage = {
+  label: string;
+  image: string;
+  description?: string;
+};

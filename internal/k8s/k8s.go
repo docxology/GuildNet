@@ -169,10 +169,7 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 	replicas := int32(1)
 	// Optional imagePullSecret name
 	imgPullSecret := strings.TrimSpace(os.Getenv("K8S_IMAGE_PULL_SECRET"))
-	// Default to code-server image if unspecified
-	if strings.TrimSpace(spec.Image) == "" {
-		spec.Image = "codercom/code-server:4.90.3"
-	}
+	// Do not inject a default image; the API layer validates image is provided.
 
 	// pick probe port: first declared container port or 8080
 	probePort := int32(8080)
@@ -325,6 +322,27 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 		}
 	}
 	return name, id, nil
+}
+
+// DeleteManaged deletes Deployments and Services labeled with guildnet.io/managed=true in the given namespace.
+func (c *Client) DeleteManaged(ctx context.Context, ns string) error {
+	if ns == "" {
+		ns = "default"
+	}
+	sel := metav1.ListOptions{LabelSelector: "guildnet.io/managed=true"}
+	// Delete Deployments
+	if deps, err := c.K.AppsV1().Deployments(ns).List(ctx, sel); err == nil {
+		for _, d := range deps.Items {
+			_ = c.K.AppsV1().Deployments(ns).Delete(ctx, d.Name, metav1.DeleteOptions{})
+		}
+	}
+	// Delete Services
+	if svcs, err := c.K.CoreV1().Services(ns).List(ctx, sel); err == nil {
+		for _, s := range svcs.Items {
+			_ = c.K.CoreV1().Services(ns).Delete(ctx, s.Name, metav1.DeleteOptions{})
+		}
+	}
+	return nil
 }
 
 // EnsureIngress creates/updates an Ingress mapping host -> service:port with optional TLS and annotations.

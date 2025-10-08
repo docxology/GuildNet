@@ -1,4 +1,4 @@
-import type { JobAccepted, JobSpec, LogLine, Server } from './types';
+import type { DeployImage, JobAccepted, JobSpec, LogLine, Server } from './types';
 import { apiUrl } from './config';
 
 async function handle<T>(res: Response): Promise<T> {
@@ -63,5 +63,14 @@ export async function getImageDefaults(image: string, signal?: AbortSignal): Pro
     return await handle<{ ports?: {name?: string; port: number}[]; env?: Record<string,string> }>(res);
   } catch {
     return {};
+  }
+}
+
+export async function listImages(signal?: AbortSignal): Promise<DeployImage[]> {
+  try {
+    const res = await fetch(apiUrl('/api/images'), { signal });
+    return await handle<DeployImage[]>(res);
+  } catch {
+    return [];
   }
 }

@@ -235,18 +235,28 @@ func main() {
 					TLSHandshakeTimeout: 10 * time.Second,
 				},
 			}
-			mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-				if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/proxy/") || r.URL.Path == "/healthz" {
-					// Let other handlers serve
-					mux2 := http.NewServeMux()
-					mux2.ServeHTTP(w, r)
-					return
-				}
-				uiProxy.ServeHTTP(w, r)
-			})
+			// Note: We do not special-case /api or /proxy here; net/http ServeMux will route
+			// those to longer, more specific patterns registered above. This handler only
+			// runs for paths that didn't match any earlier /api/* or /proxy/* handlers.
+			mux.HandleFunc("/", uiProxy.ServeHTTP)
 			log.Printf("dev UI proxied at / -> %s", uiOrigin)
 		}
 	}
+
+	// Preset deployable images (server-sourced; avoid hardcoding in UI)
+	presetImages := []model.DeployImage{
+		{Label: "VS Code (code-server)", Image: "codercom/code-server:4.90.3", Description: "Browser-based VS Code via code-server behind Caddy"},
+		// Add more curated images here in the future.
+	}
+
+	// List deployable images
+	mux.HandleFunc("/api/images", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		httpx.JSON(w, http.StatusOK, presetImages)
+	})
 
 	// Image defaults: return suggested env/ports for a given image reference
 	mux.HandleFunc("/api/image-defaults", func(w http.ResponseWriter, r *http.Request) {
@@ -376,6 +386,34 @@ func main() {
 		}
 		_ = name
 		httpx.JSON(w, http.StatusAccepted, model.JobAccepted{ID: id, Status: "pending"})
+	})
+
+	// admin: stop all servers (delete managed workloads)
+	adminStopAll := func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		log.Printf("admin: stop-all requested from %s", r.RemoteAddr)
+		if err := kcli.DeleteManaged(r.Context(), defaultNS); err != nil {
+			httpx.JSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		httpx.JSON(w, http.StatusOK, map[string]any{"status": "ok"})
+	}
+	mux.HandleFunc("/api/admin/stop-all", adminStopAll)
+	mux.HandleFunc("/api/admin/stop-all/", adminStopAll)
+	// Also expose a flat path without the /admin prefix to avoid any ServeMux edge cases in dev
+	mux.HandleFunc("/api/stop-all", adminStopAll)
+	mux.HandleFunc("/api/stop-all/", adminStopAll)
+	mux.HandleFunc("/api/admin/", func(w http.ResponseWriter, r *http.Request) {
+		switch strings.TrimPrefix(r.URL.Path, "/api/admin/") {
+		case "stop-all", "stop-all/":
+			adminStopAll(w, r)
+			return
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
 	})
 
 	// logs SSE
