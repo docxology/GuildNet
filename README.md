@@ -1,19 +1,32 @@
 # GuildNet
 
-GuildNet provides communities with a set of powerful affordances that reshape how developers work
-together. Socially, it enables censorship-resistant collaboration and shared capacity across geographies,
-lowering barriers to entry and broadening inclusion. Organizationally, its DAG-based workflows and Spec-
-Kit templates reduce coordination costs, preserve institutional knowledge, and distribute governance more
-equitably. Culturally, it supports pluralism, local sovereignty, and transparent contribution recognition,
-while amplifying accessibility through templated prompts and multilingual outputs. Creatively, it lowers the
-cost of experimentation, encourages safe sandboxes for bold ideas, and allows programmable
-collaboration pipelines that accelerate the idea-to-artifact cycle.
+GuildNet is a private self-hostable stack that puts human-in-the-loop with agent prompting on top of a knowledge gardening and coding version control foundation. For end users, it has simple interfaces that attempt to bring the cost to experiment down whilst bringing the capacity to experiment up, so non-engineers can have appropriate guardrails and higher level tools that upgrade them to collaborate fast, whilst allowing engineers and agents to ensure architectural integrity across time. Eventually it will have a DAG for tasks, prompting templates & infrastructure for robust agentic workflows, and much more.
 
-These affordances emerge because GuildNet unifies networking, orchestration, workflows, storage, and
-collaboration tools under an event-driven, extensible architecture. By combining resilient infrastructure with
-knowledge systems and AI-driven agents, it ensures that communities can not only maintain continuity
-under constraints but also expand their cultural and creative capacity through new forms of real-time,
-human–AI co-creation.
+## Key components
+
+### Distributed private network cluster
+
+- **Host App**: A local server that runs on all machines and exposes the UI to the network via tsnet as well as reverse-proxies traffic between the Talos cluster.
+- **Talos Cluster**: A Kubernetes cluster running on Talos OS, which hosts the code-server instances and other services.
+- **Tailscale/Headscale**: Used for secure networking, allowing devices to connect to the Host App and Talos cluster.
+- **UI**: A web interface for users to interact with the system, manage clusters, and access code servers.
+- **Image Registry**: A private Docker image registry running within the Talos cluster to store and manage container images.
+
+## Services
+
+- **Persistent Storage**: Provides persistent storage for code-server instances, ensuring data is retained across restarts.
+- **Event Bus**: Facilitates communication between servers and hosts, enabling scheduling, notifications and updates.
+- **Scheduler**: Distributes workloads across available server instances based on current load and availability.
+- **Load Balancer**: Manages incoming requests and routes them to the appropriate server instance.
+- **Public Tunnel**: Exposes services to the internet securely, allowing remote access to code servers and the UI.
+
+### Agent coding workflow
+
+- **code-server**: Provides a web-based VSCode environment for coding and interaction.
+- **Ollama**: Runs locally on the host machines to provide LLM capabilities for agents.
+- **OpenAI Codex**: Used within code-server instances to assist with coding tasks.
+- **Radicle**: A decentralized git hosting solution for managing code repositories within the cluster.
+- **Knowledge Base**: A system for storing and managing knowledge, integrated with agent workflows.
 
 ## Quickstart
 
