@@ -11,6 +11,10 @@ Goals
 
 ## Components
 
+- How to access the UI
+  - Local development: open `https://127.0.0.1:8080`. The Host App proxies the Vite dev server (which listens on `https://localhost:5173`) so the browser uses a single HTTPS origin.
+  - Tailnet: open `https://<hostapp-ts-fqdn>:443`. Ensure your server certificate includes your tailnet FQDN/IP to avoid warnings, or front the Host App with a trusted proxy.
+
 - Client UI (Vite + SolidJS)
   - Launch form posts to the Host App; simple defaults, advanced options on demand.
   - Servers list/detail with logs and an IDE tab (iframe via the proxy).
@@ -18,7 +22,7 @@ Goals
 
 - Host App (Go + tsnet)
   - Local TLS listener (default `LISTEN_LOCAL=127.0.0.1:8080`) and a tsnet listener on `:443` inside the tailnet.
-  - CORS is restricted to a single origin via `FRONTEND_ORIGIN` (default `https://localhost:5173`).
+  - CORS is restricted to a single origin via `FRONTEND_ORIGIN` (for dev use the Host App origin `https://127.0.0.1:8080`).
   - Endpoints (current implementation):
     - `GET /healthz` — liveness
     - `GET /api/ui-config` — minimal UI config (e.g., name)
@@ -35,7 +39,7 @@ Goals
       - `/proxy?to=host:port&path=/...` (query form)
       - `/proxy/{to}/{rest}` (path form)
       - `/proxy/server/{id}/{rest}` (server-aware form)
-  - Dev UI reverse-proxy: requests to `/` are forwarded to the Vite server (default `https://localhost:5173`), while `/api/*`, `/proxy/*`, and `/healthz` are handled by the Host App.
+  - Dev UI reverse-proxy: requests to `/` are forwarded to the Vite dev server (which listens on `https://localhost:5173`), while `/api/*`, `/proxy/*`, and `/healthz` are handled by the Host App. In practice, you should open `https://127.0.0.1:8080` in the browser; the Host App will proxy the UI for a single, secure origin.
 
 - Tailscale control plane (Headscale or Tailscale)
   - The Host App authenticates via tsnet using configured login server and auth key.
@@ -89,7 +93,7 @@ Notes
 - The reverse proxy preserves method/body and handles WebSockets; cookies and redirects are adjusted for iframe use.
 
 Multi-device model
-- The Host App serves the UI locally and on `:443` over the tailnet. Any device in your tailnet can open the Host App’s URL and operate against the same Kubernetes cluster.
+- The Host App serves the UI locally on `https://127.0.0.1:8080` and on `:443` over the tailnet. Any device in your tailnet can open the Host App’s URL and operate against the same Kubernetes cluster.
 - The Host App’s kubeconfig determines cluster access and permissions. There’s no per-user auth yet inside the app; rely on your tailnet for access control and on Kubernetes RBAC.
 
 Environment assumptions
@@ -230,7 +234,7 @@ Server listing and logs:
   1) `./certs/server.crt|server.key` (repo CA-signed)
   2) `./certs/dev.crt|dev.key`
   3) `~/.guildnet/state/certs/server.crt|server.key` (auto-generated self-signed for dev)
-- CORS: only `FRONTEND_ORIGIN` is allowed (default `https://localhost:5173`).
+- CORS: only `FRONTEND_ORIGIN` is allowed (for local dev, set to `https://127.0.0.1:8080`).
 - API server proxy: when enabled (default), traffic to cluster Pods can traverse the Kubernetes API server via client-go with TLS; HTTP/2 is disabled on that path to avoid INTERNAL_ERROR on proxy endpoints.
 - Cookies/redirects are adjusted by the proxy for iframe usage, as noted above.
 
@@ -269,8 +273,8 @@ Multi‑user security notes
 - Agent (typical): HTTP on 8080; HTTPS 8443 optional depending on image/config.
 - Proxying: HTTP or HTTPS to upstream depending on resolved port or explicit `scheme`.
 
-Multi‑device access summary
-- Local dev: `https://127.0.0.1:8080` and dev UI at `https://localhost:5173` (proxied at `/`).
+Multi-device access summary
+- Local dev: open `https://127.0.0.1:8080` in the browser. The Vite dev server runs on `https://localhost:5173` but is proxied at `/` by the Host App for same-origin access.
 - Tailnet: `https://<hostapp-ts-fqdn>:443` (same UI, single origin). Ensure the TLS cert includes the tailnet name/IP or use a trusted front proxy.
 
 
@@ -293,8 +297,8 @@ Multi‑device access summary
 - Example UI iframe src: `https://<hostapp>/proxy/server/{id}/`
 - Useful env flags:
   - `LISTEN_LOCAL` — local HTTPS bind (e.g., `127.0.0.1:8080`)
-  - `FRONTEND_ORIGIN` — CORS allow origin (default `https://localhost:5173`)
-  - `UI_DEV_ORIGIN` — dev UI origin reverse-proxied at `/` (default `https://localhost:5173`)
+  - `FRONTEND_ORIGIN` — CORS allow origin (use `https://127.0.0.1:8080` for local dev)
+  - `UI_DEV_ORIGIN` — dev UI origin reverse-proxied at `/` (Vite runs on `https://localhost:5173` by default)
   - `WORKSPACE_LB` — expose Services as LoadBalancer (`1`/`true`)
   - `WORKSPACE_LB_POOL` — MetalLB address pool name
   - `WORKSPACE_DOMAIN` — per-workspace Ingress base domain (when not using LB)

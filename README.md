@@ -29,7 +29,7 @@ make setup
 
 ```sh
 # Optional: override origin/listen address
-# ORIGIN=https://localhost:5173 LISTEN_LOCAL=127.0.0.1:8080 make dev-backend
+# ORIGIN=https://127.0.0.1:8080 LISTEN_LOCAL=127.0.0.1:8080 make dev-backend
 make dev-backend
 ```
 
@@ -47,7 +47,7 @@ make dev-ui
 # Backend health (self-signed):
 curl -k https://127.0.0.1:8080/healthz
 # Open the UI:
-open https://localhost:5173
+open https://127.0.0.1:8080
 ```
 
 Tip: `make help` lists all common targets (build, test, lint, utilities like TLS checks and stop-all).

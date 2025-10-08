@@ -90,7 +90,7 @@
       "group": "test"
     },
     {
-      "label": "TLS check: Vite 5173",
+      "label": "TLS check: Dev UI (Vite 5173, proxied to 8080)",
       "type": "shell",
       "command": "make tls-check-ui",
       "group": "test"
