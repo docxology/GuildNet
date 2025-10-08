@@ -52,6 +52,25 @@ open https://localhost:5173
 
 Tip: `make help` lists all common targets (build, test, lint, utilities like TLS checks and stop-all).
 
+## Share and join network
+
+As an organizer (already running a Host App):
+
+- Create a join file you can send to teammates (contains the Host App URL, optional CA, and optional pre-auth key):
+  - scripts/create_join_info.sh --hostapp-url https://<your-ts-fqdn>:443 --include-ca certs/server.crt --login-server https://headscale.example.com --auth-key tskey-... --hostname teammate-1 --name "Dev Cluster" --out guildnet.config
+  - Share the resulting guildnet.config securely.
+
+As a teammate (to join):
+
+- Run: scripts/join.sh /path/to/guildnet.config
+- If it includes a pre-auth key, your ~/.guildnet/config.json will be created so you can run your own Host App if desired.
+- Open the shared Host App URL in a browser and you’re in.
+
+Verify the flow end-to-end (isolated):
+
+- scripts/verify_join.sh --hostapp-url https://<your-ts-fqdn>:443 --include-ca certs/server.crt --login-server https://headscale.example.com --auth-key tskey-...
+- The script runs in a temp HOME, calls create_join_info.sh and join.sh, and checks /healthz.
+
 # Progress
 
 - [x] Join/create Headscale/Tailscale network
@@ -60,6 +79,7 @@ Tip: `make help` lists all common targets (build, test, lint, utilities like TLS
 - [x] Create dashboard server to run scripts and report status
 - [x] Create UI for dashboard server to join/create network, manage clusters and observe code servers
 - [ ] Ensure multi-user support with orgs/clusters
+- [ ] Automatic TLS certs for tailnet access
 - [ ] Fully generic and configurable docker deploys via subdomain on tailnet
 - [ ] Docker image registry inside Talos cluster
 - [ ] Run Ollama on host machine and OpenAI Codex inside code servers, opening terminal to interact with agent via web UI

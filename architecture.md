@@ -88,10 +88,18 @@ Notes
 - Host App dials cluster services via tsnet; for cluster-internal access it can go direct (ClusterIP) or via the Kubernetes API server pod proxy (see below).
 - The reverse proxy preserves method/body and handles WebSockets; cookies and redirects are adjusted for iframe use.
 
+Multi-device model
+- The Host App serves the UI locally and on `:443` over the tailnet. Any device in your tailnet can open the Host App’s URL and operate against the same Kubernetes cluster.
+- The Host App’s kubeconfig determines cluster access and permissions. There’s no per-user auth yet inside the app; rely on your tailnet for access control and on Kubernetes RBAC.
+
 Environment assumptions
 - A Kubernetes cluster is reachable (in-cluster config or `KUBECONFIG`).
 - A Tailscale/Headscale control plane is available for the Host App’s tsnet.
 - For private Service access by ClusterIP from outside the cluster, a Tailscale subnet router (advertising cluster CIDRs) is recommended.
+
+Kubernetes reachability modes
+- Preferred (default): API server Pod Proxy — the Host App uses client‑go to request `.../pods/<pod>:<port>/proxy` to reach the container. This works even when ClusterIP ranges aren’t routed to the Host machine.
+- Direct (optional): ClusterIP over tsnet — set `HOSTAPP_DISABLE_API_PROXY=true` to bypass the API proxy and dial the ClusterIP:port via tsnet. This requires a route (e.g., a Tailscale subnet router advertising the cluster CIDRs). Useful to validate WebSockets/long‑lived conns end‑to‑end.
 
 
 ## Launch flow (UI → Host App → Kubernetes → Agent)
@@ -130,6 +138,7 @@ Important choices (as implemented)
 - Optional per-workspace Ingress when `WORKSPACE_DOMAIN` is set and `WORKSPACE_LB` is not:
   - IngressClass: `INGRESS_CLASS_NAME` (defaults to `nginx` if empty).
   - TLS: if `CERT_MANAGER_ISSUER` is set, a certificate is requested (secret defaults to `workspace-<id>-tls`).
+ - Optional per‑workspace auth hooks for NGINX Ingress via `INGRESS_AUTH_URL` and `INGRESS_AUTH_SIGNIN`.
 
 
 ## Access flow (iframe via reverse-proxy over tsnet)
@@ -178,6 +187,14 @@ Why this works in a browser
 
 - Allowlist: removed. The proxy no longer enforces a CIDR or host:port allowlist; access is expected to be restricted by your tailnet and Kubernetes RBAC.
 
+Certificates and hostnames for multi-device access
+- The Host App serves HTTPS using, in order of preference:
+  1) `./certs/server.crt|server.key` (recommended for dev with your own CA)
+  2) `./certs/dev.crt|dev.key` (repo dev certs)
+  3) `~/.guildnet/state/certs/server.crt|server.key` (auto‑generated self‑signed)
+- For other devices in the tailnet to connect without warnings, include the Host App’s tailnet FQDN and/or Tailscale IP in the server cert SANs. Use `scripts/generate-server-cert.sh -H "localhost,127.0.0.1,::1,<ts-fqdn>,<ts-ip>" -f`.
+- Alternatively, terminate TLS in front of the Host App with a proxy that has a trusted certificate and forwards to the Host App locally.
+
 
 ## Kubernetes responsibilities (current design)
 
@@ -217,6 +234,13 @@ Server listing and logs:
 - API server proxy: when enabled (default), traffic to cluster Pods can traverse the Kubernetes API server via client-go with TLS; HTTP/2 is disabled on that path to avoid INTERNAL_ERROR on proxy endpoints.
 - Cookies/redirects are adjusted by the proxy for iframe usage, as noted above.
 
+Multi‑user security notes
+- The Host App currently has no built‑in user accounts or login. Access control relies on:
+  - Your tailnet boundary (who can reach the Host App over Tailscale/Headscale)
+  - Kubernetes RBAC applied to the kubeconfig used by the Host App
+  - Optional per‑workspace Ingress auth when exposing via `WORKSPACE_DOMAIN`
+- If exposing outside the tailnet, add an auth proxy in front (e.g., OIDC‑enabled reverse proxy) or run the Host App behind a private ingress.
+
 
 ## Failure modes and troubleshooting
 
@@ -235,6 +259,8 @@ Server listing and logs:
 
 - CORS errors
   - Ensure the UI origin matches `FRONTEND_ORIGIN`.
+ - Remote tailnet device gets TLS warning
+   - Regenerate the server certificate to include your tailnet FQDN and/or IP in SANs, or front the Host App with a TLS‑terminating proxy with a trusted cert.
 
 
 ## Port and protocol summary
@@ -242,6 +268,10 @@ Server listing and logs:
 - Host App: HTTPS on `LISTEN_LOCAL` (e.g., `127.0.0.1:8080`) and HTTPS via tsnet on `:443` inside the tailnet.
 - Agent (typical): HTTP on 8080; HTTPS 8443 optional depending on image/config.
 - Proxying: HTTP or HTTPS to upstream depending on resolved port or explicit `scheme`.
+
+Multi‑device access summary
+- Local dev: `https://127.0.0.1:8080` and dev UI at `https://localhost:5173` (proxied at `/`).
+- Tailnet: `https://<hostapp-ts-fqdn>:443` (same UI, single origin). Ensure the TLS cert includes the tailnet name/IP or use a trusted front proxy.
 
 
 ## What “multiple agents” means here
@@ -273,3 +303,24 @@ Server listing and logs:
   - `K8S_IMAGE_PULL_SECRET` — imagePullSecret name for workloads
   - `AGENT_DEFAULT_PASSWORD` — default agent password when not provided
   - `HOSTAPP_DISABLE_API_PROXY` — disable Kubernetes API server proxy (force direct tsnet dial)
+
+## End‑to‑end setup: existing Headscale + Talos
+
+1) Kubernetes access on the Host machine
+- Ensure `kubectl get ns` works (KUBECONFIG or in‑cluster).
+
+2) Host App tsnet config
+- Run `./bin/hostapp init` and provide Headscale URL, pre‑auth key, hostname, and listen address. Or set `.env` with `TS_LOGIN_SERVER`, `TS_AUTHKEY`, `TS_HOSTNAME` and run `make dev-backend`.
+
+3) Certificates for multi‑device
+- Regenerate `certs/server.crt` to include your tailnet FQDN/IP SANs via `scripts/generate-server-cert.sh -H "localhost,127.0.0.1,::1,<ts-fqdn>,<ts-ip>" -f`.
+
+4) Start services
+- `make dev-backend` (Host App) and `make dev-ui` (UI) or browse the Host App’s tailnet URL directly.
+
+5) Launch a workspace
+- From the UI, use Launch. Inspect `/api/servers` and open the IDE tab which proxies `/proxy/server/<id>/`.
+
+Limitations to note
+- No built‑in auth; rely on tailnet and RBAC. Consider an auth proxy if exposing beyond the tailnet.
+- Logs SSE is tail‑only + heartbeat; no live watch yet.

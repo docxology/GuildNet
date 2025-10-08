@@ -29,3 +29,5 @@ ui/dist/
 .env.local
 
 /hostapp
+
+guildnet.config
