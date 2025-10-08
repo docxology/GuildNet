@@ -508,6 +508,11 @@ func main() {
 		},
 		Logger: httpx.Logger(),
 		APIProxy: func() (http.RoundTripper, func(req *http.Request, scheme, hostport, subPath string), bool) {
+			// Allow disabling API proxy (pods proxy) to validate WS directly via tsnet/ClusterIP.
+			if strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_DISABLE_API_PROXY")), "1") ||
+				strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_DISABLE_API_PROXY")), "true") {
+				return nil, nil, false
+			}
 			// Build a transport using the k8s rest config to go through the API server proxy
 			cfg := kcli.Config()
 			if cfg == nil {

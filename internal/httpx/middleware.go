@@ -1,11 +1,15 @@
 package httpx
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"time"
 )
@@ -78,6 +82,31 @@ func (w *respWriter) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// Hijack passes through to the underlying ResponseWriter when it supports
+// http.Hijacker. This is critical for WebSocket upgrades handled by
+// net/http/httputil.ReverseProxy.
+func (w *respWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
+	}
+	return nil, nil, fmt.Errorf("hijacker not supported")
+}
+
+// Optional pass-throughs for completeness when servers/handlers check these.
+func (w *respWriter) Push(target string, opts *http.PushOptions) error {
+	if p, ok := w.ResponseWriter.(http.Pusher); ok {
+		return p.Push(target, opts)
+	}
+	return http.ErrNotSupported
+}
+
+func (w *respWriter) ReadFrom(r io.Reader) (n int64, err error) {
+	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
+		return rf.ReadFrom(r)
+	}
+	return 0, nil
 }
 
 // request id context key

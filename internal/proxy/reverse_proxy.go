@@ -176,6 +176,15 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rp := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			// Preserve original method, body, and most headers. Adjust URL.
+			// Mirror ProxyPreserveHost (Apache) behavior via X-Forwarded-Host/Proto for upstream awareness.
+			if r.Host != "" {
+				req.Header.Set("X-Forwarded-Host", r.Host)
+			}
+			if r.TLS != nil {
+				req.Header.Set("X-Forwarded-Proto", "https")
+			} else {
+				req.Header.Set("X-Forwarded-Proto", "http")
+			}
 			if p.opts.APIProxy != nil {
 				if rt, setDirector, ok := p.opts.APIProxy(); ok && rt != nil && setDirector != nil {
 					// Prefer pods proxy to avoid Service readiness/endpoint races
