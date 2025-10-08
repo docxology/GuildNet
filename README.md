@@ -1,34 +1,19 @@
 # GuildNet
 
-GuildNet helps teams launch and reach “workload servers” inside or near their network/cluster with:
+GuildNet provides communities with a set of powerful affordances that reshape how developers work
+together. Socially, it enables censorship-resistant collaboration and shared capacity across geographies,
+lowering barriers to entry and broadening inclusion. Organizationally, its DAG-based workflows and Spec-
+Kit templates reduce coordination costs, preserve institutional knowledge, and distribute governance more
+equitably. Culturally, it supports pluralism, local sovereignty, and transparent contribution recognition,
+while amplifying accessibility through templated prompts and multilingual outputs. Creatively, it lowers the
+cost of experimentation, encourages safe sandboxes for bold ideas, and allows programmable
+collaboration pipelines that accelerate the idea-to-artifact cycle.
 
-- A local Go host app that proxies traffic using Tailscale (tsnet)
-- A simple web UI to list, launch, and view logs
-- A developer-friendly agent image (VS Code via code-server behind an iframe-friendly proxy)
-
-Tailscale (tsnet) is required. For a deeper dive, see `architecture.md`.
-
-## Goals
-
-- Simple, HTTPS-first dev experience
-- One host app binary with built-in tsnet
-- Browser UI for managing and opening workspaces
-- Agent image that exposes a ready-to-use IDE endpoint
-
-## Architecture (overview)
-
-- Host App (Go + tsnet)
-  - Serves a local TLS endpoint and a Tailscale listener
-  - Provides minimal APIs (health, images, servers, logs, launch)
-  - Proxies to agents or in-cluster HTTP endpoints
-- Web UI (SolidJS + Vite)
-  - Lists servers, shows details/logs, and provides a Launch form
-  - Pulls image presets from the backend (no hardcoding)
-- Agent Image (code-server + Caddy)
-  - Single-port HTTP (default 8080), iframe-friendly headers
-  - Non-root, health at `/healthz`, password from env or generated
-- Kubernetes Integration
-  - Deployments + Services for agents, logs retrieval
+These affordances emerge because GuildNet unifies networking, orchestration, workflows, storage, and
+collaboration tools under an event-driven, extensible architecture. By combining resilient infrastructure with
+knowledge systems and AI-driven agents, it ensures that communities can not only maintain continuity
+under constraints but also expand their cultural and creative capacity through new forms of real-time,
+human–AI co-creation.
 
 ## Quickstart
 
@@ -74,8 +59,9 @@ Tip: `make help` lists all common targets (build, test, lint, utilities like TLS
 - [x] Build & run code-server image inside Talos cluster
 - [x] Create dashboard server to run scripts and report status
 - [x] Create UI for dashboard server to join/create network, manage clusters and observe code servers
-- [ ] Fully generic and configurable docker deploys via subdomain on tailnet
 - [ ] Ensure multi-user support with orgs/clusters
+- [ ] Fully generic and configurable docker deploys via subdomain on tailnet
+- [ ] Docker image registry inside Talos cluster
 - [ ] Run Ollama on host machine and OpenAI Codex inside code servers, opening terminal to interact with agent via web UI
 - [ ] Event bus for agent-host communication (e.g. notify users of PR created, code pushed, etc) with web UI
 - [ ] Add persistent storage to cluster via Longhorn, save code server data there
