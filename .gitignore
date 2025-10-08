@@ -14,7 +14,6 @@
 # /vendor/
 
 # Editor/IDE
-.vscode/
 .idea/
 .DS_Store
 Thumbs.db

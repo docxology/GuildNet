@@ -1,0 +1,125 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    // Setup
+    {
+      "label": "Setup project (UI deps + certs)",
+      "type": "shell",
+      "command": "make setup",
+      "group": "build"
+    },
+
+    // Build
+    {
+      "label": "Build backend",
+      "type": "shell",
+      "command": "make build-backend",
+      "group": "build"
+    },
+    {
+      "label": "Build UI",
+      "type": "shell",
+      "command": "make build-ui",
+      "group": "build"
+    },
+    {
+      "label": "Build all",
+      "type": "shell",
+      "command": "make build",
+      "group": "build"
+    },
+
+    // Dev
+    {
+      "label": "Run backend (serve)",
+      "type": "shell",
+      "command": "make run",
+      "group": "build"
+    },
+    {
+      "label": "Dev: backend",
+      "type": "shell",
+      "command": "make dev-backend",
+      "group": "build"
+    },
+    {
+      "label": "Dev: UI (Vite)",
+      "type": "shell",
+      "command": "make dev-ui",
+      "group": "build",
+      "isBackground": true
+    },
+
+    // Quality
+    {
+      "label": "Test (Go)",
+      "type": "shell",
+      "command": "make test",
+      "group": "test"
+    },
+    {
+      "label": "Lint (Go)",
+      "type": "shell",
+      "command": "make lint",
+      "group": "test"
+    },
+    {
+      "label": "Go mod tidy",
+      "type": "shell",
+      "command": "make tidy",
+      "group": "build"
+    },
+    {
+      "label": "Clean",
+      "type": "shell",
+      "command": "make clean",
+      "group": "build"
+    },
+
+    // Utilities
+    {
+      "label": "Health: backend",
+      "type": "shell",
+      "command": "make health",
+      "group": "test"
+    },
+    {
+      "label": "TLS check: backend 8080",
+      "type": "shell",
+      "command": "make tls-check-backend",
+      "group": "test"
+    },
+    {
+      "label": "TLS check: Vite 5173",
+      "type": "shell",
+      "command": "make tls-check-ui",
+      "group": "test"
+    },
+    {
+      "label": "Admin: stop all workloads",
+      "type": "shell",
+      "command": "make stop-all",
+      "group": "test"
+    },
+
+    // Extras
+    {
+      "label": "Agent: build image",
+      "type": "shell",
+      "command": "make agent-build",
+      "group": "build"
+    },
+    {
+      "label": "Talos: fresh deploy",
+      "type": "shell",
+      "command": "make talos-fresh",
+      "group": "build"
+    },
+    {
+      "label": "Talos: upgrade cluster",
+      "type": "shell",
+      "command": "make talos-upgrade",
+      "group": "build"
+    }
+  ]
+}
