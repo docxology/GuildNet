@@ -151,7 +151,7 @@ func (s *Store) SeedDemo() {
 	srv := &model.Server{
 		ID:        "demo-1",
 		Name:      "GuildNet Agent",
-		Image:     "guildnet/agent:dev",
+		Image:     "codercom/code-server:4.90.3",
 		Status:    "running",
 		Ports:     []model.Port{{Name: "http", Port: 8080}, {Name: "https", Port: 8443}},
 		Resources: &model.Resources{CPU: "500m", Memory: "256Mi"},

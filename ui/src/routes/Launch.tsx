@@ -23,7 +23,7 @@ export default function Launch() {
   const navigate = useNavigate();
   const [image, setImage] = createSignal('');
   const imagePresets: Array<{ label: string; value: string }> = [
-    { label: 'GuildNet Agent (VS Code)', value: 'guildnet/agent:dev' },
+  { label: 'VS Code (code-server)', value: 'codercom/code-server:4.90.3' },
   ];
   const [name, setName] = createSignal('');
   const [args, setArgs] = createSignal<string[]>([]);
@@ -37,9 +37,13 @@ export default function Launch() {
 
   // Prefill defaults by querying backend for the selected image
   createEffect(async () => {
-    const img = image() || 'guildnet/agent:dev';
+    const img = image() || 'codercom/code-server:4.90.3';
     if (!image()) setImage(img);
-    const d: ImageDefaults = await getImageDefaults(img).catch(() => ({} as ImageDefaults));
+    let d: ImageDefaults = await getImageDefaults(img).catch(() => ({} as ImageDefaults));
+    // Client-side fallback defaults for known images (avoids requiring backend restart)
+    if ((!d || (!d.ports && !d.env)) && /(codercom|ghcr\.io\/coder)\/code-server/i.test(img)) {
+      d = { ports: [{ name: 'http', port: 8080 }], env: { AGENT_HOST: '' } } as ImageDefaults;
+    }
     if ((ports()?.length ?? 0) === 0 && Array.isArray(d.ports)) setPorts(d.ports.map((p) => ({ name: p.name || '', port: p.port })));
     const existing: Record<string, string> = Object.fromEntries(env().map((e) => [e.k, e.v] as const));
     const merged: Record<string, string> = { ...(d.env || {}), ...existing };

@@ -21,7 +21,7 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: agent
-          image: guildnet/agent:dev
+          image: codercom/code-server:4.90.3
           imagePullPolicy: IfNotPresent
           env:
             - name: PORT
@@ -34,7 +34,7 @@ spec:
             # Set to the Kubernetes Service DNS name or Pod IP as appropriate
             - name: AGENT_HOST
               value: "agent-demo"
-            # OPTIONAL: set PASSWORD explicitly; else it will be generated and stored in /data
+            # OPTIONAL: set PASSWORD explicitly; code-server also supports /home/coder/.config/code-server/config.yaml
             #- name: PASSWORD
             #  valueFrom:
             #    secretKeyRef:
@@ -91,12 +91,12 @@ spec:
   selector:
     app: agent-demo
   ports:
-  - name: http
-    port: 8080
-    targetPort: http
-  - name: https
-    port: 8443
-    targetPort: https
+    - name: http
+      port: 8080
+      targetPort: http
+    - name: https
+      port: 8443
+      targetPort: https
 
 ---
 apiVersion: v1

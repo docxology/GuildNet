@@ -264,6 +264,9 @@ func main() {
 		if strings.Contains(img, "guildnet/agent") {
 			resp["ports"] = []model.Port{{Name: "http", Port: 8080}, {Name: "https", Port: 8443}}
 			resp["env"] = map[string]string{"AGENT_HOST": ""}
+		} else if strings.Contains(img, "codercom/code-server") || strings.Contains(img, "ghcr.io/coder/code-server") {
+			resp["ports"] = []model.Port{{Name: "http", Port: 8080}}
+			resp["env"] = map[string]string{"AGENT_HOST": ""}
 		}
 		httpx.JSON(w, http.StatusOK, resp)
 	})

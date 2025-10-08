@@ -130,11 +130,17 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 		cports = append(cports, cp)
 	}
 	if len(cports) == 0 {
-		// Default to both 8080 (http) and 8443 (https). Readiness will target 8080.
-		cports = append(cports,
-			corev1.ContainerPort{Name: "http", ContainerPort: 8080},
-			corev1.ContainerPort{Name: "https", ContainerPort: 8443},
-		)
+		// If image looks like code-server, expose only HTTP 8080 by default.
+		img := strings.ToLower(strings.TrimSpace(spec.Image))
+		if strings.Contains(img, "codercom/code-server") || strings.Contains(img, "ghcr.io/coder/code-server") || strings.Contains(img, "code-server") {
+			cports = append(cports, corev1.ContainerPort{Name: "http", ContainerPort: 8080})
+		} else {
+			// Default to both 8080 (http) and 8443 (https). Readiness will target 8080.
+			cports = append(cports,
+				corev1.ContainerPort{Name: "http", ContainerPort: 8080},
+				corev1.ContainerPort{Name: "https", ContainerPort: 8443},
+			)
+		}
 	}
 
 	// env
@@ -163,6 +169,10 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 	replicas := int32(1)
 	// Optional imagePullSecret name
 	imgPullSecret := strings.TrimSpace(os.Getenv("K8S_IMAGE_PULL_SECRET"))
+	// Default to code-server image if unspecified
+	if strings.TrimSpace(spec.Image) == "" {
+		spec.Image = "codercom/code-server:4.90.3"
+	}
 
 	// pick probe port: first declared container port or 8080
 	probePort := int32(8080)
@@ -187,6 +197,11 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 						}
 						return []corev1.LocalObjectReference{{Name: imgPullSecret}}
 					}(),
+					SecurityContext: &corev1.PodSecurityContext{
+						RunAsUser:  func() *int64 { v := int64(1000); return &v }(),
+						RunAsGroup: func() *int64 { v := int64(1000); return &v }(),
+						FSGroup:    func() *int64 { v := int64(1000); return &v }(),
+					},
 					Containers: []corev1.Container{{
 						Name:           "app",
 						Image:          spec.Image,
@@ -195,6 +210,10 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 						Ports:          cports,
 						ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstr.FromInt(int(probePort))}}},
 						LivenessProbe:  &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstr.FromInt(int(probePort))}}},
+						SecurityContext: &corev1.SecurityContext{
+							AllowPrivilegeEscalation: func() *bool { b := false; return &b }(),
+							RunAsNonRoot:             func() *bool { b := true; return &b }(),
+						},
 					}},
 				},
 			},

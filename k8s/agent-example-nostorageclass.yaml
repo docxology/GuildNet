@@ -30,7 +30,7 @@ spec:
           effect: "NoSchedule"
       containers:
         - name: agent
-          image: ghcr.io/hexafield/guildnet-agent:latest
+          image: codercom/code-server:4.90.3
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false
@@ -39,15 +39,11 @@ spec:
           env:
             - name: PORT
               value: "8080"
-            - name: HTTPS_PORT
-              value: "8443"
             - name: AGENT_HOST
               value: "agent-demo"
           ports:
             - containerPort: 8080
               name: http
-            - containerPort: 8443
-              name: https
           resources:
             requests:
               cpu: "250m"
@@ -64,14 +60,14 @@ spec:
               mountPath: /workspace
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /
               port: http
             initialDelaySeconds: 10
             periodSeconds: 5
             failureThreshold: 10
           livenessProbe:
             httpGet:
-              path: /healthz
+              path: /
               port: http
             initialDelaySeconds: 20
             periodSeconds: 10
@@ -83,7 +79,6 @@ spec:
         - name: workspace
           emptyDir:
             sizeLimit: 50Gi
----
 apiVersion: v1
 kind: Service
 metadata:
@@ -97,6 +92,3 @@ spec:
     - name: http
       port: 8080
       targetPort: http
-    - name: https
-      port: 8443
-      targetPort: https
