@@ -11,6 +11,7 @@ A simple SolidJS + Vite + Tailwind web UI to browse servers, stream logs, and la
 - npm run format — prettier
 
 ## Backend contract (same-origin)
+
 - GET /api/servers
 - GET /api/servers/:id
 - WS /ws/logs?target=...&level=info|debug|error&tail=200
@@ -21,4 +22,5 @@ A simple SolidJS + Vite + Tailwind web UI to browse servers, stream logs, and la
 No environment variables are used; all requests are relative.
 
 ## Dev notes
+
 If your API runs on a different port during local dev, configure a Vite proxy in vite.config.ts.

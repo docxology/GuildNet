@@ -1,8 +1,14 @@
-@import "tailwindcss";
+@import 'tailwindcss';
 
 @layer base {
-  :root { color-scheme: light dark; }
-  html, body, #root { height: 100%; }
+  :root {
+    color-scheme: light dark;
+  }
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
 }
 
 /* Keep semantic class names; map to utility classes directly where used in JSX.

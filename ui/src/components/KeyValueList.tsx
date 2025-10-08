@@ -1,6 +1,6 @@
 export default function KeyValueList(props: { data?: Record<string, string> }) {
-  const entries = Object.entries(props.data ?? {});
-  if (!entries.length) return <div class="text-sm text-neutral-500">None</div>;
+  const entries = Object.entries(props.data ?? {})
+  if (!entries.length) return <div class="text-sm text-neutral-500">None</div>
   return (
     <dl class="grid grid-cols-1 sm:grid-cols-2 gap-2">
       {entries.map(([k, v]) => (
@@ -10,5 +10,5 @@ export default function KeyValueList(props: { data?: Record<string, string> }) {
         </div>
       ))}
     </dl>
-  );
+  )
 }
