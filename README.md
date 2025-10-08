@@ -69,11 +69,11 @@ Tip: `make help` lists all common targets (build, test, lint, utilities like TLS
 
 # Progress
 
-- [ ] Join/create Headscale/Tailscale network
-- [ ] Create Talos cluster inside Tailnet
-- [ ] Build & run Code Server image inside Talos cluster
-- [ ] Create dashboard server to run scripts and report status
-- [ ] Create UI for dashboard server to join/create network, manage clusters and observe code servers
+- [x] Join/create Headscale/Tailscale network
+- [x] Create Talos cluster running Tailscale Tailnet
+- [x] Build & run code-server image inside Talos cluster
+- [x] Create dashboard server to run scripts and report status
+- [x] Create UI for dashboard server to join/create network, manage clusters and observe code servers
 - [ ] Fully generic and configurable docker deploys via subdomain on tailnet
 - [ ] Ensure multi-user support with orgs/clusters
 - [ ] Run Ollama on host machine and OpenAI Codex inside code servers, opening terminal to interact with agent via web UI
