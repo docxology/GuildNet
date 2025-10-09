@@ -235,6 +235,10 @@ main() {
   done
 
   # Reconcile (self-heal) subnet router DS each run
+  if ! kubectl get nodes >/dev/null 2>&1; then
+    err "kube API still unreachable; aborting before Tailscale DS apply"
+    return 1
+  fi
   log "Reconciling Tailscale subnet router (routes=$TS_ROUTES, login=$TS_LOGIN_SERVER)"
   kubectl -n kube-system apply -f - <<YAML
 apiVersion: apps/v1
@@ -284,7 +288,7 @@ spec:
           set -e
           /usr/sbin/tailscaled --state=/var/lib/tailscale/tailscaled.state &
           sleep 2
-          HOSTNAME_ARG="--hostname=${TS_HOSTNAME:-talos-subnet-router-\$(hostname)}"
+          HOSTNAME_ARG="--hostname=${TS_HOSTNAME:-talos-subnet-router-$(hostname)}"
           tailscale up --authkey="$TS_AUTHKEY" --login-server="$TS_LOGIN_SERVER" --advertise-routes="$TS_ROUTES" $HOSTNAME_ARG --accept-routes
           # keep foreground to hold the pod
           tail -f /dev/null
