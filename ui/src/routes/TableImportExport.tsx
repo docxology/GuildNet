@@ -11,22 +11,26 @@ export default function TableImportExport() {
   const [preview, setPreview] = createSignal<any>(null)
   const [result, setResult] = createSignal<any>(null)
   const [format, setFormat] = createSignal<'json' | 'csv'>('json')
-  const [mapping, setMapping] = createSignal<Record<string,string>>({})
-  const previewRows = () => (preview()?.rows || preview()?.Rows || preview()?.data || []) as any[]
+  const [mapping, setMapping] = createSignal<Record<string, string>>({})
+  const previewRows = () =>
+    (preview()?.rows || preview()?.Rows || preview()?.data || []) as any[]
   const sourceColumns = createMemo(() => {
     const first = previewRows()[0]
     if (!first) return []
     // try raw first, fallback mapped
-    const obj = (first.raw || first) as Record<string,any>
+    const obj = (first.raw || first) as Record<string, any>
     return Object.keys(obj || {})
   })
   const targetColumns = createMemo(() => {
     // Cannot fetch schema here easily; allow free text target columns users can set
     // Alternatively, users can set any desired column names.
-    return Array.from(new Set([...sourceColumns(), ...Object.values(mapping())]))
+    return Array.from(
+      new Set([...sourceColumns(), ...Object.values(mapping())])
+    )
   })
-  const setMap = (from: string, to: string) => setMapping(m => ({ ...m, [from]: to }))
-  function tryParseRaw(text: string, fmt: 'json'|'csv'): any[] {
+  const setMap = (from: string, to: string) =>
+    setMapping((m) => ({ ...m, [from]: to }))
+  function tryParseRaw(text: string, fmt: 'json' | 'csv'): any[] {
     if (fmt === 'json') {
       try {
         const v = JSON.parse(text)
@@ -38,10 +42,13 @@ export default function TableImportExport() {
       }
     }
     // naive CSV: first line headers, comma-separated, no advanced quoting
-    const lines = text.split(/\r?\n/).map(l => l.trim()).filter((l): l is string => !!l)
+    const lines = text
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l): l is string => !!l)
     if (lines.length === 0) return []
     const first = lines[0] ?? ''
-    const head = first.split(',').map(h => h.trim())
+    const head = first.split(',').map((h) => h.trim())
     const out: any[] = []
     for (let i = 1; i < lines.length; i++) {
       const line = lines[i] ?? ''
@@ -65,7 +72,10 @@ export default function TableImportExport() {
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rows: tryParseRaw(raw(), format()), mapping: mapping() })
+        body: JSON.stringify({
+          rows: tryParseRaw(raw(), format()),
+          mapping: mapping()
+        })
       }
     )
     try {
@@ -86,7 +96,10 @@ export default function TableImportExport() {
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rows: tryParseRaw(raw(), format()), mapping: mapping() })
+        body: JSON.stringify({
+          rows: tryParseRaw(raw(), format()),
+          mapping: mapping()
+        })
       }
     )
     try {
@@ -114,10 +127,20 @@ export default function TableImportExport() {
       <div class="space-y-2">
         <div class="flex gap-2 items-center text-xs">
           <label class="flex items-center gap-1">
-            <input type="radio" checked={format() === 'json'} onChange={() => setFormat('json')} /> JSON
+            <input
+              type="radio"
+              checked={format() === 'json'}
+              onChange={() => setFormat('json')}
+            />{' '}
+            JSON
           </label>
           <label class="flex items-center gap-1">
-            <input type="radio" checked={format() === 'csv'} onChange={() => setFormat('csv')} /> CSV
+            <input
+              type="radio"
+              checked={format() === 'csv'}
+              onChange={() => setFormat('csv')}
+            />{' '}
+            CSV
           </label>
           <Button onClick={dryRun}>Dry Run</Button>
           <Button variant="primary" onClick={runImport}>
@@ -139,16 +162,29 @@ export default function TableImportExport() {
           </pre>
           <div class="space-y-2">
             <div class="font-semibold">Column mapping</div>
-            <div class="grid gap-2" style={{ 'grid-template-columns': '1fr 20px 1fr' }}>
-              <For each={sourceColumns()}>{(src) => (
-                <>
-                  <div class="border rounded px-2 py-1 bg-neutral-50 dark:bg-neutral-800">{src}</div>
-                  <div class="text-center">→</div>
-                  <input class="border rounded px-2 py-1" value={mapping()[src] || src} onInput={(e) => setMap(src, e.currentTarget.value)} />
-                </>
-              )}</For>
+            <div
+              class="grid gap-2"
+              style={{ 'grid-template-columns': '1fr 20px 1fr' }}
+            >
+              <For each={sourceColumns()}>
+                {(src) => (
+                  <>
+                    <div class="border rounded px-2 py-1 bg-neutral-50 dark:bg-neutral-800">
+                      {src}
+                    </div>
+                    <div class="text-center">→</div>
+                    <input
+                      class="border rounded px-2 py-1"
+                      value={mapping()[src] || src}
+                      onInput={(e) => setMap(src, e.currentTarget.value)}
+                    />
+                  </>
+                )}
+              </For>
             </div>
-            <div class="text-[10px] text-neutral-500">Adjust targets to match your table schema before running import.</div>
+            <div class="text-[10px] text-neutral-500">
+              Adjust targets to match your table schema before running import.
+            </div>
             <Show when={previewRows().length}>
               <div class="mt-3">
                 <div class="font-semibold mb-1">Row errors</div>
@@ -156,9 +192,16 @@ export default function TableImportExport() {
                   {(r: any, i) => (
                     <div class="text-[11px] px-2 py-1 border-b last:border-0 flex items-center gap-2">
                       <span class="text-neutral-500">#{i() + 1}</span>
-                      <Show when={(r.errors || r.Errors || []).length} fallback={<span class="text-green-700">ok</span>}>
+                      <Show
+                        when={(r.errors || r.Errors || []).length}
+                        fallback={<span class="text-green-700">ok</span>}
+                      >
                         <For each={r.errors || r.Errors}>
-                          {(e: string) => <span class="px-1.5 py-0.5 rounded bg-red-100 text-red-800">{e}</span>}
+                          {(e: string) => (
+                            <span class="px-1.5 py-0.5 rounded bg-red-100 text-red-800">
+                              {e}
+                            </span>
+                          )}
                         </For>
                       </Show>
                     </div>

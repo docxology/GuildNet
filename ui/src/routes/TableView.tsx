@@ -9,19 +9,35 @@ export default function TableView() {
         <h1 class="text-xl font-semibold">Table: {params.table}</h1>
       </div>
       <nav class="flex gap-2 text-xs">
-        <A class="hover:underline" href={`/databases/${encodeURIComponent(params.dbId || '')}/tables/${encodeURIComponent(params.table || '')}`} end>
+        <A
+          class="hover:underline"
+          href={`/databases/${encodeURIComponent(params.dbId || '')}/tables/${encodeURIComponent(params.table || '')}`}
+          end
+        >
           Data
         </A>
-        <A class="hover:underline" href={`/databases/${encodeURIComponent(params.dbId || '')}/tables/${encodeURIComponent(params.table || '')}/schema`}>
+        <A
+          class="hover:underline"
+          href={`/databases/${encodeURIComponent(params.dbId || '')}/tables/${encodeURIComponent(params.table || '')}/schema`}
+        >
           Schema
         </A>
-        <A class="hover:underline" href={`/databases/${encodeURIComponent(params.dbId || '')}/tables/${encodeURIComponent(params.table || '')}/audit`}>
+        <A
+          class="hover:underline"
+          href={`/databases/${encodeURIComponent(params.dbId || '')}/tables/${encodeURIComponent(params.table || '')}/audit`}
+        >
           Audit
         </A>
-        <A class="hover:underline" href={`/databases/${encodeURIComponent(params.dbId || '')}/tables/${encodeURIComponent(params.table || '')}/permissions`}>
+        <A
+          class="hover:underline"
+          href={`/databases/${encodeURIComponent(params.dbId || '')}/tables/${encodeURIComponent(params.table || '')}/permissions`}
+        >
           Permissions
         </A>
-        <A class="hover:underline" href={`/databases/${encodeURIComponent(params.dbId || '')}/tables/${encodeURIComponent(params.table || '')}/import-export`}>
+        <A
+          class="hover:underline"
+          href={`/databases/${encodeURIComponent(params.dbId || '')}/tables/${encodeURIComponent(params.table || '')}/import-export`}
+        >
           Import/Export
         </A>
       </nav>

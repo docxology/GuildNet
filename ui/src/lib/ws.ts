@@ -48,7 +48,9 @@ export class WSManager extends Emitter {
   }
 
   private resolveUrl() {
-    return typeof this.urlOrFn === 'function' ? (this.urlOrFn as () => string)() : this.urlOrFn
+    return typeof this.urlOrFn === 'function'
+      ? (this.urlOrFn as () => string)()
+      : this.urlOrFn
   }
 
   setUrl(url: string | (() => string)) {

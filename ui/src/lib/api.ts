@@ -25,32 +25,82 @@ export async function listServers(signal?: AbortSignal): Promise<Server[]> {
 }
 
 // ---- Databases Feature (experimental) ----
-export type DatabaseInstance = { id: string; name: string; description?: string; created_at?: string }
-export type TableDef = { id: string; name: string; primary_key?: string; schema?: ColumnDef[] }
-export type ColumnDef = { name: string; type: string; required?: boolean; mask?: boolean }
-
-export async function listDatabases(): Promise<DatabaseInstance[]> {
-  try { const res = await fetch(apiUrl('/api/db')); if (!res.ok) return []; return await res.json(); } catch { return [] }
+export type DatabaseInstance = {
+  id: string
+  name: string
+  description?: string
+  created_at?: string
+}
+export type TableDef = {
+  id: string
+  name: string
+  primary_key?: string
+  schema?: ColumnDef[]
+}
+export type ColumnDef = {
+  name: string
+  type: string
+  required?: boolean
+  mask?: boolean
 }
 
-export async function createDatabase(payload: { name: string; description?: string }): Promise<DatabaseInstance | null> {
+export async function listDatabases(): Promise<DatabaseInstance[]> {
   try {
-    const res = await fetch(apiUrl('/api/db'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+    const res = await fetch(apiUrl('/api/db'))
+    if (!res.ok) return []
+    return await res.json()
+  } catch {
+    return []
+  }
+}
+
+export async function createDatabase(payload: {
+  name: string
+  description?: string
+}): Promise<DatabaseInstance | null> {
+  try {
+    const res = await fetch(apiUrl('/api/db'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    })
     if (!res.ok) return null
     return await res.json()
-  } catch { return null }
+  } catch {
+    return null
+  }
 }
 
 export async function listTables(dbId: string): Promise<TableDef[]> {
-  try { const res = await fetch(apiUrl(`/api/db/${encodeURIComponent(dbId)}/tables`)); if (!res.ok) return []; return await res.json(); } catch { return [] }
+  try {
+    const res = await fetch(
+      apiUrl(`/api/db/${encodeURIComponent(dbId)}/tables`)
+    )
+    if (!res.ok) return []
+    return await res.json()
+  } catch {
+    return []
+  }
 }
 
-export async function createTable(dbId: string, payload: { name: string; primary_key?: string; schema: ColumnDef[] }): Promise<TableDef | null> {
+export async function createTable(
+  dbId: string,
+  payload: { name: string; primary_key?: string; schema: ColumnDef[] }
+): Promise<TableDef | null> {
   try {
-    const res = await fetch(apiUrl(`/api/db/${encodeURIComponent(dbId)}/tables`), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+    const res = await fetch(
+      apiUrl(`/api/db/${encodeURIComponent(dbId)}/tables`),
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }
+    )
     if (!res.ok) return null
     return await res.json()
-  } catch { return null }
+  } catch {
+    return null
+  }
 }
 
 export async function getServer(

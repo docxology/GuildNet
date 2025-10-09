@@ -25,7 +25,9 @@ export default function TableAudit() {
     const a = action()
     const s = q().toLowerCase()
     return list.filter(
-      (ev) => (!a || ev.action === a) && (!s || JSON.stringify(ev).toLowerCase().includes(s))
+      (ev) =>
+        (!a || ev.action === a) &&
+        (!s || JSON.stringify(ev).toLowerCase().includes(s))
     )
   })
   const restoreRow = async (e: Audit) => {
@@ -36,28 +38,54 @@ export default function TableAudit() {
       const rowId = parts[1]
       if (e.action === 'update' && e.diff && typeof e.diff === 'object') {
         const res = await fetch(
-          apiUrl(`/api/db/${encodeURIComponent(String(params.dbId || ''))}/tables/${encodeURIComponent(String(table))}/rows/${encodeURIComponent(String(rowId))}`),
-          { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(e.diff) }
+          apiUrl(
+            `/api/db/${encodeURIComponent(String(params.dbId || ''))}/tables/${encodeURIComponent(String(table))}/rows/${encodeURIComponent(String(rowId))}`
+          ),
+          {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(e.diff)
+          }
         )
         if (!res.ok) throw new Error(`${res.status}`)
         pushToast({ type: 'success', message: 'Row restored' })
-      } else if (e.action === 'delete' && e.diff && typeof e.diff === 'object') {
+      } else if (
+        e.action === 'delete' &&
+        e.diff &&
+        typeof e.diff === 'object'
+      ) {
         const res = await fetch(
-          apiUrl(`/api/db/${encodeURIComponent(String(params.dbId || ''))}/tables/${encodeURIComponent(String(table))}/rows`),
-          { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rows: e.diff }) }
+          apiUrl(
+            `/api/db/${encodeURIComponent(String(params.dbId || ''))}/tables/${encodeURIComponent(String(table))}/rows`
+          ),
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rows: e.diff })
+          }
         )
         if (!res.ok) throw new Error(`${res.status}`)
         pushToast({ type: 'success', message: 'Row reinserted' })
       } else {
-        pushToast({ type: 'info', message: 'Restore not available for this event' })
+        pushToast({
+          type: 'info',
+          message: 'Restore not available for this event'
+        })
       }
     } catch (err: any) {
-      pushToast({ type: 'error', message: `Restore failed: ${err?.message || ''}` })
+      pushToast({
+        type: 'error',
+        message: `Restore failed: ${err?.message || ''}`
+      })
     }
   }
   const restoreSchema = async (e: Audit) => {
     try {
-      if (e.action !== 'update_schema' || !e.diff || typeof e.diff !== 'object') {
+      if (
+        e.action !== 'update_schema' ||
+        !e.diff ||
+        typeof e.diff !== 'object'
+      ) {
         pushToast({ type: 'info', message: 'No schema to restore' })
         return
       }
@@ -65,13 +93,22 @@ export default function TableAudit() {
       const table = parts[0]
       const body = JSON.stringify(e.diff)
       const res = await fetch(
-        apiUrl(`/api/db/${encodeURIComponent(String(params.dbId || ''))}/tables/${encodeURIComponent(String(table))}`),
-        { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body }
+        apiUrl(
+          `/api/db/${encodeURIComponent(String(params.dbId || ''))}/tables/${encodeURIComponent(String(table))}`
+        ),
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body
+        }
       )
       if (!res.ok) throw new Error(`${res.status}`)
       pushToast({ type: 'success', message: 'Schema restored' })
     } catch (err: any) {
-      pushToast({ type: 'error', message: `Restore failed: ${err?.message || ''}` })
+      pushToast({
+        type: 'error',
+        message: `Restore failed: ${err?.message || ''}`
+      })
     }
   }
   return (
@@ -100,14 +137,20 @@ export default function TableAudit() {
       <div class="border rounded divide-y bg-white dark:bg-neutral-900 text-sm">
         <For each={filtered()}>
           {(e) => (
-            <div class={`p-2 space-y-1 ${e.action.includes('schema') ? 'bg-amber-50 dark:bg-amber-900/20' : ''}`}>
+            <div
+              class={`p-2 space-y-1 ${e.action.includes('schema') ? 'bg-amber-50 dark:bg-amber-900/20' : ''}`}
+            >
               <div class="flex items-center justify-between">
                 <span class="font-mono text-xs">{e.id}</span>
                 <span class="text-xs text-neutral-500">{e.ts}</span>
               </div>
               <div class="text-xs flex items-center gap-2">
                 <span class="font-semibold">{e.action}</span>
-                {e.action.includes('schema') && <span class="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">schema</span>}
+                {e.action.includes('schema') && (
+                  <span class="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">
+                    schema
+                  </span>
+                )}
               </div>
               {e.diff && (
                 <pre class="bg-neutral-100 dark:bg-neutral-800 p-2 rounded overflow-auto text-[10px] leading-snug max-h-40">
@@ -115,10 +158,20 @@ export default function TableAudit() {
                 </pre>
               )}
               <Show when={e.action === 'update' || e.action === 'delete'}>
-                <button class="text-xs border rounded px-2 py-1" onClick={() => restoreRow(e)}>Restore</button>
+                <button
+                  class="text-xs border rounded px-2 py-1"
+                  onClick={() => restoreRow(e)}
+                >
+                  Restore
+                </button>
               </Show>
               <Show when={e.action === 'update_schema'}>
-                <button class="text-xs border rounded px-2 py-1" onClick={() => restoreSchema(e)}>Restore schema</button>
+                <button
+                  class="text-xs border rounded px-2 py-1"
+                  onClick={() => restoreSchema(e)}
+                >
+                  Restore schema
+                </button>
               </Show>
             </div>
           )}

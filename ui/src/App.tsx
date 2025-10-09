@@ -106,10 +106,22 @@ export default function App() {
         <Route path="/databases" component={Databases} />
         <Route path="/databases/:dbId" component={DatabaseDetail} />
         <Route path="/databases/:dbId/tables/:table" component={TableView} />
-        <Route path="/databases/:dbId/tables/:table/schema" component={TableSchema} />
-        <Route path="/databases/:dbId/tables/:table/audit" component={TableAudit} />
-        <Route path="/databases/:dbId/tables/:table/permissions" component={TablePermissions} />
-        <Route path="/databases/:dbId/tables/:table/import-export" component={TableImportExport} />
+        <Route
+          path="/databases/:dbId/tables/:table/schema"
+          component={TableSchema}
+        />
+        <Route
+          path="/databases/:dbId/tables/:table/audit"
+          component={TableAudit}
+        />
+        <Route
+          path="/databases/:dbId/tables/:table/permissions"
+          component={TablePermissions}
+        />
+        <Route
+          path="/databases/:dbId/tables/:table/import-export"
+          component={TableImportExport}
+        />
       </Route>
     </Router>
   )

@@ -5,13 +5,23 @@ import Button from '../components/Button'
 import { apiUrl } from '../lib/config'
 import { pushToast } from '../components/Toaster'
 
-type ColumnDef = { name: string; type: string; required?: boolean; mask?: boolean }
+type ColumnDef = {
+  name: string
+  type: string
+  required?: boolean
+  mask?: boolean
+}
 type TableMeta = { name: string; primary_key: string; schema: ColumnDef[] }
 
-async function fetchTable(dbId: string, table: string): Promise<TableMeta | null> {
+async function fetchTable(
+  dbId: string,
+  table: string
+): Promise<TableMeta | null> {
   try {
     const r = await fetch(
-      apiUrl(`/api/db/${encodeURIComponent(dbId)}/tables/${encodeURIComponent(table)}`)
+      apiUrl(
+        `/api/db/${encodeURIComponent(dbId)}/tables/${encodeURIComponent(table)}`
+      )
     )
     if (!r.ok) return null
     return await r.json()
@@ -41,7 +51,9 @@ export default function TableSchema() {
     setDirty(true)
   }
   const updateCol = (i: number, patch: Partial<ColumnDef>) => {
-    setEditing((cols) => cols.map((c, idx) => (idx === i ? { ...c, ...patch } : c)))
+    setEditing((cols) =>
+      cols.map((c, idx) => (idx === i ? { ...c, ...patch } : c))
+    )
     setDirty(true)
   }
   const removeCol = (i: number) => {
@@ -55,11 +67,11 @@ export default function TableSchema() {
   const save = async () => {
     try {
       const res = await fetch(
-      apiUrl(
-        `/api/db/${encodeURIComponent(params.dbId!)}/tables/${encodeURIComponent(
-          params.table!
-        )}`
-      ),
+        apiUrl(
+          `/api/db/${encodeURIComponent(params.dbId!)}/tables/${encodeURIComponent(
+            params.table!
+          )}`
+        ),
         {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
@@ -144,7 +156,9 @@ export default function TableSchema() {
                     <div class="col-span-4">
                       <Input
                         value={col.name}
-                        onInput={(e) => updateCol(i(), { name: e.currentTarget.value })}
+                        onInput={(e) =>
+                          updateCol(i(), { name: e.currentTarget.value })
+                        }
                         placeholder="column"
                       />
                     </div>
@@ -152,7 +166,9 @@ export default function TableSchema() {
                       <select
                         class="w-full rounded-md border px-2 py-2 bg-white dark:bg-neutral-900 text-sm"
                         value={col.type}
-                        onChange={(e) => updateCol(i(), { type: e.currentTarget.value })}
+                        onChange={(e) =>
+                          updateCol(i(), { type: e.currentTarget.value })
+                        }
                       >
                         <option value="string">string</option>
                         <option value="number">number</option>
@@ -166,7 +182,11 @@ export default function TableSchema() {
                         <input
                           type="checkbox"
                           checked={col.required}
-                          onChange={(e) => updateCol(i(), { required: e.currentTarget.checked })}
+                          onChange={(e) =>
+                            updateCol(i(), {
+                              required: e.currentTarget.checked
+                            })
+                          }
                         />{' '}
                         req
                       </label>
@@ -174,7 +194,9 @@ export default function TableSchema() {
                         <input
                           type="checkbox"
                           checked={col.mask}
-                          onChange={(e) => updateCol(i(), { mask: e.currentTarget.checked })}
+                          onChange={(e) =>
+                            updateCol(i(), { mask: e.currentTarget.checked })
+                          }
                         />{' '}
                         mask
                       </label>
