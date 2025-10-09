@@ -21,7 +21,7 @@ class Emitter {
 }
 
 export class WSManager extends Emitter {
-  private url: string
+  private urlOrFn: string | (() => string)
   private es?: EventSource // SSE only
   private state: WSState = 'closed'
   private retries = 0
@@ -33,11 +33,11 @@ export class WSManager extends Emitter {
   private didProbe = false // single-shot status probe on error
 
   constructor(
-    url: string,
+    url: string | (() => string),
     opts?: { maxRetries?: number; heartbeatInterval?: number }
   ) {
     super()
-    this.url = url
+    this.urlOrFn = url
     if (opts?.maxRetries != null) this.maxRetries = opts.maxRetries
     if (opts?.heartbeatInterval != null)
       this.heartbeatInterval = opts.heartbeatInterval
@@ -47,6 +47,14 @@ export class WSManager extends Emitter {
     return this.state
   }
 
+  private resolveUrl() {
+    return typeof this.urlOrFn === 'function' ? (this.urlOrFn as () => string)() : this.urlOrFn
+  }
+
+  setUrl(url: string | (() => string)) {
+    this.urlOrFn = url
+  }
+
   open() {
     this.cleanup()
     this.state = this.retries > 0 ? 'reconnecting' : 'connecting'
@@ -54,9 +62,9 @@ export class WSManager extends Emitter {
     try {
       // Dev diagnostics
       try {
-        console.info('[SSE] connecting', this.url)
+        console.info('[SSE] connecting', this.resolveUrl())
       } catch {}
-      this.es = new EventSource(this.url)
+      this.es = new EventSource(this.resolveUrl())
     } catch (e) {
       this.fail(e instanceof Error ? e.message : String(e))
       return
@@ -71,7 +79,7 @@ export class WSManager extends Emitter {
     }
     ;(this.es as EventSource).onopen = () => {
       try {
-        console.info('[SSE] open', this.url)
+        console.info('[SSE] open', this.resolveUrl())
       } catch {}
       this.state = 'open'
       this.retries = 0
@@ -100,7 +108,7 @@ export class WSManager extends Emitter {
         if (!this.didProbe) {
           this.didProbe = true
           try {
-            const res = await fetch(this.url, {
+            const res = await fetch(this.resolveUrl(), {
               method: 'GET',
               headers: { Accept: 'application/json' }
             })

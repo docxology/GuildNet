@@ -31,8 +31,10 @@ import (
 	crlog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
+	"github.com/your/module/internal/db"
 	httpx "github.com/your/module/internal/httpx"
 	"github.com/your/module/internal/k8s"
+	"github.com/your/module/internal/metrics"
 	"github.com/your/module/internal/model"
 	"github.com/your/module/internal/proxy"
 
@@ -240,11 +242,29 @@ func main() {
 
 	mux := http.NewServeMux()
 
+	// Initialize RethinkDB (best-effort; feature is optional if DB not reachable)
+	var dbMgr *db.Manager
+	if mgr, derr := db.Connect(ctx); derr != nil {
+		log.Printf("rethinkdb connect failed (databases feature disabled): %v", derr)
+	} else {
+		dbMgr = mgr
+		// Register database API endpoints
+		httpx.InitAndRegisterDB(mux, dbMgr)
+	}
+
 	// health check
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
+	})
+
+	// lightweight in-memory metrics (JSON)
+	mux.HandleFunc("/api/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(struct {
+			Snapshot any `json:"snapshot"`
+		}{Snapshot: metrics.Export()})
 	})
 
 	// Kubernetes client (Talos cluster required; no local mode)
