@@ -36,9 +36,7 @@ export default function Databases() {
     <div class="space-y-4">
       <div class="flex items-center justify-between">
         <h1 class="text-xl font-semibold">Databases</h1>
-        <Button onClick={() => setOpen(true)} variant="primary">
-          New Database
-        </Button>
+        <Button onClick={() => setOpen(true)} variant="primary">New Database</Button>
       </div>
       <div class="border rounded-lg divide-y overflow-hidden bg-white dark:bg-neutral-900">
         <For each={dbs()}>
@@ -67,14 +65,16 @@ export default function Databases() {
         footer={
           <>
             <Button
+              type="button"
               onClick={() => setOpen(false)}
               class="!bg-neutral-100 dark:!bg-neutral-800"
             >
               Cancel
             </Button>
             <Button
+              type="button"
               variant="primary"
-              disabled={creating() || !name().trim()}
+              disabled={creating() || name().trim().length === 0}
               onClick={submit}
             >
               {creating() ? 'Creating…' : 'Create'}
