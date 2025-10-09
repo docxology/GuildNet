@@ -3,10 +3,12 @@ package operator
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -28,8 +30,12 @@ type WorkspaceReconciler struct {
 // Reconcile implements the reconciliation loop.
 func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+	logger.Info("reconcile start", "name", req.Name, "namespace", req.Namespace)
 	ws := &apiv1alpha1.Workspace{}
 	if err := r.Get(ctx, req.NamespacedName, ws); err != nil {
+		if !apierrors.IsNotFound(err) {
+			logger.Error(err, "failed to get workspace")
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -44,8 +50,14 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	depKey := types.NamespacedName{Name: depName, Namespace: ws.Namespace}
 	createDep := false
 	if err := r.Get(ctx, depKey, dep); err != nil {
-		createDep = true
-		dep = &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: depName, Namespace: ws.Namespace}}
+		if apierrors.IsNotFound(err) {
+			createDep = true
+			dep = &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: depName, Namespace: ws.Namespace}}
+			logger.Info("deployment not found, will create", "name", depName)
+		} else {
+			logger.Error(err, "get deployment failed")
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
 	}
 
 	// Spec template (simple single container).
@@ -58,29 +70,81 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		ports = []corev1.ContainerPort{{ContainerPort: 8080, Name: "http"}}
 	}
 
+	// Build environment with defaults.
+	env := append([]corev1.EnvVar{}, ws.Spec.Env...)
+	envIndex := map[string]int{}
+	for i, e := range env {
+		envIndex[e.Name] = i
+	}
+	// Ensure PORT=8080 if absent.
+	if _, ok := envIndex["PORT"]; !ok {
+		env = append(env, corev1.EnvVar{Name: "PORT", Value: "8080"})
+	}
+	imgLower := strings.ToLower(ws.Spec.Image)
+	if strings.Contains(imgLower, "codercom/code-server") || strings.Contains(imgLower, "code-server") {
+		if _, exists := envIndex["PASSWORD"]; !exists {
+			env = append(env, corev1.EnvVar{Name: "PASSWORD", Value: "changeme"})
+		}
+	}
+	// Container command adjustments for minimal images like alpine that would otherwise exit immediately.
+	var command []string
+	var readiness *corev1.Probe
+	var liveness *corev1.Probe
+	if strings.Contains(imgLower, "alpine") {
+		// Provide a tiny HTTP responder loop using nc (busybox) so probes can succeed.
+		command = []string{"/bin/sh", "-c", "while true; do echo -e 'HTTP/1.1 200 OK\r\nContent-Length:2\r\n\r\nok' | nc -l -p 8080 -w 1; done"}
+		readiness = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstrFromPort(ports[0])}}, InitialDelaySeconds: 2, PeriodSeconds: 10}
+		liveness = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstrFromPort(ports[0])}}, InitialDelaySeconds: 10, PeriodSeconds: 20}
+	} else {
+		readiness = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstrFromPort(ports[0])}}, InitialDelaySeconds: 2, PeriodSeconds: 5}
+		liveness = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstrFromPort(ports[0])}}, InitialDelaySeconds: 5, PeriodSeconds: 10}
+	}
+
 	replicas := int32(1)
 	dep.Spec.Replicas = &replicas
 	dep.Spec.Selector = &metav1.LabelSelector{MatchLabels: map[string]string{"guildnet.io/workspace": ws.Name}}
 	dep.Spec.Template.ObjectMeta.Labels = map[string]string{"guildnet.io/workspace": ws.Name}
 	dep.Spec.Template.Spec.Containers = []corev1.Container{{
-		Name:           "workspace",
-		Image:          ws.Spec.Image,
-		Env:            ws.Spec.Env,
-		Ports:          ports,
-		ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstrFromPort(ports[0])}}, InitialDelaySeconds: 2, PeriodSeconds: 5},
-		LivenessProbe:  &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstrFromPort(ports[0])}}, InitialDelaySeconds: 5, PeriodSeconds: 10},
+		Name:    "workspace",
+		Image:   ws.Spec.Image,
+		Env:     env,
+		Command: command,
+		Ports:   ports,
+		SecurityContext: &corev1.SecurityContext{
+			AllowPrivilegeEscalation: func() *bool { b := false; return &b }(),
+			RunAsNonRoot:             func() *bool { b := true; return &b }(),
+			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+		},
+		ReadinessProbe: readiness,
+		LivenessProbe:  liveness,
 	}}
+	// Pod-level security context
+	dep.Spec.Template.Spec.SecurityContext = &corev1.PodSecurityContext{
+		RunAsUser:      func() *int64 { v := int64(1000); return &v }(),
+		RunAsGroup:     func() *int64 { v := int64(1000); return &v }(),
+		FSGroup:        func() *int64 { v := int64(1000); return &v }(),
+		SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+	}
+	// Allow scheduling on single control-plane node in Talos dev cluster.
+	ctrlPlaneTol := corev1.Toleration{Key: "node-role.kubernetes.io/control-plane", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule}
+	// Overwrite tolerations with a single required toleration to prevent duplication drift across reconciles.
+	dep.Spec.Template.Spec.Tolerations = []corev1.Toleration{ctrlPlaneTol}
 
 	if err := controllerutil.SetControllerReference(ws, dep, r.Scheme); err != nil {
+		logger.Error(err, "set controller ref deployment failed")
 		return ctrl.Result{}, err
 	}
 	if createDep {
+		logger.Info("creating deployment", "name", depName)
 		if err := r.Create(ctx, dep); err != nil {
-			return ctrl.Result{}, err
+			logger.Error(err, "create deployment failed")
+			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 		}
 	} else {
+		logger.Info("updating deployment", "name", depName)
 		if err := r.Update(ctx, dep); err != nil {
-			return ctrl.Result{}, err
+			logger.Error(err, "update deployment failed")
+			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 		}
 	}
 
@@ -89,8 +153,14 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	svcKey := types.NamespacedName{Name: svcName, Namespace: ws.Namespace}
 	createSvc := false
 	if err := r.Get(ctx, svcKey, svc); err != nil {
-		createSvc = true
-		svc = &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: svcName, Namespace: ws.Namespace}}
+		if apierrors.IsNotFound(err) {
+			createSvc = true
+			svc = &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: svcName, Namespace: ws.Namespace}}
+			logger.Info("service not found, will create", "name", svcName)
+		} else {
+			logger.Error(err, "get service failed")
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
 	}
 	svc.Spec.Selector = map[string]string{"guildnet.io/workspace": ws.Name}
 	var svcPorts []corev1.ServicePort
@@ -103,15 +173,20 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		svc.Spec.Type = corev1.ServiceTypeLoadBalancer
 	}
 	if err := controllerutil.SetControllerReference(ws, svc, r.Scheme); err != nil {
+		logger.Error(err, "set controller ref service failed")
 		return ctrl.Result{}, err
 	}
 	if createSvc {
+		logger.Info("creating service", "name", svcName)
 		if err := r.Create(ctx, svc); err != nil {
-			return ctrl.Result{}, err
+			logger.Error(err, "create service failed")
+			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 		}
 	} else {
+		logger.Info("updating service", "name", svcName)
 		if err := r.Update(ctx, svc); err != nil {
-			return ctrl.Result{}, err
+			logger.Error(err, "update service failed")
+			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 		}
 	}
 
@@ -136,6 +211,7 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		logger.Error(err, "status update failed")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
+	logger.Info("reconcile complete", "phase", ws.Status.Phase, "ready", ws.Status.ReadyReplicas, "svc", ws.Status.ServiceDNS)
 	return ctrl.Result{}, nil
 }
 

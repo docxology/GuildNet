@@ -27,6 +27,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	crlog "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	httpx "github.com/your/module/internal/httpx"
 	"github.com/your/module/internal/k8s"
@@ -55,6 +57,8 @@ func startOperator(ctx context.Context, restCfg *rest.Config) error {
 	scheme := runtime.NewScheme()
 	_ = clientgoscheme.AddToScheme(scheme)
 	_ = apiv1alpha1.AddToScheme(scheme)
+	// configure controller-runtime logger (dev mode)
+	crlog.SetLogger(zap.New(zap.UseDevMode(true)))
 	opts := ctrl.Options{Scheme: scheme}
 	mgr, err := ctrl.NewManager(restCfg, opts)
 	if err != nil {
@@ -607,9 +611,15 @@ func main() {
 		if len(spec.Env) > 0 {
 			var envArr []any
 			for k, v := range spec.Env {
-				envArr = append(envArr, map[string]any{"name": k, "value": v})
+				kTrim := strings.TrimSpace(k)
+				if kTrim == "" || strings.TrimSpace(v) == "" {
+					continue
+				}
+				envArr = append(envArr, map[string]any{"name": kTrim, "value": v})
 			}
-			specMap["env"] = envArr
+			if len(envArr) > 0 {
+				specMap["env"] = envArr
+			}
 		}
 		if len(spec.Expose) > 0 {
 			var portsArr []any
