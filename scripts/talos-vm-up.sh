@@ -235,7 +235,14 @@ main() {
 
   log "Checking cluster health (kube API readiness)"
   total_wait=0; max_wait=300; interval=5
-  until kubectl version --short >/dev/null 2>&1; do
+  while true; do
+    if kubectl get nodes >/dev/null 2>&1; then
+      # Require at least one Ready node
+      if kubectl get nodes -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null | grep -q True; then
+        log "kube API reachable and node Ready"
+        break
+      fi
+    fi
     sleep $interval
     total_wait=$((total_wait+interval))
     if [ $total_wait -ge $max_wait ]; then
@@ -250,7 +257,7 @@ main() {
     return 1
   fi
   log "Reconciling Tailscale subnet router (routes=$TS_ROUTES, login=$TS_LOGIN_SERVER)"
-  kubectl -n kube-system apply -f - <<YAML
+  kubectl -n kube-system apply -f - <<'YAML'
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -298,8 +305,11 @@ spec:
           set -e
           /usr/sbin/tailscaled --state=/var/lib/tailscale/tailscaled.state &
           sleep 2
-          HOSTNAME_ARG="--hostname=${TS_HOSTNAME:-talos-subnet-router-$(hostname)}"
-          tailscale up --authkey="$TS_AUTHKEY" --login-server="$TS_LOGIN_SERVER" --advertise-routes="$TS_ROUTES" $HOSTNAME_ARG --accept-routes
+          : "Using TS_HOSTNAME if set; else derive" 
+          if [ -z "${TS_HOSTNAME:-}" ]; then
+            TS_HOSTNAME="talos-subnet-router-$(hostname)"
+          fi
+          tailscale up --authkey="$TS_AUTHKEY" --login-server="$TS_LOGIN_SERVER" --advertise-routes="$TS_ROUTES" --hostname="$TS_HOSTNAME" --accept-routes
           # keep foreground to hold the pod
           tail -f /dev/null
       volumes:
