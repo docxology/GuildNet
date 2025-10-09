@@ -257,7 +257,7 @@ main() {
     return 1
   fi
   log "Reconciling Tailscale subnet router (routes=$TS_ROUTES, login=$TS_LOGIN_SERVER)"
-  kubectl -n kube-system apply -f - <<'YAML'
+  kubectl -n kube-system apply -f - <<YAML
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -313,18 +313,12 @@ spec:
         - -c
         - |
           set -e
-          # Start tailscaled in background (correct path for official image)
           /usr/local/bin/tailscaled --state=/var/lib/tailscale/tailscaled.state &
-          # Wait for control socket
           for i in $(seq 1 60); do
             if tailscale status >/dev/null 2>&1; then break; fi
             sleep 1
           done
-          if [ -z "${TS_HOSTNAME:-}" ]; then
-            TS_HOSTNAME="talos-subnet-router-$(hostname)"
-          fi
-            tailscale up --authkey="$TS_AUTHKEY" --login-server="$TS_LOGIN_SERVER" --advertise-routes="$TS_ROUTES" --hostname="$TS_HOSTNAME" --accept-routes || true
-          # Keep container alive
+          tailscale up --authkey="$TS_AUTHKEY" --login-server="$TS_LOGIN_SERVER" --advertise-routes="$TS_ROUTES" --hostname="$TS_HOSTNAME" --accept-routes || true
           tail -f /dev/null
       volumes:
       - name: state
