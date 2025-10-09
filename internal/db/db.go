@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
+	"net"
 	"os"
 	"strings"
 	"sync"
@@ -22,12 +24,14 @@ type Manager struct {
 	seq uint64
 }
 
-// Connect creates a Manager using env vars: RETHINKDB_ADDR (host:port), RETHINKDB_USER, RETHINKDB_PASS.
+// Connect creates a Manager using env vars and auto-discovery:
+//   - Explicit override: RETHINKDB_ADDR (host:port)
+//   - In Kubernetes: RETHINKDB_SERVICE_HOST/RETHINKDB_SERVICE_PORT if present
+//     Otherwise build DNS host using RETHINKDB_SERVICE_NAME (default: rethinkdb)
+//     and namespace from RETHINKDB_NAMESPACE/POD_NAMESPACE/KUBERNETES_NAMESPACE or serviceaccount file.
+//   - Outside Kubernetes: fallback localhost:28015
 func Connect(ctx context.Context) (*Manager, error) {
-	addr := strings.TrimSpace(os.Getenv("RETHINKDB_ADDR"))
-	if addr == "" {
-		addr = "localhost:28015" // dev default
-	}
+	addr := AutoDiscoverAddr()
 	opts := r.ConnectOpts{Address: addr, InitialCap: 5, MaxOpen: 20, Timeout: 5 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second}
 	if u := os.Getenv("RETHINKDB_USER"); u != "" {
 		opts.Username = u
@@ -40,6 +44,84 @@ func Connect(ctx context.Context) (*Manager, error) {
 		return nil, err
 	}
 	return &Manager{sess: sess}, nil
+}
+
+// AutoDiscoverAddr returns the best-effort RethinkDB address (host:port).
+// Precedence:
+// 1) RETHINKDB_ADDR env if set
+// 2) In-cluster K8s service env vars RETHINKDB_SERVICE_HOST/PORT
+// 3) DNS name "<svc>.<ns>.svc.cluster.local:28015" using RETHINKDB_SERVICE_NAME and namespace hints
+// 4) If inside Kubernetes but no hints: rethinkdb:28015
+// 5) Outside Kubernetes: localhost:28015
+func AutoDiscoverAddr() string {
+	if v := strings.TrimSpace(os.Getenv("RETHINKDB_ADDR")); v != "" {
+		return v
+	}
+	inCluster := strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_HOST")) != ""
+	if !inCluster {
+		// Outside Kubernetes: prefer local loopback port-forward in dev if it is available
+		if canDialFast("127.0.0.1:28015", 150*time.Millisecond) {
+			return "127.0.0.1:28015"
+		}
+	}
+	// Direct service host/port envs (set automatically for Services)
+	host := strings.TrimSpace(os.Getenv("RETHINKDB_SERVICE_HOST"))
+	port := strings.TrimSpace(os.Getenv("RETHINKDB_SERVICE_PORT"))
+	if host != "" {
+		if port == "" {
+			port = "28015"
+		}
+		return host + ":" + port
+	}
+	if inCluster {
+		// Build DNS from service name and namespace
+		svc := strings.TrimSpace(os.Getenv("RETHINKDB_SERVICE_NAME"))
+		if svc == "" {
+			svc = "rethinkdb"
+		}
+		ns := strings.TrimSpace(os.Getenv("RETHINKDB_NAMESPACE"))
+		if ns == "" {
+			ns = strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
+		}
+		if ns == "" {
+			ns = strings.TrimSpace(os.Getenv("KUBERNETES_NAMESPACE"))
+		}
+		if ns == "" {
+			// Try well-known serviceaccount namespace file
+			// Only attempt if file exists and is readable
+			saNS := "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+			if b, err := os.ReadFile(saNS); err == nil {
+				ns = strings.TrimSpace(string(b))
+			} else if !errorsIsNotExist(err) {
+				// ignore other fs errors and continue
+				_ = err
+			}
+		}
+		if ns == "" {
+			// As a last resort inside cluster, use short service name
+			return svc + ":28015"
+		}
+		return fmt.Sprintf("%s.%s.svc.cluster.local:28015", svc, ns)
+	}
+	// Outside cluster: assume local dev; prefer IPv4 loopback to avoid IPv6 (::1) resolution mismatches
+	return "127.0.0.1:28015"
+}
+
+func errorsIsNotExist(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Use fs helpers to classify
+	return errors.Is(err, fs.ErrNotExist)
+}
+
+func canDialFast(addr string, d time.Duration) bool {
+	conn, err := net.DialTimeout("tcp", addr, d)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 // dbName returns the physical database name for an org.
@@ -57,19 +139,29 @@ func (m *Manager) EnsureOrgDatabase(ctx context.Context, orgID string) error {
 	if err := cur.All(&dbs); err != nil {
 		return err
 	}
+	found := false
 	for _, d := range dbs {
 		if d == name {
-			return nil
+			found = true
+			break
 		}
 	}
-	_, err = r.DBCreate(name).RunWrite(m.sess)
-	return err
+	if !found {
+		if _, err := r.DBCreate(name).RunWrite(m.sess); err != nil {
+			return err
+		}
+	}
+	// Always ensure meta tables exist for this org database
+	return m.ensureMetaTables(ctx, orgID)
 }
 
 // ensureMetaTables creates internal meta tables (_schemas, _audit) if absent.
 func (m *Manager) ensureMetaTables(ctx context.Context, orgID string) error {
 	dbn := dbName(orgID)
-	// schemas handled during CreateTable; here also ensure audit
+	// Ensure schemas and audit tables exist
+	if _, err := r.DB(dbn).TableCreate("_schemas").RunWrite(m.sess); err != nil && !strings.Contains(err.Error(), "already exists") {
+		return err
+	}
 	if _, err := r.DB(dbn).TableCreate("_audit").RunWrite(m.sess); err != nil && !strings.Contains(err.Error(), "already exists") {
 		return err
 	}
@@ -130,6 +222,10 @@ func (m *Manager) UpdateTableSchema(ctx context.Context, orgID string, table str
 // GetTables returns table metadata for an org DB.
 func (m *Manager) GetTables(ctx context.Context, orgID string) ([]model.Table, error) {
 	dbn := dbName(orgID)
+	// Ensure database and meta tables exist so listing works on a fresh org
+	if err := m.EnsureOrgDatabase(ctx, orgID); err != nil {
+		return nil, err
+	}
 	cur, err := r.DB(dbn).Table("_schemas").Run(m.sess)
 	if err != nil {
 		return nil, err
@@ -138,6 +234,9 @@ func (m *Manager) GetTables(ctx context.Context, orgID string) ([]model.Table, e
 	var out []model.Table
 	if err := cur.All(&out); err != nil {
 		return nil, err
+	}
+	if out == nil {
+		out = []model.Table{}
 	}
 	return out, nil
 }
@@ -261,6 +360,11 @@ type ChangefeedStream struct {
 
 // SubscribeTable produces events for inserts/updates/deletes. Resume token currently unused (placeholder).
 func (m *Manager) SubscribeTable(ctx context.Context, orgID, table string) (*ChangefeedStream, error) {
+	// Increment a simple sequence to form a monotonic token (future: expose for resume)
+	m.mu.Lock()
+	m.seq++
+	_ = m.seq // currently unused outside of increment; keeps linter happy for now
+	m.mu.Unlock()
 	dbn := dbName(orgID)
 	term := r.DB(dbn).Table(table).Changes(r.ChangesOpts{IncludeInitial: true, IncludeStates: false})
 	cur, err := term.Run(m.sess)

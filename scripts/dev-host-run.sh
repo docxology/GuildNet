@@ -54,6 +54,10 @@ if [ -z "$ORIGIN" ]; then
   ORIGIN="https://localhost:5173"
 fi
 export FRONTEND_ORIGIN="$ORIGIN"
+# Pass DB connection env through if provided
+if [ -n "${RETHINKDB_ADDR:-}" ]; then export RETHINKDB_ADDR; fi
+if [ -n "${RETHINKDB_USER:-}" ]; then export RETHINKDB_USER; fi
+if [ -n "${RETHINKDB_PASS:-}" ]; then export RETHINKDB_PASS; fi
 log "FRONTEND_ORIGIN=$FRONTEND_ORIGIN"
 
 # Ensure config exists (required for tsnet). If missing and env is provided, create non-interactively; otherwise run interactive init.

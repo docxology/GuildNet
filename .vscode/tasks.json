@@ -49,6 +49,12 @@
       "group": "build",
       "isBackground": true
     },
+    {
+      "label": "Dev: all (backend + UI)",
+      "type": "shell",
+      "command": "make dev-all",
+      "group": "build"
+    },
 
     // Quality
     {

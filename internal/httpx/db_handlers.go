@@ -2,6 +2,7 @@ package httpx
 
 import (
 	"bytes"
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -31,13 +32,35 @@ func (a *DBAPI) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/db/", a.handleDatabaseSubroutes)
 	// SSE changefeed
 	mux.HandleFunc("/sse/db/", a.handleChangefeed)
+	// DB connectivity health
+	mux.HandleFunc("/api/db/health", func(w http.ResponseWriter, r *http.Request) {
+		status := "ok"
+		resp := map[string]any{"status": status}
+		if a.Manager == nil {
+			// Best-effort lazy connect: if DB becomes reachable after server start, initialize manager now.
+			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+			defer cancel()
+			addr := db.AutoDiscoverAddr()
+			if mgr, err := db.Connect(ctx); err == nil {
+				a.Manager = mgr
+			} else {
+				status = "unavailable"
+				resp["status"] = status
+				resp["addr"] = addr
+				resp["error"] = err.Error()
+				log.Printf("db health lazy connect failed: addr=%s err=%v", addr, err)
+			}
+		}
+		JSON(w, http.StatusOK, resp)
+	})
 }
 
 func (a *DBAPI) handleDatabases(w http.ResponseWriter, r *http.Request) {
 	principal := PrincipalFromRequest(r.Header.Get("X-Debug-Principal"))
 	switch r.Method {
 	case http.MethodGet:
-		// For MVP list just returns a synthetic single DB derived from org env.
+		// For MVP list returns a synthetic single DB derived from org env, even if DB is down.
+		// This keeps the UI navigable; writes will still be guarded.
 		inst := model.DatabaseInstance{ID: a.OrgID, OrgID: a.OrgID, Name: "default", CreatedAt: model.NowISO()}
 		JSON(w, http.StatusOK, []model.DatabaseInstance{inst})
 	case http.MethodPost:
@@ -57,10 +80,12 @@ func (a *DBAPI) handleDatabases(w http.ResponseWriter, r *http.Request) {
 			req.Name = "default"
 		}
 		inst := model.DatabaseInstance{ID: a.OrgID, OrgID: a.OrgID, Name: req.Name, Description: req.Description, CreatedAt: model.NowISO()}
-		// Ensure backing DB
-		if err := a.Manager.EnsureOrgDatabase(r.Context(), a.OrgID); err != nil {
-			JSONError(w, http.StatusInternalServerError, "database create failed", "db_create_failed", err.Error())
-			return
+		// Ensure backing DB if manager available; otherwise, return metadata-only (dev mode)
+		if a.Manager != nil {
+			if err := a.Manager.EnsureOrgDatabase(r.Context(), a.OrgID); err != nil {
+				JSONError(w, http.StatusInternalServerError, "database create failed", "db_create_failed", err.Error())
+				return
+			}
 		}
 		JSON(w, http.StatusCreated, inst)
 	default:
@@ -174,6 +199,10 @@ func (a *DBAPI) handleDatabaseSubroutes(w http.ResponseWriter, r *http.Request) 
 }
 
 func (a *DBAPI) handleTables(w http.ResponseWriter, r *http.Request, dbID string, rest []string) {
+	if a.Manager == nil {
+		JSONError(w, http.StatusServiceUnavailable, "database unavailable", "db_unavailable")
+		return
+	}
 	principal := PrincipalFromRequest(r.Header.Get("X-Debug-Principal"))
 	if len(rest) == 0 { // /api/db/:dbId/tables
 		switch r.Method {
@@ -182,6 +211,9 @@ func (a *DBAPI) handleTables(w http.ResponseWriter, r *http.Request, dbID string
 			if err != nil {
 				JSONError(w, http.StatusInternalServerError, "list tables failed", "list_failed", err.Error())
 				return
+			}
+			if tbls == nil {
+				tbls = []model.Table{}
 			}
 			JSON(w, http.StatusOK, tbls)
 		case http.MethodPost:

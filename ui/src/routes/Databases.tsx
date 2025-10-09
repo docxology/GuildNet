@@ -8,6 +8,7 @@ import {
   listDatabases,
   type DatabaseInstance
 } from '../lib/api'
+import { createEffect, onCleanup } from 'solid-js'
 
 async function fetchDatabases(): Promise<DatabaseInstance[]> {
   return listDatabases()
@@ -19,6 +20,21 @@ export default function Databases() {
   const [name, setName] = createSignal('')
   const [desc, setDesc] = createSignal('')
   const [creating, setCreating] = createSignal(false)
+  const [dbStatus, setDbStatus] = createSignal<'ok'|'unavailable'|'unknown'>('unknown')
+  // poll db health lightly while page is open
+  createEffect(() => {
+    let cancelled = false
+    const tick = async () => {
+      try {
+        const res = await fetch(apiUrl('/api/db/health'))
+        const j = await res.json()
+        if (!cancelled) setDbStatus(j?.status === 'ok' ? 'ok' : 'unavailable')
+      } catch { if (!cancelled) setDbStatus('unavailable') }
+    }
+    tick()
+    const id = setInterval(tick, 10000)
+    onCleanup(() => { cancelled = true; clearInterval(id) })
+  })
   const submit = async () => {
     if (!name().trim()) return
     setCreating(true)
@@ -39,6 +55,11 @@ export default function Databases() {
         <Button onClick={() => setOpen(true)} variant="primary">New Database</Button>
       </div>
       <div class="border rounded-lg divide-y overflow-hidden bg-white dark:bg-neutral-900">
+        {dbStatus() === 'unavailable' && (
+          <div class="p-3 text-xs bg-amber-50 text-amber-900 border-b">
+            Database backend is unavailable. You can create metadata, but tables and data operations are disabled until the DB is reachable.
+          </div>
+        )}
         <For each={dbs()}>
           {(d) => (
             <a

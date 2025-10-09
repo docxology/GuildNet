@@ -12,7 +12,17 @@ VITE_API_BASE ?= https://localhost:8080
 	test lint tidy clean setup ui-setup \
 	health tls-check-backend tls-check-ui regen-certs stop-all \
 	talos-fresh talos-upgrade agent-build \
-	crd-apply operator-run operator-build
+	crd-apply operator-run operator-build db-health
+rethink-deploy: ## Deploy RethinkDB (single replica) into current kube-context
+	kubectl apply -f k8s/rethinkdb.yaml
+	@echo "Waiting for RethinkDB Service external IP (if using LoadBalancer)..."
+	@kubectl get svc rethinkdb -o wide || true
+
+rethink-info: ## Show RethinkDB Service address and hints for RETHINKDB_ADDR
+	@echo "RethinkDB Service:"; kubectl get svc rethinkdb -o wide || true; echo
+	@echo "If hostapp runs outside the cluster, set RETHINKDB_ADDR to <EXTERNAL-IP>:28015 (or use 'kubectl port-forward svc/rethinkdb 28015')."
+	@echo "If hostapp runs in-cluster, it can reach 'rethinkdb:28015' directly."
+
 
 all: build ## Build backend and UI
 
@@ -45,19 +55,28 @@ build-ui: ## Build UI (Vite)
 run: build-backend ## Run compiled backend (serve)
 	./bin/$(BINARY) serve
 
+dev-all: ## Run backend and UI in dev mode (tsnet + Vite), CORS origin=$(ORIGIN)
+	$(MAKE) build-backend && $(MAKE) -j2 run dev-ui
+
 dev-backend: ## Run backend in dev mode (tsnet), CORS origin=$(ORIGIN)
 	LISTEN_LOCAL=$(LISTEN_LOCAL) ORIGIN=$(ORIGIN) $(MAKE) dev-run
 
 # Dev helper: builds, generates certs, sets CORS origin, runs with Tailscale (tsnet)
 # Usage examples:
 #   make dev-run                    # default ORIGIN=$(ORIGIN)
-#   make dev-backend ORIGIN=https://app.example.com NO_CERTS=1
+#   make dev-backend ORIGIN=https://app.example.com RENEW_CERTS=1
 dev-run: ## Low-level dev runner (invokes scripts/dev-host-run.sh)
 	@set -e; \
 	ARGS=""; \
-	if [ "$(NO_CERTS)" = "1" ]; then ARGS="$$ARGS --no-certs"; fi; \
+	if [ -n "$(RENEW_CERTS)" = "1" ]; then ARGS="$$ARGS --no-certs"; fi; \
 	if [ -n "$(ORIGIN)" ]; then ARGS="$$ARGS --origin $(ORIGIN)"; fi; \
 	LISTEN_LOCAL=$(LISTEN_LOCAL) sh ./scripts/dev-host-run.sh $$ARGS
+
+# ---------- DB / Health ----------
+db-health: ## Check database API and report availability
+	@echo "Checking backend health and DB API..."; \
+	(set -x; curl -sk https://127.0.0.1:8080/healthz); echo; \
+	(set -x; curl -sk https://127.0.0.1:8080/api/db) || true; echo
 
 dev-ui: ## Run UI (Vite) pointing at backend API ($(VITE_API_BASE))
 	cd ui && VITE_API_BASE=$(VITE_API_BASE) npm run dev

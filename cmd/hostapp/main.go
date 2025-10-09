@@ -248,9 +248,9 @@ func main() {
 		log.Printf("rethinkdb connect failed (databases feature disabled): %v", derr)
 	} else {
 		dbMgr = mgr
-		// Register database API endpoints
-		httpx.InitAndRegisterDB(mux, dbMgr)
 	}
+	// Always register database API endpoints; handlers will degrade gracefully when dbMgr is nil.
+	httpx.InitAndRegisterDB(mux, dbMgr)
 
 	// health check
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
