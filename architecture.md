@@ -1,6 +1,6 @@
-## GuildNet Architecture (Operator + Workspace CRD)
+## GuildNet Architecture
 
-GuildNet runs ephemeral or semi-persistent Workspaces (container images) in a Kubernetes cluster, surfaced through a single HTTPS origin provided by the Host App (Go + embedded Tailscale/tsnet). The Host App now creates a custom `Workspace` resource; an embedded controller (operator) reconciles each `Workspace` into a Deployment + Service. All browser interactions terminate at the Host App, which exposes an API and a reverse proxy for per‑Workspace UIs.
+GuildNet runs ephemeral or semi-persistent Workspaces (container images) in a Kubernetes cluster, surfaced through a single HTTPS origin provided by the Host App (Go + embedded Tailscale/tsnet). The Host App creates a custom `Workspace` resource; an embedded controller reconciles each `Workspace` into a Deployment and Service. All browser interactions terminate at the Host App, which exposes an API and a reverse proxy for per‑Workspace UIs.
 
 ### Component Overview Diagram
 
@@ -68,30 +68,30 @@ flowchart LR
 ```
 
 #### Diagram Notes
-* Pod proxy (API server path) is preferred; direct ClusterIP over tsnet is an optional fallback when routing permits.
-* The Operator lives inside the Host App process; no separate controller deployment needed for this prototype.
-* Multiple `Workspace` CRs (e.g., code-server, alpine) are independently reconciled into their own Deployments/Services.
-* Single HTTPS origin ensures cookies, auth headers (future), and iframe content share security context.
-* Tailscale provides remote, secure access without exposing a public ingress (unless optionally configured).
+* Pod proxy (API server path) is the primary access method; direct ClusterIP over tsnet is an optional fallback when routing permits.
+* The Operator runs inside the Host App process; no separate controller deployment.
+* Multiple `Workspace` resources are independently reconciled into their own Deployments and Services.
+* The single HTTPS origin ensures cookies, future auth headers, and iframe content share one security context.
+* Tailscale provides remote, secure access without requiring a public ingress.
 
 
-### Current Goals
-* Launch container images quickly by creating a `Workspace` CR with minimal required fields (primarily `spec.image`).
+### Capabilities
+* Launch container images by creating a `Workspace` resource with minimal required fields (primarily `spec.image`).
 * Provide a single-origin HTTPS proxy for all Workspace traffic (including iframe-based IDEs) via the Host App.
-* Support multi-device, low-friction access over a tailnet (Tailscale/Headscale) without per‑user auth (yet).
-* Offer a minimal capability-based permission prototype for destructive actions (e.g., stop-all) — still rudimentary.
-* Ensure stable first-start behavior for slower images (e.g., code-server) via tuned readiness/liveness probes.
+* Support multi-device access over a tailnet (Tailscale/Headscale) without built-in per‑user authentication.
+* Apply capability-style permission gating for destructive actions (e.g., stop-all).
+* Stabilize first-start behavior for slower images (e.g., code-server) via tuned readiness and liveness probes.
 * Allow multiple simultaneous instances of the same image through unique, auto‑suffixed names.
 
-### Deferred (Not Implemented Yet)
-* Authentication / per-user access control (tailnet + Kubernetes RBAC only today).
-* CRD Conditions set (only basic Phase & counts are reported currently).
-* Rich metrics, tracing, auditing.
-* External ingress automation & DNS (beyond optional per‑workspace Ingress when configured).
+### Unimplemented Features
+* Authentication / per-user access control (rely on tailnet + Kubernetes RBAC).
+* CRD Conditions (only phase and counts are exposed).
+* Metrics, tracing, auditing.
+* External ingress automation and DNS beyond optional per‑workspace Ingress.
 * Persistent storage provisioning / volume claims.
-* Advanced policy (image/port constraints, concurrency limits, resource quotas per user).
-* Configurable probe timing / startupProbe via API (static defaults today).
-* Tightened CRD schema for `spec.env` (currently permissive; operator sanitizes blanks).
+* Advanced policy (image and port constraints, concurrency limits, resource quotas per user).
+* Configurable probe timing and startup probes via API (static defaults in use).
+* Tightened CRD schema for `spec.env` (permissive; sanitation occurs in operator).
 
 
 ### Components
@@ -108,7 +108,7 @@ flowchart LR
 #### Host App (Go + tsnet)
   - Local TLS listener (default `LISTEN_LOCAL=127.0.0.1:8080`) and a tsnet listener on `:443` inside the tailnet.
   - CORS is restricted to a single origin via `FRONTEND_ORIGIN` (for dev use the Host App origin `https://127.0.0.1:8080`).
-  - Endpoints (current implementation):
+  - Endpoints:
     - `GET /healthz` — liveness
     - `GET /api/ui-config` — minimal UI config (e.g., name)
     - `GET /api/images` — list deployable images (server-sourced presets)
@@ -132,9 +132,9 @@ flowchart LR
 
 #### Kubernetes Cluster, Workspace CRD & Embedded Operator
   - The Host App uses in-cluster config when running inside the cluster, or falls back to `KUBECONFIG` (client-go) when outside.
-  - Launch requests (`POST /api/jobs`) create a `Workspace` custom resource instead of directly applying a Deployment/Service.
-  - An embedded controller-runtime manager (operator) watches `Workspace` objects and reconciles each into a Deployment + Service (and optional Ingress/LB) following defaulting & hardening rules.
-  - Status from live K8s objects (ready replicas, service DNS, proxy resolution) is reflected back onto the `Workspace.status` fields which the Host App surfaces indirectly (server list/detail); dedicated `/api/workspaces` endpoints are planned but not yet implemented.
+  - Launch requests (`POST /api/jobs`) create a `Workspace` custom resource.
+  - An embedded controller-runtime manager watches `Workspace` objects and reconciles each into a Deployment and Service (and optional Ingress or LoadBalancer) following defaulting and hardening rules.
+  - Status (ready replicas, service DNS, proxy resolution) is written to `Workspace.status` and surfaced via server list/detail endpoints; additional direct Workspace endpoints can be added.
 
 #### Workspace Images
   - Typically code-server behind Caddy, listening on HTTP 8080; other images are supported by configuration.
@@ -144,13 +144,13 @@ flowchart LR
 Browser → Host App API → Workspace CR (Kubernetes API) → Operator Reconcile → Deployment + Service → Host App Reverse Proxy → Browser iframe.
 
 Notes
-- Browser ↔ Host App is always HTTPS on a single origin.
-- Host App dials cluster services via tsnet; for cluster-internal access it can go direct (ClusterIP) or via the Kubernetes API server pod proxy (see below).
+- Browser ↔ Host App uses HTTPS on a single origin.
+- The Host App dials cluster services via tsnet; for cluster-internal access it can go direct (ClusterIP) or via the Kubernetes API server pod proxy.
 - The reverse proxy preserves method/body and handles WebSockets; cookies and redirects are adjusted for iframe use.
 
 Multi-device model
-- The Host App serves the UI locally on `https://127.0.0.1:8080` and on `:443` over the tailnet. Any device in your tailnet can open the Host App’s URL and operate against the same Kubernetes cluster.
-- The Host App’s kubeconfig determines cluster access and permissions. There’s no per-user auth yet inside the app; rely on your tailnet for access control and on Kubernetes RBAC.
+- The Host App serves the UI locally on `https://127.0.0.1:8080` and on `:443` over the tailnet. Any device in the tailnet can open the URL and operate against the same Kubernetes cluster.
+- The Host App’s kubeconfig determines cluster access and permissions. There is no built‑in per-user authentication; tailnet boundaries and Kubernetes RBAC provide access control.
 
 Environment assumptions
 - A Kubernetes cluster is reachable (in-cluster config or `KUBECONFIG`).
@@ -158,13 +158,13 @@ Environment assumptions
 - For private Service access by ClusterIP from outside the cluster, a Tailscale subnet router (advertising cluster CIDRs) is recommended.
 
 Kubernetes reachability modes
-- Preferred (default): API server Pod Proxy — the Host App uses client‑go to request `.../pods/<pod>:<port>/proxy` to reach the container. This works even when ClusterIP ranges aren’t routed to the Host machine.
-- Direct (optional): ClusterIP over tsnet — set `HOSTAPP_DISABLE_API_PROXY=true` to bypass the API proxy and dial the ClusterIP:port via tsnet. This requires a route (e.g., a Tailscale subnet router advertising the cluster CIDRs). Useful to validate WebSockets/long‑lived conns end‑to‑end.
+- API server Pod Proxy (default) — the Host App uses client‑go to request `.../pods/<pod>:<port>/proxy` to reach the container. This works even when ClusterIP ranges are not routed to the Host machine.
+- Direct ClusterIP over tsnet — set `HOSTAPP_DISABLE_API_PROXY=true` to bypass the API proxy and dial the ClusterIP:port via tsnet. This requires a route (for example, a Tailscale subnet router advertising the cluster CIDRs). Useful to validate WebSockets and long‑lived connections end‑to‑end.
 
 
 ### Workspace Launch Flow
 
-Intent: The Launch UI deploys a container in the cluster (Deployment + Service) and makes it reachable through the Host App proxy.
+The launch UI deploys a container in the cluster (Deployment and Service) and makes it reachable through the Host App proxy.
 
 ```mermaid
 sequenceDiagram
@@ -187,13 +187,13 @@ sequenceDiagram
 ```
 
 ### Operator Defaults & Hardening
-Applies during reconciliation of a `Workspace`:
+Applied during reconciliation of a `Workspace`:
 * Image: `spec.image` required (no implicit default).
 * Ports:
   * If image resembles code-server (heuristic) expose only 8080.
   * Otherwise expose 8080 (HTTP) and 8443 (HTTPS).
   * Readiness/Liveness target `/` on first port (usually 8080).
-* Probes (stability-focused): Extended initial delay & period for slower first-start images to reduce churn. StartupProbe not yet implemented.
+* Probes: Extended initial delay and period for slower first-start images to reduce churn. No StartupProbe is configured.
 * Environment:
   * Blank / empty-name env entries are sanitized out (both API handler and operator layer).
   * Inject `PORT=8080` if missing.
@@ -212,12 +212,12 @@ Applies during reconciliation of a `Workspace`:
 * Status:
   * `status.phase` (e.g., Pending → Running), `status.readyReplicas`, `status.serviceDNS`, `status.proxyTarget` updated each reconcile.
 * Conflict Handling:
-  * Basic: relies on next reconcile after Deployment update conflicts; explicit backoff logic is a future enhancement.
+  * Relies on the next reconcile after Deployment update conflicts.
 
 
 ### Access Flow (Proxy → Workspace)
 
-Intent: The Server Detail page’s IDE tab loads an iframe whose src points at the Host App’s `/proxy`. The Host App resolves the upstream and streams the agent’s UI back to the browser.
+The server detail page’s IDE tab loads an iframe whose src points at the Host App’s `/proxy`. The Host App resolves the upstream and streams the agent’s UI back to the browser.
 
 ```mermaid
 sequenceDiagram
@@ -280,10 +280,10 @@ On creation/update of a `Workspace`:
 * Record status fields reflecting live workload state (phase, ready replica count, service DNS, inferred proxy target).
 * Leave advanced features (conditions array, metrics, startupProbe, cleanup/TTL) for future iterations.
 
-Current Limitations:
+Current limitations:
 * No `kubectl describe workspace <name>` condition reasons beyond coarse phase.
-* CRD schema allows `{}` in `spec.env` (operator filters but validation not enforced at schema level yet).
-* No native stop/TTL lifecycle on the CR itself (stop-all still works by label selection).
+* CRD schema allows `{}` in `spec.env` (operator filters but validation not enforced at schema level).
+* No native stop/TTL lifecycle on the custom resource itself (stop-all operates by label selection).
 
 ### Listing & Logs
 - `GET /api/servers` maps Deployments labeled `guildnet.io/managed=true` to `model.Server`.
@@ -309,11 +309,11 @@ Current Limitations:
 - Cookies/redirects are adjusted by the proxy for iframe usage, as noted above.
 
 ### Multi-User Notes
-- The Host App currently has no built‑in user accounts or login. Access control relies on:
-  - Your tailnet boundary (who can reach the Host App over Tailscale/Headscale)
+Access control relies on:
+  - Tailnet boundary (who can reach the Host App over Tailscale/Headscale)
   - Kubernetes RBAC applied to the kubeconfig used by the Host App
-  - Optional per‑workspace Ingress auth when exposing via `WORKSPACE_DOMAIN`
-- If exposing outside the tailnet, add an auth proxy in front (e.g., OIDC‑enabled reverse proxy) or run the Host App behind a private ingress.
+  - Optional per‑workspace Ingress authentication when exposing via `WORKSPACE_DOMAIN`
+If exposing outside the tailnet, add an authentication proxy in front (for example, an OIDC‑enabled reverse proxy) or run the Host App behind a private ingress.
 
 
 ### Troubleshooting
@@ -352,8 +352,8 @@ Current Limitations:
 
 * Each launch creates a distinct `Workspace` object; the operator reconciles them independently.
 * Names: A base name (derived from image or user input) is suffixed with a random 5‑hex token (`<base>-<aaaaa>`) to avoid collisions and permit multiple simultaneous instances of the same image.
-* The label `guildnet.io/id` mirrors the name for discovery; the UI lists these “servers,” and the IDE iframe targets `/proxy/server/{name}/...`.
-* If a collision somehow occurs (rare given randomness), the API handler retries with a new suffix up to a small attempt limit.
+* The label `guildnet.io/id` mirrors the name for discovery; the UI lists these servers, and the IDE iframe targets `/proxy/server/{name}/...`.
+* On collision, the API handler retries with a new suffix up to a bounded attempt limit.
 
 
 ### Environment Assumptions
@@ -380,11 +380,11 @@ Current Limitations:
   - `AGENT_DEFAULT_PASSWORD` — default agent password when not provided
   - `HOSTAPP_DISABLE_API_PROXY` — disable Kubernetes API server proxy (force direct tsnet dial)
 
-### Limitations (Current)
-* No user auth layer (tailnet + kube RBAC only).
-* Logs SSE tail-only; no live follow streaming (beyond heartbeats).
-* Env/ports enrichment & validation still minimal; CRD schema loose for env objects.
+### Limitations
+* No built-in user authentication layer (tailnet boundary + Kubernetes RBAC only).
+* Logs SSE tail-only; no continuous live follow beyond heartbeats.
+* Environment and port enrichment are minimal; CRD schema is permissive for env objects.
 * No metrics, tracing, or structured Workspace Conditions.
-* StartupProbe absent; long cold starts rely solely on tuned readiness/liveness delays.
-* No direct `/api/workspaces` endpoints yet (UI uses existing server listing abstraction over underlying Deployments; future will read CRDs directly).
-* Conflict retries are coarse (next reconcile) and not backoff-aware.
+* No StartupProbe; long cold starts rely on tuned readiness and liveness delays.
+* No dedicated `/api/workspaces` endpoints (server list abstraction surfaces status indirectly).
+* Conflict retries rely on subsequent reconciliations without explicit backoff.
