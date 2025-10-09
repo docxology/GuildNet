@@ -66,10 +66,12 @@ for n in "${CP_ARR[@]}"; do
   echo "  resetting control-plane $n"
   talosctl reset --nodes "$n" --reboot --graceful=false || true
 done
-for n in "${WK_ARR[@]}"; do
-  echo "  resetting worker $n"
-  talosctl reset --nodes "$n" --reboot --graceful=false || true
-done
+if [[ ${#WK_ARR[@]} -gt 0 ]]; then
+  for n in "${WK_ARR[@]}"; do
+    echo "  resetting worker $n"
+    talosctl reset --nodes "$n" --reboot --graceful=false || true
+  done
+fi
 
 echo "[3/7] Waiting for nodes to become reachable (post-reset) ..."
 wait_node() {
@@ -86,7 +88,9 @@ wait_node() {
   return 1
 }
 for n in "${CP_ARR[@]}"; do wait_node "$n" || true; done
-for n in "${WK_ARR[@]}"; do wait_node "$n" || true; done
+if [[ ${#WK_ARR[@]} -gt 0 ]]; then
+  for n in "${WK_ARR[@]}"; do wait_node "$n" || true; done
+fi
 
 echo "[4/7] Applying control-plane configs..."
 for n in "${CP_ARR[@]}"; do
