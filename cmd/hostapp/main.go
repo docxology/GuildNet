@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -38,6 +39,7 @@ import (
 	//"github.com/your/module/internal/store"
 	"github.com/your/module/internal/ts"
 	"github.com/your/module/pkg/config"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -602,11 +604,43 @@ func main() {
 			httpx.JSONError(w, http.StatusInternalServerError, "dynamic client unavailable", "dyn_unavailable")
 			return
 		}
+		gvr := schema.GroupVersionResource{Group: "guildnet.io", Version: "v1alpha1", Resource: "workspaces"}
 		wsName := spec.Name
 		if wsName == "" {
 			wsName = dns1123Name(deriveAgentHost(spec))
 		}
-		gvr := schema.GroupVersionResource{Group: "guildnet.io", Version: "v1alpha1", Resource: "workspaces"}
+		baseName := wsName
+		// ensure non-empty base
+		if baseName == "" {
+			baseName = "workspace"
+		}
+		// attempt up to 10 unique name generations if collisions occur
+		for attempt := 0; attempt < 10; attempt++ {
+			candidate := wsName
+			if attempt > 0 { // append short random suffix
+				// 5 hex chars from crypto/rand
+				buf := make([]byte, 3)
+				if _, rerr := rand.Read(buf); rerr == nil {
+					sfx := hex.EncodeToString(buf)[:5]
+					candidate = fmt.Sprintf("%s-%s", baseName, sfx)
+				}
+			}
+			// name must remain <= 63 chars for DNS-1123
+			if len(candidate) > 63 {
+				candidate = candidate[:63]
+			}
+			wsName = candidate
+			// probe existence
+			_, gerr := dyn.Resource(gvr).Namespace(defaultNS).Get(r.Context(), wsName, metav1.GetOptions{})
+			if gerr != nil {
+				if apierrors.IsNotFound(gerr) {
+					break // available
+				}
+				// on unexpected error just break and let create path surface it
+				break
+			}
+			// exists; continue to next attempt
+		}
 		specMap := map[string]any{"image": spec.Image}
 		if len(spec.Env) > 0 {
 			var envArr []any
@@ -639,6 +673,30 @@ func main() {
 			"spec":       specMap,
 		}
 		if _, err := dyn.Resource(gvr).Namespace(defaultNS).Create(r.Context(), &unstructured.Unstructured{Object: obj}, metav1.CreateOptions{}); err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				// extremely unlikely due to prior check; add one more randomized suffix and retry once
+				buf := make([]byte, 3)
+				if _, rerr := rand.Read(buf); rerr == nil {
+					alt := fmt.Sprintf("%s-%s", baseName, hex.EncodeToString(buf)[:5])
+					obj["metadata"].(map[string]any)["name"] = alt
+					if _, cerr := dyn.Resource(gvr).Namespace(defaultNS).Create(r.Context(), &unstructured.Unstructured{Object: obj}, metav1.CreateOptions{}); cerr == nil {
+						httpx.JSON(w, http.StatusAccepted, model.JobAccepted{ID: alt, Status: "pending"})
+						return
+					}
+				}
+			}
+			// If schema warning escalates to error referencing env[0].name or value, retry without env.
+			if strings.Contains(err.Error(), "env[0].name") || strings.Contains(err.Error(), "env[0].value") {
+				if specSection, ok := obj["spec"].(map[string]any); ok {
+					if _, had := specSection["env"]; had {
+						delete(specSection, "env")
+						if _, rerr := dyn.Resource(gvr).Namespace(defaultNS).Create(r.Context(), &unstructured.Unstructured{Object: obj}, metav1.CreateOptions{}); rerr == nil {
+							httpx.JSON(w, http.StatusAccepted, model.JobAccepted{ID: wsName, Status: "pending"})
+							return
+						}
+					}
+				}
+			}
 			httpx.JSONError(w, http.StatusInternalServerError, "workspace create failed", "create_failed", err.Error())
 			return
 		}

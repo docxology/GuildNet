@@ -70,8 +70,14 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		ports = []corev1.ContainerPort{{ContainerPort: 8080, Name: "http"}}
 	}
 
-	// Build environment with defaults.
-	env := append([]corev1.EnvVar{}, ws.Spec.Env...)
+	// Build environment with defaults. Filter any blank entries to avoid invalid specs.
+	var env []corev1.EnvVar
+	for _, e := range ws.Spec.Env {
+		if strings.TrimSpace(e.Name) == "" { // skip invalid
+			continue
+		}
+		env = append(env, e)
+	}
 	envIndex := map[string]int{}
 	for i, e := range env {
 		envIndex[e.Name] = i
@@ -93,11 +99,13 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if strings.Contains(imgLower, "alpine") {
 		// Provide a tiny HTTP responder loop using nc (busybox) so probes can succeed.
 		command = []string{"/bin/sh", "-c", "while true; do echo -e 'HTTP/1.1 200 OK\r\nContent-Length:2\r\n\r\nok' | nc -l -p 8080 -w 1; done"}
-		readiness = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstrFromPort(ports[0])}}, InitialDelaySeconds: 2, PeriodSeconds: 10}
-		liveness = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstrFromPort(ports[0])}}, InitialDelaySeconds: 10, PeriodSeconds: 20}
+		// Increased probe windows to avoid premature restarts on slower cold starts.
+		readiness = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstrFromPort(ports[0])}}, InitialDelaySeconds: 10, PeriodSeconds: 15, TimeoutSeconds: 3, FailureThreshold: 6, SuccessThreshold: 1}
+		liveness = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstrFromPort(ports[0])}}, InitialDelaySeconds: 60, PeriodSeconds: 30, TimeoutSeconds: 5, FailureThreshold: 3, SuccessThreshold: 1}
 	} else {
-		readiness = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstrFromPort(ports[0])}}, InitialDelaySeconds: 2, PeriodSeconds: 5}
-		liveness = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstrFromPort(ports[0])}}, InitialDelaySeconds: 5, PeriodSeconds: 10}
+		// Generic images (e.g., code-server) often need extra startup time for unpacking/first-run initialization.
+		readiness = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstrFromPort(ports[0])}}, InitialDelaySeconds: 20, PeriodSeconds: 15, TimeoutSeconds: 5, FailureThreshold: 8, SuccessThreshold: 1}
+		liveness = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstrFromPort(ports[0])}}, InitialDelaySeconds: 90, PeriodSeconds: 30, TimeoutSeconds: 5, FailureThreshold: 3, SuccessThreshold: 1}
 	}
 
 	replicas := int32(1)
