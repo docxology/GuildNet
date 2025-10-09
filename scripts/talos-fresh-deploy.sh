@@ -17,6 +17,7 @@ CP_NODES=""
 WK_NODES=""
 OUT_DIR="./talos"
 FORCE=0
+declare -a WK_ARR=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
