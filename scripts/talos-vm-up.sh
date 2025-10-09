@@ -205,11 +205,23 @@ main() {
 
   log "Checking cluster health"
   if ! kubectl version --short >/dev/null 2>&1; then
-    err "kubectl unable to connect; ensure KUBECONFIG is set for the new cluster."
-    exit 1
+    # Wait up to 90s for API (self-heal if initial kubectl call raced)
+    tries=30; sleepInt=3
+    while (( tries > 0 )); do
+      if kubectl version --short >/dev/null 2>&1; then
+        break
+      fi
+      sleep $sleepInt
+      tries=$((tries-1))
+    done
+    if ! kubectl version --short >/dev/null 2>&1; then
+      err "kubectl unable to connect after wait; verify kubeconfig context."
+      exit 1
+    fi
   fi
 
-  log "Applying Tailscale subnet router (routes=$TS_ROUTES, login=$TS_LOGIN_SERVER)"
+  # Reconcile (self-heal) subnet router DS each run
+  log "Reconciling Tailscale subnet router (routes=$TS_ROUTES, login=$TS_LOGIN_SERVER)"
   kubectl -n kube-system apply -f - <<YAML
 apiVersion: apps/v1
 kind: DaemonSet
@@ -271,9 +283,13 @@ spec:
           type: CharDevice
 YAML
 
-  log "Waiting for Tailscale router to be ready"
-  kubectl -n kube-system rollout status ds/tailscale-subnet-router --timeout=180s || true
-  log "Talos cluster ready and (if auth succeeded) advertised to Tailscale."
+  log "Waiting for Tailscale router to be ready (rollout status)"
+  kubectl -n kube-system rollout status ds/tailscale-subnet-router --timeout=240s || true
+  # Pod self-check
+  if ! kubectl -n kube-system get pods -l app=tailscale-subnet-router >/dev/null 2>&1; then
+    err "Tailscale subnet router pods not found; investigate manually (kubectl -n kube-system get pods)."
+  fi
+  log "Talos cluster ready; Tailscale DS applied (check logs for auth success)."
   log "Kubeconfig: \${KUBECONFIG:-\"~/.kube/config\"}; Namespace: $NAMESPACE; Cluster: $CLUSTER_NAME"
 }
 
