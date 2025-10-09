@@ -184,41 +184,55 @@ main() {
 
   TALOS_CIDR=${TALOS_CIDR:-10.55.0.0/24}
 
-  log "Creating Talos cluster: $CLUSTER_NAME (provisioner=${TALOS_PROVISIONER:-auto}, cidr=${TALOS_CIDR})"
-  set +e
-  talosctl cluster create --name "$CLUSTER_NAME" --workers 0 --wait ${TALOS_PROVISIONER:+--provisioner "$TALOS_PROVISIONER"} --cidr "$TALOS_CIDR"
-  rc=$?
-  set -e
-  if [ $rc -ne 0 ]; then
-    err "talosctl cluster create failed (rc=$rc). Attempting destroy and recreate."
+  # Reuse detection: if context exists and control plane responds, skip create
+  if kubectl config get-contexts -o name 2>/dev/null | grep -q "admin@${CLUSTER_NAME}"; then
+    # Try each existing suffix (latest first)
+    ctx=$(kubectl config get-contexts -o name | grep "admin@${CLUSTER_NAME}" | tail -n 1)
+    if [ -n "$ctx" ]; then
+      kubectl config use-context "$ctx" >/dev/null 2>&1 || true
+      if kubectl get nodes >/dev/null 2>&1; then
+        log "Cluster '$CLUSTER_NAME' appears up (context=$ctx); skipping create"
+        reuse=1
+      fi
+    fi
+  fi
+  reuse=${reuse:-0}
+  if [ $reuse -ne 1 ]; then
+    log "Creating Talos cluster: $CLUSTER_NAME (provisioner=${TALOS_PROVISIONER:-auto}, cidr=${TALOS_CIDR})"
     set +e
-    talosctl cluster destroy --name "$CLUSTER_NAME" ${TALOS_PROVISIONER:+--provisioner "$TALOS_PROVISIONER"}
+    talosctl cluster create --name "$CLUSTER_NAME" --workers 0 --wait ${TALOS_PROVISIONER:+--provisioner "$TALOS_PROVISIONER"} --cidr "$TALOS_CIDR"
+    rc=$?
     set -e
-    # Try alternate CIDR to avoid network overlap
-    ALT_CIDR=${ALT_CIDR:-10.66.0.0/24}
-    log "Recreating cluster with alternate CIDR ${ALT_CIDR}"
-    talosctl cluster create --name "$CLUSTER_NAME" --workers 0 --wait ${TALOS_PROVISIONER:+--provisioner "$TALOS_PROVISIONER"} --cidr "$ALT_CIDR"
+    if [ $rc -ne 0 ]; then
+      err "cluster create failed (rc=$rc). Destroying and retrying with alternate CIDR"
+      set +e
+      talosctl cluster destroy --name "$CLUSTER_NAME" ${TALOS_PROVISIONER:+--provisioner "$TALOS_PROVISIONER"}
+      set -e
+      ALT_CIDR=${ALT_CIDR:-10.66.0.0/24}
+      log "Recreating cluster with alternate CIDR ${ALT_CIDR}"
+      talosctl cluster create --name "$CLUSTER_NAME" --workers 0 --wait ${TALOS_PROVISIONER:+--provisioner "$TALOS_PROVISIONER"} --cidr "$ALT_CIDR"
+    fi
+    # After creation, capture newest context
+    ctx=$(kubectl config get-contexts -o name | grep "admin@${CLUSTER_NAME}" | tail -n 1 || true)
+    if [ -n "$ctx" ]; then
+      kubectl config use-context "$ctx" >/dev/null 2>&1 || true
+      log "Selected kube context: $ctx"
+    fi
   fi
 
   log "Fetching kubeconfig"
   talosctl kubeconfig --name "$CLUSTER_NAME" >/dev/null 2>&1 || true
 
-  log "Checking cluster health"
-  if ! kubectl version --short >/dev/null 2>&1; then
-    # Wait up to 90s for API (self-heal if initial kubectl call raced)
-    tries=30; sleepInt=3
-    while (( tries > 0 )); do
-      if kubectl version --short >/dev/null 2>&1; then
-        break
-      fi
-      sleep $sleepInt
-      tries=$((tries-1))
-    done
-    if ! kubectl version --short >/dev/null 2>&1; then
-      err "kubectl unable to connect after wait; verify kubeconfig context."
-      exit 1
+  log "Checking cluster health (kube API readiness)"
+  total_wait=0; max_wait=300; interval=5
+  until kubectl version --short >/dev/null 2>&1; do
+    sleep $interval
+    total_wait=$((total_wait+interval))
+    if [ $total_wait -ge $max_wait ]; then
+      err "kube API not ready after ${max_wait}s; continuing (will still try DS apply)"
+      break
     fi
-  fi
+  done
 
   # Reconcile (self-heal) subnet router DS each run
   log "Reconciling Tailscale subnet router (routes=$TS_ROUTES, login=$TS_LOGIN_SERVER)"
