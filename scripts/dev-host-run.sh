@@ -89,5 +89,44 @@ LISTEN_LOCAL_DEFAULT="127.0.0.1:8080"
 export LISTEN_LOCAL="${LISTEN_LOCAL:-$LISTEN_LOCAL_DEFAULT}"
 log "LISTEN_LOCAL=$LISTEN_LOCAL"
 
+# Default RETHINKDB_ADDR to local loopback for dev unless explicitly provided
+if [ -z "${RETHINKDB_ADDR:-}" ]; then
+  export RETHINKDB_ADDR="127.0.0.1:28015"
+fi
+log "RETHINKDB_ADDR=$RETHINKDB_ADDR"
+
+# Ensure a local DB endpoint is available automatically
+if ! (nc -z 127.0.0.1 28015 >/dev/null 2>&1); then
+  if command -v kubectl >/dev/null 2>&1; then
+    # Deploy RethinkDB Service/Deployment if missing (best-effort)
+    if ! kubectl get svc rethinkdb >/dev/null 2>&1; then
+      log "RethinkDB Service not found; applying $ROOT/k8s/rethinkdb.yaml"
+      kubectl apply -f "$ROOT/k8s/rethinkdb.yaml" >/dev/null 2>&1 || true
+      log "Waiting for deployment/rethinkdb rollout..."
+      kubectl rollout status deployment/rethinkdb --timeout=60s >/dev/null 2>&1 || true
+    fi
+    # Start or reuse port-forward to local 28015
+    if kubectl get svc rethinkdb >/dev/null 2>&1; then
+      PF_FILE="$ROOT/.dev-rethinkdb-pf.pid"
+      if [ -f "$PF_FILE" ]; then
+        PF_PID=$(cat "$PF_FILE" 2>/dev/null || true)
+        if [ -n "$PF_PID" ] && ps -p "$PF_PID" >/dev/null 2>&1; then
+          log "Using existing port-forward (PID=$PF_PID)"
+        else
+          log "Starting kubectl port-forward: svc/rethinkdb -> 127.0.0.1:28015"
+          kubectl port-forward svc/rethinkdb 28015:28015 >/dev/null 2>&1 & echo $! > "$PF_FILE" ; sleep 1
+        fi
+      else
+        log "Starting kubectl port-forward: svc/rethinkdb -> 127.0.0.1:28015"
+        kubectl port-forward svc/rethinkdb 28015:28015 >/dev/null 2>&1 & echo $! > "$PF_FILE" ; sleep 1
+      fi
+    else
+      log "No Kubernetes RethinkDB service available; DB may remain unavailable."
+    fi
+  else
+    log "kubectl not found; cannot auto-start DB port-forward."
+  fi
+fi
+
 # Run server (tsnet mandatory)
 exec "$ROOT/bin/hostapp" serve

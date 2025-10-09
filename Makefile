@@ -56,7 +56,7 @@ run: build-backend ## Run compiled backend (serve)
 	./bin/$(BINARY) serve
 
 dev-all: ## Run backend and UI in dev mode (tsnet + Vite), CORS origin=$(ORIGIN)
-	$(MAKE) build-backend && $(MAKE) -j2 run dev-ui
+	$(MAKE) build-backend && $(MAKE) -j2 dev-backend dev-ui
 
 dev-backend: ## Run backend in dev mode (tsnet), CORS origin=$(ORIGIN)
 	LISTEN_LOCAL=$(LISTEN_LOCAL) ORIGIN=$(ORIGIN) $(MAKE) dev-run
