@@ -183,6 +183,10 @@ main() {
   esac
 
   TALOS_CIDR=${TALOS_CIDR:-10.55.0.0/24}
+  # Default hostname if not provided
+  if [ -z "${TS_HOSTNAME:-}" ]; then
+    TS_HOSTNAME="guildnet-host-$(hostname | tr 'A-Z' 'a-z' | cut -c1-12)"
+  fi
 
   # Reuse detection: if context exists and control plane responds, skip create
   if kubectl config get-contexts -o name 2>/dev/null | grep -q "admin@${CLUSTER_NAME}"; then
@@ -217,6 +221,12 @@ main() {
     if [ -n "$ctx" ]; then
       kubectl config use-context "$ctx" >/dev/null 2>&1 || true
       log "Selected kube context: $ctx"
+    fi
+    # Force export of KUBECONFIG path for subshells (best effort)
+    if [ -z "${KUBECONFIG:-}" ]; then
+      if [ -f "$HOME/.kube/config" ]; then
+        export KUBECONFIG="$HOME/.kube/config"
+      fi
     fi
   fi
 
