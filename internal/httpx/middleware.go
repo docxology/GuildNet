@@ -28,8 +28,37 @@ func JSON(w http.ResponseWriter, code int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func JSONError(w http.ResponseWriter, code int, msg string) {
-	JSON(w, code, map[string]any{"error": msg})
+// ErrorPayload is the canonical error response shape.
+type ErrorPayload struct {
+	Code    string      `json:"code"`
+	Message string      `json:"message"`
+	Request string      `json:"request_id,omitempty"`
+	Details interface{} `json:"details,omitempty"`
+}
+
+// JSONError writes a structured error. Code param is HTTP status; errCode is stable machine code.
+func JSONError(w http.ResponseWriter, httpStatus int, msg string, errCodeAndDetails ...interface{}) {
+	var errCode string = http.StatusText(httpStatus)
+	var details interface{}
+	if len(errCodeAndDetails) > 0 {
+		if s, ok := errCodeAndDetails[0].(string); ok && s != "" {
+			errCode = s
+		}
+	}
+	if len(errCodeAndDetails) > 1 {
+		details = errCodeAndDetails[1]
+	}
+	// Attempt to pull request id from context if available by inspecting a header writer wrapper later.
+	// Caller should set X-Request-Id header already through middleware.
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(httpStatus)
+	// Try best-effort to read request id from interface (middleware sets it on header already)
+	// We don't have direct access to context here; callers can wrap if needed.
+	payload := ErrorPayload{Code: errCode, Message: msg, Request: w.Header().Get("X-Request-Id")}
+	if details != nil {
+		payload.Details = details
+	}
+	_ = json.NewEncoder(w).Encode(payload)
 }
 
 // RequestID middleware adds/propagates a request ID.

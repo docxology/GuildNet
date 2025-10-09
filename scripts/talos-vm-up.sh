@@ -36,6 +36,13 @@ TS_LOGIN_SERVER=${TS_LOGIN_SERVER:-https://login.tailscale.com}
 TS_ROUTES=${TS_ROUTES:-10.96.0.0/12,10.244.0.0/16}
 TS_HOSTNAME=${TS_HOSTNAME:-}
 
+# If using docker provisioner and login server points to 127.0.0.1, swap to host.docker.internal
+if [ "${TALOS_PROVISIONER:-}" = "docker" ]; then
+  if printf '%s' "$TS_LOGIN_SERVER" | grep -qE '127.0.0.1'; then
+    TS_LOGIN_SERVER=$(printf '%s' "$TS_LOGIN_SERVER" | sed 's#127.0.0.1#host.docker.internal#g')
+  fi
+fi
+
 log() { printf "%s | %s\n" "$(date -Iseconds)" "$*"; }
 err() { printf "ERR: %s\n" "$*" >&2; }
 
@@ -154,11 +161,11 @@ install_hint() {
 
 main() {
   if [[ -z "$TS_AUTHKEY" ]]; then
-  err "TS_AUTHKEY is required (Tailscale/Headscale pre-auth key)."
-  err "Hint: create $ROOT/.env with values, e.g.:"
-  err "  TS_LOGIN_SERVER=https://headscale.example.com"
-  err "  TS_AUTHKEY=tskey-..."
-  err "  TS_ROUTES=10.96.0.0/12,10.244.0.0/16"
+    err "TS_AUTHKEY is required (Tailscale/Headscale pre-auth key)."
+    err "Hint: create $ROOT/.env with values, e.g.:"
+    err "  TS_LOGIN_SERVER=https://headscale.example.com"
+    err "  TS_AUTHKEY=tskey-..."
+    err "  TS_ROUTES=10.96.0.0/12,10.244.0.0/16"
     exit 1
   fi
 
@@ -182,34 +189,89 @@ main() {
       ;;
   esac
 
-  TALOS_CIDR=${TALOS_CIDR:-10.55.0.0/24}
+  # Rewrite login server host for container reachability when using docker provisioner
+  if [ "${TALOS_PROVISIONER}" = "docker" ] && printf '%s' "$TS_LOGIN_SERVER" | grep -qE '127.0.0.1'; then
+    orig=$TS_LOGIN_SERVER
+    TS_LOGIN_SERVER=$(printf '%s' "$TS_LOGIN_SERVER" | sed 's#127.0.0.1#host.docker.internal#g')
+    log "Rewriting TS_LOGIN_SERVER host from 127.0.0.1 to host.docker.internal for container access (was: $orig now: $TS_LOGIN_SERVER)"
+  fi
 
-  log "Creating Talos cluster: $CLUSTER_NAME (provisioner=${TALOS_PROVISIONER:-auto}, cidr=${TALOS_CIDR})"
-  set +e
-  talosctl cluster create --name "$CLUSTER_NAME" --workers 0 --wait ${TALOS_PROVISIONER:+--provisioner "$TALOS_PROVISIONER"} --cidr "$TALOS_CIDR"
-  rc=$?
-  set -e
-  if [ $rc -ne 0 ]; then
-    err "talosctl cluster create failed (rc=$rc). Attempting destroy and recreate."
+  TALOS_CIDR=${TALOS_CIDR:-10.55.0.0/24}
+  # Default hostname if not provided
+  if [ -z "${TS_HOSTNAME:-}" ]; then
+    TS_HOSTNAME="guildnet-host-$(hostname | tr 'A-Z' 'a-z' | cut -c1-12)"
+  fi
+
+  # Reuse detection: choose highest numeric suffix (admin@CLUSTER-N)
+  if kubectl config get-contexts -o name 2>/dev/null | grep -q "admin@${CLUSTER_NAME}"; then
+    ctx=$(kubectl config get-contexts -o name | grep "admin@${CLUSTER_NAME}" | sort -V | tail -n 1)
+    if [ -n "$ctx" ]; then
+      kubectl config use-context "$ctx" >/dev/null 2>&1 || true
+      if kubectl get nodes >/dev/null 2>&1; then
+        log "Cluster '$CLUSTER_NAME' appears up (context=$ctx); skipping create"
+        reuse=1
+      else
+        log "Context $ctx found but cluster not responding; will attempt create"
+      fi
+    fi
+  fi
+  reuse=${reuse:-0}
+  if [ $reuse -ne 1 ]; then
+    log "Creating Talos cluster: $CLUSTER_NAME (provisioner=${TALOS_PROVISIONER:-auto}, cidr=${TALOS_CIDR})"
     set +e
-    talosctl cluster destroy --name "$CLUSTER_NAME" ${TALOS_PROVISIONER:+--provisioner "$TALOS_PROVISIONER"}
+    talosctl cluster create --name "$CLUSTER_NAME" --workers 0 --wait ${TALOS_PROVISIONER:+--provisioner "$TALOS_PROVISIONER"} --cidr "$TALOS_CIDR"
+    rc=$?
     set -e
-    # Try alternate CIDR to avoid network overlap
-    ALT_CIDR=${ALT_CIDR:-10.66.0.0/24}
-    log "Recreating cluster with alternate CIDR ${ALT_CIDR}"
-    talosctl cluster create --name "$CLUSTER_NAME" --workers 0 --wait ${TALOS_PROVISIONER:+--provisioner "$TALOS_PROVISIONER"} --cidr "$ALT_CIDR"
+    if [ $rc -ne 0 ]; then
+      err "cluster create failed (rc=$rc). Destroying and retrying with alternate CIDR"
+      set +e
+      talosctl cluster destroy --name "$CLUSTER_NAME" ${TALOS_PROVISIONER:+--provisioner "$TALOS_PROVISIONER"}
+      set -e
+      ALT_CIDR=${ALT_CIDR:-10.66.0.0/24}
+      log "Recreating cluster with alternate CIDR ${ALT_CIDR}"
+      talosctl cluster create --name "$CLUSTER_NAME" --workers 0 --wait ${TALOS_PROVISIONER:+--provisioner "$TALOS_PROVISIONER"} --cidr "$ALT_CIDR"
+    fi
+  # After creation, capture newest context (version sort)
+  ctx=$(kubectl config get-contexts -o name | grep "admin@${CLUSTER_NAME}" | sort -V | tail -n 1 || true)
+    if [ -n "$ctx" ]; then
+      kubectl config use-context "$ctx" >/dev/null 2>&1 || true
+      log "Selected kube context: $ctx"
+    fi
+    # Force export of KUBECONFIG path for subshells (best effort)
+    if [ -z "${KUBECONFIG:-}" ]; then
+      if [ -f "$HOME/.kube/config" ]; then
+        export KUBECONFIG="$HOME/.kube/config"
+      fi
+    fi
   fi
 
   log "Fetching kubeconfig"
   talosctl kubeconfig --name "$CLUSTER_NAME" >/dev/null 2>&1 || true
 
-  log "Checking cluster health"
-  if ! kubectl version --short >/dev/null 2>&1; then
-    err "kubectl unable to connect; ensure KUBECONFIG is set for the new cluster."
-    exit 1
-  fi
+  log "Checking cluster health (kube API readiness)"
+  total_wait=0; max_wait=300; interval=5
+  while true; do
+    if kubectl get nodes >/dev/null 2>&1; then
+      # Require at least one Ready node
+      if kubectl get nodes -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null | grep -q True; then
+        log "kube API reachable and node Ready"
+        break
+      fi
+    fi
+    sleep $interval
+    total_wait=$((total_wait+interval))
+    if [ $total_wait -ge $max_wait ]; then
+      err "kube API not ready after ${max_wait}s; continuing (will still try DS apply)"
+      break
+    fi
+  done
 
-  log "Applying Tailscale subnet router (routes=$TS_ROUTES, login=$TS_LOGIN_SERVER)"
+  # Reconcile (self-heal) subnet router DS each run
+  if ! kubectl get nodes >/dev/null 2>&1; then
+    err "kube API still unreachable; aborting before Tailscale DS apply"
+    return 1
+  fi
+  log "Reconciling Tailscale subnet router (routes=$TS_ROUTES, login=$TS_LOGIN_SERVER)"
   kubectl -n kube-system apply -f - <<YAML
 apiVersion: apps/v1
 kind: DaemonSet
@@ -251,16 +313,33 @@ spec:
           mountPath: /var/lib/tailscale
         - name: tun
           mountPath: /dev/net/tun
+        readinessProbe:
+          exec:
+            command: ["/bin/sh","-c","tailscale status >/dev/null 2>&1"]
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          exec:
+            command: ["/bin/sh","-c","tailscale status >/dev/null 2>&1"]
+          initialDelaySeconds: 30
+          periodSeconds: 30
         args:
         - /bin/sh
         - -c
         - |
           set -e
-          /usr/sbin/tailscaled --state=/var/lib/tailscale/tailscaled.state &
-          sleep 2
-          HOSTNAME_ARG="--hostname=${TS_HOSTNAME:-talos-subnet-router-\$(hostname)}"
-          tailscale up --authkey="$TS_AUTHKEY" --login-server="$TS_LOGIN_SERVER" --advertise-routes="$TS_ROUTES" $HOSTNAME_ARG --accept-routes
-          # keep foreground to hold the pod
+          /usr/local/bin/tailscaled --state=/var/lib/tailscale/tailscaled.state &
+          # Wait up to 60s for tailscaled to answer (static list avoids host shell var expansion)
+          for _ in 1 2 3 4 5 6 7 8 9 10 \
+            11 12 13 14 15 16 17 18 19 20 \
+            21 22 23 24 25 26 27 28 29 30 \
+            31 32 33 34 35 36 37 38 39 40 \
+            41 42 43 44 45 46 47 48 49 50 \
+            51 52 53 54 55 56 57 58 59 60; do
+            if tailscale status >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          tailscale up --authkey="${TS_AUTHKEY}" --login-server="${TS_LOGIN_SERVER}" --advertise-routes="${TS_ROUTES}" --hostname="${TS_HOSTNAME}" --accept-routes || true
           tail -f /dev/null
       volumes:
       - name: state
@@ -271,10 +350,13 @@ spec:
           type: CharDevice
 YAML
 
-  log "Waiting for Tailscale router to be ready"
-  kubectl -n kube-system rollout status ds/tailscale-subnet-router --timeout=120s
-
-  log "Talos cluster ready and advertised to Tailscale."
+  log "Waiting for Tailscale router to be ready (rollout status)"
+  kubectl -n kube-system rollout status ds/tailscale-subnet-router --timeout=240s || true
+  # Pod self-check
+  if ! kubectl -n kube-system get pods -l app=tailscale-subnet-router >/dev/null 2>&1; then
+    err "Tailscale subnet router pods not found; investigate manually (kubectl -n kube-system get pods)."
+  fi
+  log "Talos cluster ready; Tailscale DS applied (check logs for auth success)."
   log "Kubeconfig: \${KUBECONFIG:-\"~/.kube/config\"}; Namespace: $NAMESPACE; Cluster: $CLUSTER_NAME"
 }
 

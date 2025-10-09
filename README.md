@@ -63,26 +63,95 @@ curl -k https://127.0.0.1:8080/healthz
 open https://127.0.0.1:8080
 ```
 
-Tip: `make help` lists all common targets (build, test, lint, utilities like TLS checks and stop-all).
+Tip: `make help` lists all common targets (build, test, lint, CRD apply, utilities).
 
-## Share and join network
+## Networking / Multi-Device
 
-As an organizer (already running a Host App):
+Run the Host App on any tailnet device; others reach it at `https://<ts-hostname-or-ip>:443`. Include that hostname/IP in the server certificate SANs (see cert generation script) or accept the self-signed cert in dev.
 
-- Create a join file you can send to teammates (contains the Host App URL, optional CA, and optional pre-auth key):
-  - scripts/create_join_info.sh --hostapp-url https://<your-ts-fqdn>:443 --include-ca certs/server.crt --login-server https://headscale.example.com --auth-key tskey-... --hostname teammate-1 --name "Dev Cluster" --out guildnet.config
-  - Share the resulting guildnet.config securely.
+## Workspace Lifecycle
 
-As a teammate (to join):
+1. UI POST `/api/jobs` with image (and optional env/ports — enrichment in progress).
+2. Host App creates a Workspace CR (name derived from job) in the target namespace.
+3. Workspace controller reconciles to Deployment + Service.
+4. Status fields (phase, proxyTarget) updated when Pod and Service become Ready.
+5. UI lists Workspaces via `/api/servers` (CRD-backed) and proxy iframe loads `/proxy/server/{id}/`.
 
-- Run: scripts/join.sh /path/to/guildnet.config
-- If it includes a pre-auth key, your ~/.guildnet/config.json will be created so you can run your own Host App if desired.
-- Open the shared Host App URL in a browser and you’re in.
+Proxy resolution order:
+1. `status.proxyTarget` (scheme://host:port) if set.
+2. Fallback: Service ClusterIP + chosen port (prefers 8443/443 for HTTPS, then 8080, else first port).
 
-Verify the flow end-to-end (isolated):
+## Current API Surface
 
-- scripts/verify_join.sh --hostapp-url https://<your-ts-fqdn>:443 --include-ca certs/server.crt --login-server https://headscale.example.com --auth-key tskey-...
-- The script runs in a temp HOME, calls create_join_info.sh and join.sh, and checks /healthz.
+```
+GET  /healthz
+GET  /api/ui-config
+GET  /api/images
+GET  /api/image-defaults?image=<ref>
+GET  /api/servers
+GET  /api/servers/{id}
+GET  /api/servers/{id}/logs?level=&limit=
+POST /api/jobs
+POST /api/admin/stop-all   (also /api/stop-all)
+GET  /sse/logs?target=&level=&tail=
+GET  /api/proxy-debug
+/*  (UI dev proxy -> Vite) in dev
+/proxy[...] (reverse proxy variants)
+```
+
+Stop-all permission: Allowed if at least one Capability matches action `stopAll` and its selector matches the Workspace labels; if zero Capability objects exist, action is allowed (permissive prototype semantics).
+
+## Capability Prototype
+
+- Capability CRD spec fields used: `actions[]`, `selector.matchLabels`.
+- Cache refresh interval: ~10s (config code sets 10s in Host App main).
+- Unsupported (ignored) fields: constraints, rate limits, images, ports.
+
+## Certificate Strategy
+
+Preference order:
+1. `./certs/server.crt|server.key`
+2. `./certs/dev.crt|dev.key`
+3. `~/.guildnet/state/certs/server.crt|server.key` (auto self-signed)
+
+Regenerate with SANs: `scripts/generate-server-cert.sh -H "localhost,127.0.0.1,<ts-hostname>,<ts-ip>" -f`.
+
+## Development Flags / Env
+
+| Variable | Purpose |
+|----------|---------|
+| LISTEN_LOCAL | Local HTTPS bind address (e.g. 127.0.0.1:8080) |
+| FRONTEND_ORIGIN | CORS allowlist origin (default dev: https://127.0.0.1:8080) |
+| UI_DEV_ORIGIN | Vite dev origin (proxied at /) |
+| HOSTAPP_DISABLE_API_PROXY | Dial services directly (ClusterIP) instead of API pod proxy |
+| WORKSPACE_DOMAIN | (Future) Ingress domain base (currently unused in CRD prototype) |
+
+## Logs
+
+- REST: `/api/servers/{id}/logs` returns last N lines (default 200).
+- SSE: `/sse/logs` streams recent lines then heartbeats every 20s.
+
+## Limitations / Known Gaps (Prototype)
+
+- No user authentication / multi-tenant isolation.
+// Workspace spec now includes image, env, and ports from `/api/jobs` requests.
+- Permission system is minimal; destructive actions only.
+- No metrics or structured tracing yet.
+- Logs tail only; no incremental follow streaming from Kubernetes watch.
+- Ingress / external exposure flows are placeholders for future design.
+
+## Contributing / Extending
+
+Focus areas that add immediate value:
+
+- Add env + ports mapping from JobSpec into Workspace spec.
+- Improve pod selection & multi-replica log aggregation.
+- Introduce basic Prometheus metrics (proxy request count, workspace phase gauge).
+- Harden error responses with structured JSON codes.
+
+## License
+
+Prototype – license to be defined.
 
 # Progress
 

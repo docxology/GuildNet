@@ -7,11 +7,12 @@ LISTEN_LOCAL ?= 127.0.0.1:8080
 VITE_API_BASE ?= https://localhost:8080
 
 .PHONY: all help \
-        build build-backend build-ui \
-        run dev-backend dev-run dev-ui \
-        test lint tidy clean setup ui-setup \
-        health tls-check-backend tls-check-ui regen-certs stop-all \
-        talos-fresh talos-upgrade agent-build
+	build build-backend build-ui \
+	run dev-backend dev-run dev-ui \
+	test lint tidy clean setup ui-setup \
+	health tls-check-backend tls-check-ui regen-certs stop-all \
+	talos-fresh talos-upgrade agent-build \
+	crd-apply operator-run operator-build
 
 all: build ## Build backend and UI
 
@@ -33,6 +34,9 @@ build: build-backend build-ui ## Build backend and UI
 
 build-backend: ## Build Go backend (bin/hostapp)
 	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/$(BINARY) ./cmd/hostapp
+
+operator-build: ## Build operator manager binary (reuses hostapp for now if integrated later)
+	@echo "(placeholder) operator shares hostapp binary in prototype"
 
 build-ui: ## Build UI (Vite)
 	cd ui && npm ci && npm run build
@@ -84,6 +88,18 @@ tls-check-ui: ## Show TLS info for Vite :5173
 stop-all: ## Stop all managed workloads via admin API
 	@curl -sk -X POST https://127.0.0.1:8080/api/admin/stop-all || curl -sk -X POST https://127.0.0.1:8080/api/stop-all || true
 
+# ---------- CRD / Operator helpers ----------
+CRD_DIR ?= config/crd
+crd-apply: ## Apply (or update) GuildNet CRDs into current kube-context
+	@[ -d $(CRD_DIR) ] || { echo "CRD dir $(CRD_DIR) missing"; exit 1; }
+	@for f in $(CRD_DIR)/*.yaml; do \
+		echo "kubectl apply -f $$f"; \
+		kubectl apply -f $$f >/dev/null || exit 1; \
+	done; echo "CRDs applied"
+
+operator-run: ## Run workspace operator (controller-runtime manager) locally
+	go run ./cmd/hostapp --mode operator 2>&1 | sed 's/^/[operator] /'
+
 agent-build: ## Build agent image (see scripts)
 	sh ./scripts/agent-build-load.sh
 
@@ -93,7 +109,7 @@ agent-build: ## Build agent image (see scripts)
 #   make talos-upgrade UPGRADE_ARGS="--image ghcr.io/siderolabs/installer:v1.7.0 --nodes 10.0.0.10,10.0.0.20 --k8s v1.30.2"
 
 talos-fresh: ## Talos cluster fresh deploy
-	sh ./scripts/talos-fresh-deploy.sh $(FRESH_ARGS)
+	bash ./scripts/talos-fresh-deploy.sh $(FRESH_ARGS)
 
 talos-upgrade: ## Talos cluster in-place upgrade
-	sh ./scripts/talos-upgrade-inplace.sh $(UPGRADE_ARGS)
+	bash ./scripts/talos-upgrade-inplace.sh $(UPGRADE_ARGS)
