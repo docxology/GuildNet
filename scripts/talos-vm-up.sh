@@ -298,19 +298,33 @@ spec:
           mountPath: /var/lib/tailscale
         - name: tun
           mountPath: /dev/net/tun
+        readinessProbe:
+          exec:
+            command: ["/bin/sh","-c","tailscale status >/dev/null 2>&1"]
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          exec:
+            command: ["/bin/sh","-c","tailscale status >/dev/null 2>&1"]
+          initialDelaySeconds: 30
+          periodSeconds: 30
         args:
         - /bin/sh
         - -c
         - |
           set -e
-          /usr/sbin/tailscaled --state=/var/lib/tailscale/tailscaled.state &
-          sleep 2
-          : "Using TS_HOSTNAME if set; else derive" 
+          # Start tailscaled in background (correct path for official image)
+          /usr/local/bin/tailscaled --state=/var/lib/tailscale/tailscaled.state &
+          # Wait for control socket
+          for i in $(seq 1 60); do
+            if tailscale status >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
           if [ -z "${TS_HOSTNAME:-}" ]; then
             TS_HOSTNAME="talos-subnet-router-$(hostname)"
           fi
-          tailscale up --authkey="$TS_AUTHKEY" --login-server="$TS_LOGIN_SERVER" --advertise-routes="$TS_ROUTES" --hostname="$TS_HOSTNAME" --accept-routes
-          # keep foreground to hold the pod
+            tailscale up --authkey="$TS_AUTHKEY" --login-server="$TS_LOGIN_SERVER" --advertise-routes="$TS_ROUTES" --hostname="$TS_HOSTNAME" --accept-routes || true
+          # Keep container alive
           tail -f /dev/null
       volumes:
       - name: state
