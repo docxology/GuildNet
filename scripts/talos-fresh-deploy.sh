@@ -16,6 +16,7 @@ ENDPOINT=""
 CP_NODES=""
 WK_NODES=""
 OUT_DIR="./talos"
+FORCE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -24,6 +25,7 @@ while [[ $# -gt 0 ]]; do
     --cp) CP_NODES="$2"; shift 2 ;;
     --workers) WK_NODES="$2"; shift 2 ;;
     --out) OUT_DIR="$2"; shift 2 ;;
+    --force) FORCE=1; shift 1 ;;
     *) echo "Unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -46,8 +48,17 @@ fi
 
 mkdir -p "$OUT_DIR"
 
-echo "[1/5] Generating cluster config..."
-talosctl gen config "$CLUSTER" "$ENDPOINT" --output-dir "$OUT_DIR"
+echo "[1/7] Generating cluster config..."
+if [[ $FORCE -eq 1 ]]; then
+  echo "  --force specified: regenerating config into $OUT_DIR" >&2
+  talosctl gen config "$CLUSTER" "$ENDPOINT" --output-dir "$OUT_DIR" --force
+else
+  if [[ -f "$OUT_DIR/controlplane.yaml" ]]; then
+    echo "  existing config detected (use --force to regenerate); skipping generation"
+  else
+    talosctl gen config "$CLUSTER" "$ENDPOINT" --output-dir "$OUT_DIR"
+  fi
+fi
 
 echo "[2/7] Resetting any existing nodes (if reachable)..."
 for n in "${CP_ARR[@]}"; do
