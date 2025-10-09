@@ -27,6 +27,7 @@ ui/dist/
 
 .env
 .env.local
+.env-*
 
 /hostapp
 

@@ -4,6 +4,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // ExposureType enumerates how a Workspace's Service should be exposed.
@@ -312,3 +313,19 @@ func (in *CapabilityList) DeepCopyObject() runtime.Object {
 	}
 	return nil
 }
+
+// GroupVersion for registration
+var GroupVersion = schema.GroupVersion{Group: "guildnet.io", Version: "v1alpha1"}
+
+// SchemeBuilder registers our types with a runtime.Scheme.
+var SchemeBuilder = runtime.NewSchemeBuilder(func(s *runtime.Scheme) error {
+	s.AddKnownTypes(GroupVersion,
+		&Workspace{}, &WorkspaceList{},
+		&Capability{}, &CapabilityList{},
+	)
+	metav1.AddToGroupVersion(s, GroupVersion)
+	return nil
+})
+
+// AddToScheme registers all types in this package to a scheme.
+func AddToScheme(s *runtime.Scheme) error { return SchemeBuilder.AddToScheme(s) }

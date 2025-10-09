@@ -24,6 +24,10 @@ import (
 	"syscall"
 	"time"
 
+	"k8s.io/apimachinery/pkg/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	ctrl "sigs.k8s.io/controller-runtime"
+
 	httpx "github.com/your/module/internal/httpx"
 	"github.com/your/module/internal/k8s"
 	"github.com/your/module/internal/model"
@@ -40,9 +44,34 @@ import (
 
 	// no direct transport import; use rest.TransportFor
 
+	apiv1alpha1 "github.com/your/module/api/v1alpha1"
+	"github.com/your/module/internal/operator"
 	"github.com/your/module/internal/permission"
 	corev1 "k8s.io/api/core/v1"
 )
+
+// startOperator boots a controller-runtime manager that reconciles Workspace CRDs.
+func startOperator(ctx context.Context, restCfg *rest.Config) error {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = apiv1alpha1.AddToScheme(scheme)
+	opts := ctrl.Options{Scheme: scheme}
+	mgr, err := ctrl.NewManager(restCfg, opts)
+	if err != nil {
+		return fmt.Errorf("manager create: %w", err)
+	}
+	r := &operator.WorkspaceReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}
+	if err := r.SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("setup reconciler: %w", err)
+	}
+	go func() {
+		if err := mgr.Start(ctx); err != nil {
+			log.Printf("operator manager stopped: %v", err)
+		}
+	}()
+	log.Printf("workspace operator started in-process")
+	return nil
+}
 
 // WebSocket removed; SSE-only
 
@@ -227,6 +256,15 @@ func main() {
 		}
 	}
 	log.Printf("Workspace CRD mode active (legacy paths removed)")
+
+	// Start operator (controller-runtime) in-process so status of Workspaces is managed.
+	if kcli != nil && kcli.Rest != nil {
+		go func() {
+			if err := startOperator(ctx, kcli.Rest); err != nil {
+				log.Printf("operator start failed: %v", err)
+			}
+		}()
+	}
 
 	// Permission cache (prototype) – only used in CRD mode for admin/destructive actions.
 	var permCache *permission.Cache

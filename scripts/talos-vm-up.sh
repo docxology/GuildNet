@@ -36,6 +36,13 @@ TS_LOGIN_SERVER=${TS_LOGIN_SERVER:-https://login.tailscale.com}
 TS_ROUTES=${TS_ROUTES:-10.96.0.0/12,10.244.0.0/16}
 TS_HOSTNAME=${TS_HOSTNAME:-}
 
+# If using docker provisioner and login server points to 127.0.0.1, swap to host.docker.internal
+if [ "${TALOS_PROVISIONER:-}" = "docker" ]; then
+  if printf '%s' "$TS_LOGIN_SERVER" | grep -qE '127.0.0.1'; then
+    TS_LOGIN_SERVER=$(printf '%s' "$TS_LOGIN_SERVER" | sed 's#127.0.0.1#host.docker.internal#g')
+  fi
+fi
+
 log() { printf "%s | %s\n" "$(date -Iseconds)" "$*"; }
 err() { printf "ERR: %s\n" "$*" >&2; }
 
@@ -182,21 +189,29 @@ main() {
       ;;
   esac
 
+  # Rewrite login server host for container reachability when using docker provisioner
+  if [ "${TALOS_PROVISIONER}" = "docker" ] && printf '%s' "$TS_LOGIN_SERVER" | grep -qE '127.0.0.1'; then
+    orig=$TS_LOGIN_SERVER
+    TS_LOGIN_SERVER=$(printf '%s' "$TS_LOGIN_SERVER" | sed 's#127.0.0.1#host.docker.internal#g')
+    log "Rewriting TS_LOGIN_SERVER host from 127.0.0.1 to host.docker.internal for container access (was: $orig now: $TS_LOGIN_SERVER)"
+  fi
+
   TALOS_CIDR=${TALOS_CIDR:-10.55.0.0/24}
   # Default hostname if not provided
   if [ -z "${TS_HOSTNAME:-}" ]; then
     TS_HOSTNAME="guildnet-host-$(hostname | tr 'A-Z' 'a-z' | cut -c1-12)"
   fi
 
-  # Reuse detection: if context exists and control plane responds, skip create
+  # Reuse detection: choose highest numeric suffix (admin@CLUSTER-N)
   if kubectl config get-contexts -o name 2>/dev/null | grep -q "admin@${CLUSTER_NAME}"; then
-    # Try each existing suffix (latest first)
-    ctx=$(kubectl config get-contexts -o name | grep "admin@${CLUSTER_NAME}" | tail -n 1)
+    ctx=$(kubectl config get-contexts -o name | grep "admin@${CLUSTER_NAME}" | sort -V | tail -n 1)
     if [ -n "$ctx" ]; then
       kubectl config use-context "$ctx" >/dev/null 2>&1 || true
       if kubectl get nodes >/dev/null 2>&1; then
         log "Cluster '$CLUSTER_NAME' appears up (context=$ctx); skipping create"
         reuse=1
+      else
+        log "Context $ctx found but cluster not responding; will attempt create"
       fi
     fi
   fi
@@ -216,8 +231,8 @@ main() {
       log "Recreating cluster with alternate CIDR ${ALT_CIDR}"
       talosctl cluster create --name "$CLUSTER_NAME" --workers 0 --wait ${TALOS_PROVISIONER:+--provisioner "$TALOS_PROVISIONER"} --cidr "$ALT_CIDR"
     fi
-    # After creation, capture newest context
-    ctx=$(kubectl config get-contexts -o name | grep "admin@${CLUSTER_NAME}" | tail -n 1 || true)
+  # After creation, capture newest context (version sort)
+  ctx=$(kubectl config get-contexts -o name | grep "admin@${CLUSTER_NAME}" | sort -V | tail -n 1 || true)
     if [ -n "$ctx" ]; then
       kubectl config use-context "$ctx" >/dev/null 2>&1 || true
       log "Selected kube context: $ctx"
@@ -314,11 +329,17 @@ spec:
         - |
           set -e
           /usr/local/bin/tailscaled --state=/var/lib/tailscale/tailscaled.state &
-          for i in $(seq 1 60); do
+          # Wait up to 60s for tailscaled to answer (static list avoids host shell var expansion)
+          for _ in 1 2 3 4 5 6 7 8 9 10 \
+            11 12 13 14 15 16 17 18 19 20 \
+            21 22 23 24 25 26 27 28 29 30 \
+            31 32 33 34 35 36 37 38 39 40 \
+            41 42 43 44 45 46 47 48 49 50 \
+            51 52 53 54 55 56 57 58 59 60; do
             if tailscale status >/dev/null 2>&1; then break; fi
             sleep 1
           done
-          tailscale up --authkey="$TS_AUTHKEY" --login-server="$TS_LOGIN_SERVER" --advertise-routes="$TS_ROUTES" --hostname="$TS_HOSTNAME" --accept-routes || true
+          tailscale up --authkey="${TS_AUTHKEY}" --login-server="${TS_LOGIN_SERVER}" --advertise-routes="${TS_ROUTES}" --hostname="${TS_HOSTNAME}" --accept-routes || true
           tail -f /dev/null
       volumes:
       - name: state
