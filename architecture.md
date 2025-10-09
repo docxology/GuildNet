@@ -1,15 +1,22 @@
-## GuildNet architecture
+## GuildNet Architecture (Prototype)
 
-This document describes the end-to-end flow as implemented in the repository: launching workloads into a Kubernetes cluster and accessing each agent’s UI through a single HTTPS origin provided by the Host App (Go) using embedded Tailscale (tsnet).
+This prototype runs ephemeral or semi-persistent Workspaces (container images) inside a Kubernetes cluster and surfaces them through a single HTTPS origin served by the Host App (Go + embedded Tailscale/tsnet). All browser interactions hit the Host App, which exposes an API and a reverse proxy for per‑Workspace UIs.
 
-Goals
-- Launch agent containers dynamically in Kubernetes (Deployment + Service per workload).
-- Reach each agent privately over the tailnet; browser only talks to the Host App over HTTPS.
-- Use the Host App as the single browser-visible origin; it proxies to agents.
-- Provide a simple web UI to list servers, view logs, and launch new workloads.
+### Current Goals
+* Launch container images quickly as Workspaces (image + minimal fields).
+* Provide a single origin HTTPS proxy for all Workspace traffic.
+* Support multi-device access over a tailnet.
+* Offer a minimal capability-based permission prototype for destructive actions (stop-all).
+
+### Deferred (Not Implemented Yet)
+* Authentication / per-user access control.
+* Rich metrics, tracing, auditing.
+* External ingress automation & DNS.
+* Persistent storage provisioning.
+* Advanced policy (image/port constraints, concurrency limits).
 
 
-## Components
+### Components
 
 - How to access the UI
   - Local development: open `https://127.0.0.1:8080`. The Host App proxies the Vite dev server (which listens on `https://localhost:5173`) so the browser uses a single HTTPS origin.
@@ -20,7 +27,7 @@ Goals
   - Servers list/detail with logs and an IDE tab (iframe via the proxy).
   - API base configured via `VITE_API_BASE`; dev UI is also reverse-proxied by the Host App for same-origin dev.
 
-- Host App (Go + tsnet)
+#### Host App (Go + tsnet)
   - Local TLS listener (default `LISTEN_LOCAL=127.0.0.1:8080`) and a tsnet listener on `:443` inside the tailnet.
   - CORS is restricted to a single origin via `FRONTEND_ORIGIN` (for dev use the Host App origin `https://127.0.0.1:8080`).
   - Endpoints (current implementation):
@@ -41,51 +48,20 @@ Goals
       - `/proxy/server/{id}/{rest}` (server-aware form)
   - Dev UI reverse-proxy: requests to `/` are forwarded to the Vite dev server (which listens on `https://localhost:5173`), while `/api/*`, `/proxy/*`, and `/healthz` are handled by the Host App. In practice, you should open `https://127.0.0.1:8080` in the browser; the Host App will proxy the UI for a single, secure origin.
 
-- Tailscale control plane (Headscale or Tailscale)
+#### Tailscale (Headscale/Tailscale)
   - The Host App authenticates via tsnet using configured login server and auth key.
   - Provides tailnet transport; recommend a subnet router for reaching cluster CIDRs.
 
-- Kubernetes cluster
+#### Kubernetes Cluster & Controller
   - The Host App uses in-cluster config when running inside the cluster, or falls back to `KUBECONFIG` (client-go) when outside.
   - It creates/updates Deployments and Services and reads Pods/Logs via the API.
 
-- Agent container image (images/agent)
+#### Workspace Images
   - Typically code-server behind Caddy, listening on HTTP 8080; other images are supported by configuration.
 
 
-## High-level view
-
-```mermaid
-flowchart LR
-  subgraph Browser["Client Browser (UI)"]
-    UI["GuildNet UI (Vite/SolidJS)"]
-  end
-
-  subgraph Host["Host App (Go)"]
-    API[/HTTPS API\n /api/*/]
-    RP[/Reverse Proxy\n /proxy/]
-    TS["tsnet (embedded Tailscale)"]
-  end
-
-  subgraph Tailnet["Tailscale Network"]
-    HS["Headscale/Tailscale"]
-    SR["Subnet Router\n(recommended)"]
-  end
-
-  subgraph K8s["Kubernetes Cluster"]
-    subgraph NS["Namespace"]
-      A1["Agent Pod - HTTP 8080"]
-      SVC1["Service: agent-1"]
-    end
-  end
-
-  UI -->|HTTPS| API
-  API --> RP
-  RP --> TS
-  TS --> SR
-  SR --> SVC1
-  RP -->|HTTP/HTTPS| SVC1
-```
+### High-Level Data Flow
+Browser → Host App API → Workspace CR (Kubernetes) → Controller → Deployment + Service → Host App Proxy → Browser iframe.
 
 Notes
 - Browser ↔ Host App is always HTTPS on a single origin.
@@ -106,7 +82,7 @@ Kubernetes reachability modes
 - Direct (optional): ClusterIP over tsnet — set `HOSTAPP_DISABLE_API_PROXY=true` to bypass the API proxy and dial the ClusterIP:port via tsnet. This requires a route (e.g., a Tailscale subnet router advertising the cluster CIDRs). Useful to validate WebSockets/long‑lived conns end‑to‑end.
 
 
-## Launch flow (UI → Host App → Kubernetes → Agent)
+### Workspace Launch Flow
 
 Intent: The Launch UI deploys a container in the cluster (Deployment + Service) and makes it reachable through the Host App proxy.
 
@@ -128,7 +104,7 @@ sequenceDiagram
   B-->>U: Server transitions to running in list/detail
 ```
 
-Important choices (as implemented)
+### Controller Defaults
 - JobSpec must include `image`; the backend does not inject a default image.
 - Default container ports when none provided:
   - For code-server-like images: expose only HTTP 8080.
@@ -145,7 +121,7 @@ Important choices (as implemented)
  - Optional per‑workspace auth hooks for NGINX Ingress via `INGRESS_AUTH_URL` and `INGRESS_AUTH_SIGNIN`.
 
 
-## Access flow (iframe via reverse-proxy over tsnet)
+### Access Flow (Proxy → Workspace)
 
 Intent: The Server Detail page’s IDE tab loads an iframe whose src points at the Host App’s `/proxy`. The Host App resolves the upstream and streams the agent’s UI back to the browser.
 
@@ -172,12 +148,12 @@ sequenceDiagram
   B-->>U: Streams IDE content over the same HTTPS origin
 ```
 
-Why this works in a browser
+#### Browser Integration
 - The iframe src is the Host App’s HTTPS origin, avoiding mixed content.
 - The reverse proxy adjusts redirects (Location) and Set-Cookie for iframe scenarios (drops Domain, ensures `Secure` and `SameSite=None`, adds `Partitioned`, and normalizes Path).
 
 
-## Addressing model (resolution order) and allowlist
+### Proxy Resolution Order
 
 - Resolution order for `/proxy/server/{id}/...`:
   1) Try direct Service ClusterIP + port from Kubernetes by id/name or label `guildnet.io/id`.
@@ -189,7 +165,7 @@ Why this works in a browser
 
 - Explicit form `/proxy?to=host:port&path=/...` is also available.
 
-- Allowlist: removed. The proxy no longer enforces a CIDR or host:port allowlist; access is expected to be restricted by your tailnet and Kubernetes RBAC.
+* No allowlist: rely on tailnet + cluster RBAC.
 
 Certificates and hostnames for multi-device access
 - The Host App serves HTTPS using, in order of preference:
@@ -200,7 +176,7 @@ Certificates and hostnames for multi-device access
 - Alternatively, terminate TLS in front of the Host App with a proxy that has a trusted certificate and forwards to the Host App locally.
 
 
-## Kubernetes responsibilities (current design)
+### Workspace Controller Responsibilities
 
 When `POST /api/jobs` is called:
 - Create/Update a Deployment and Service labeled:
@@ -215,7 +191,7 @@ When `POST /api/jobs` is called:
   - Type ClusterIP unless `WORKSPACE_LB` is set (then LoadBalancer); `PublishNotReadyAddresses=true`
 - Optional Ingress per-workspace when `WORKSPACE_DOMAIN` is configured (see “Important choices”).
 
-Server listing and logs:
+### Listing & Logs
 - `GET /api/servers` maps Deployments labeled `guildnet.io/managed=true` to `model.Server`.
   - Status is `running` when `ReadyReplicas > 0`, else `pending`.
   - Ports are taken from the corresponding Service when present.
@@ -225,7 +201,7 @@ Server listing and logs:
 - `POST /api/admin/stop-all` deletes Deployments and Services labeled `guildnet.io/managed=true` in the namespace.
 
 
-## Security and TLS
+### Security & TLS
 
 - Host App listeners:
   - Local HTTPS at `LISTEN_LOCAL` (default from config; can override via env)
@@ -238,7 +214,7 @@ Server listing and logs:
 - API server proxy: when enabled (default), traffic to cluster Pods can traverse the Kubernetes API server via client-go with TLS; HTTP/2 is disabled on that path to avoid INTERNAL_ERROR on proxy endpoints.
 - Cookies/redirects are adjusted by the proxy for iframe usage, as noted above.
 
-Multi‑user security notes
+### Multi-User Notes
 - The Host App currently has no built‑in user accounts or login. Access control relies on:
   - Your tailnet boundary (who can reach the Host App over Tailscale/Headscale)
   - Kubernetes RBAC applied to the kubeconfig used by the Host App
@@ -246,7 +222,7 @@ Multi‑user security notes
 - If exposing outside the tailnet, add an auth proxy in front (e.g., OIDC‑enabled reverse proxy) or run the Host App behind a private ingress.
 
 
-## Failure modes and troubleshooting
+### Troubleshooting
 
 - Proxy 502 / upstream error
   - Verify target resolution for `/proxy/server/{id}/...` (Service exists, ports populated, or `Env.AGENT_HOST` set).
@@ -267,30 +243,30 @@ Multi‑user security notes
    - Regenerate the server certificate to include your tailnet FQDN and/or IP in SANs, or front the Host App with a TLS‑terminating proxy with a trusted cert.
 
 
-## Port and protocol summary
+### Ports
 
 - Host App: HTTPS on `LISTEN_LOCAL` (e.g., `127.0.0.1:8080`) and HTTPS via tsnet on `:443` inside the tailnet.
 - Agent (typical): HTTP on 8080; HTTPS 8443 optional depending on image/config.
 - Proxying: HTTP or HTTPS to upstream depending on resolved port or explicit `scheme`.
 
-Multi-device access summary
+### Multi-Device Access
 - Local dev: open `https://127.0.0.1:8080` in the browser. The Vite dev server runs on `https://localhost:5173` but is proxied at `/` by the Host App for same-origin access.
 - Tailnet: `https://<hostapp-ts-fqdn>:443` (same UI, single origin). Ensure the TLS cert includes the tailnet name/IP or use a trusted front proxy.
 
 
-## What “multiple agents” means here
+### Multiple Workspaces Concept
 
 - Each launched “server” is a separate Deployment + Service (or a Deployment with multiple replicas) labeled for discovery.
 - The UI lists these servers, and the IDE tab points the iframe to `/proxy/server/{id}/...` where the backend resolves the upstream as described above.
 
 
-## Talos bootstrap and shared env (optional)
+### Environment Assumptions
 
 - The code supports any Kubernetes cluster (in-cluster or kubeconfig). If you use Talos, helper scripts in `scripts/` can provision a dev cluster and a Tailscale subnet router.
 - The Host App reads config via `pkg/config` (tsnet login server, auth key, hostname, listen address). A shared `.env` can be used by scripts to populate this config.
 
 
-## Appendix: minimal example values
+### Useful Environment Variables
 
 - Service DNS fallback: `<dns1123(name)>.default.svc.cluster.local`
 - Default agent ports when unspecified: 8080 (http), optionally 8443 (https)
@@ -308,23 +284,8 @@ Multi-device access summary
   - `AGENT_DEFAULT_PASSWORD` — default agent password when not provided
   - `HOSTAPP_DISABLE_API_PROXY` — disable Kubernetes API server proxy (force direct tsnet dial)
 
-## End‑to‑end setup: existing Headscale + Talos
-
-1) Kubernetes access on the Host machine
-- Ensure `kubectl get ns` works (KUBECONFIG or in‑cluster).
-
-2) Host App tsnet config
-- Run `./bin/hostapp init` and provide Headscale URL, pre‑auth key, hostname, and listen address. Or set `.env` with `TS_LOGIN_SERVER`, `TS_AUTHKEY`, `TS_HOSTNAME` and run `make dev-backend`.
-
-3) Certificates for multi‑device
-- Regenerate `certs/server.crt` to include your tailnet FQDN/IP SANs via `scripts/generate-server-cert.sh -H "localhost,127.0.0.1,::1,<ts-fqdn>,<ts-ip>" -f`.
-
-4) Start services
-- `make dev-backend` (Host App) and `make dev-ui` (UI) or browse the Host App’s tailnet URL directly.
-
-5) Launch a workspace
-- From the UI, use Launch. Inspect `/api/servers` and open the IDE tab which proxies `/proxy/server/<id>/`.
-
-Limitations to note
-- No built‑in auth; rely on tailnet and RBAC. Consider an auth proxy if exposing beyond the tailnet.
-- Logs SSE is tail‑only + heartbeat; no live watch yet.
+### Limitations
+* No user auth layer (tailnet + kube RBAC only).
+* Logs SSE tail-only; no live follow.
+* Env/ports enrichment in launch path not complete.
+* No metrics/tracing yet.

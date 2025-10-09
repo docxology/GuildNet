@@ -1,0 +1,56 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: capabilities.guildnet.io
+spec:
+  group: guildnet.io
+  scope: Namespaced
+  names:
+    plural: capabilities
+    singular: capability
+    kind: Capability
+    shortNames:
+      - cap
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [actions]
+              properties:
+                actions:
+                  type: array
+                  items:
+                    type: string
+                selector:
+                  type: object
+                  description: LabelSelector; schema left open for prototype.
+                constraints:
+                  type: object
+                  properties:
+                    allowedImages:
+                      type: array
+                      items:
+                        type: string
+                    allowedPorts:
+                      type: array
+                      items:
+                        type: integer
+                    maxConcurrent:
+                      type: integer
+            status:
+              type: object
+              properties:
+                observedGeneration:
+                  type: integer
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Actions
+          type: string
+          jsonPath: .spec.actions

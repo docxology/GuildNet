@@ -1,0 +1,89 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: workspaces.guildnet.io
+spec:
+  group: guildnet.io
+  scope: Namespaced
+  names:
+    plural: workspaces
+    singular: workspace
+    kind: Workspace
+    shortNames:
+      - ws
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [image]
+              properties:
+                image:
+                  type: string
+                env:
+                  type: array
+                  items:
+                    type: object
+                ports:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      containerPort:
+                        type: integer
+                        minimum: 1
+                        maximum: 65535
+                      name:
+                        type: string
+                      protocol:
+                        type: string
+                exposure:
+                  type: object
+                  properties:
+                    type:
+                      type: string
+                      enum: [ClusterIP, LoadBalancer, Ingress]
+                    domain:
+                      type: string
+                    ingressClass:
+                      type: string
+                    tlsIssuer:
+                      type: string
+                presetsRef:
+                  type: string
+                notes:
+                  type: string
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                readyReplicas:
+                  type: integer
+                serviceDNS:
+                  type: string
+                serviceIP:
+                  type: string
+                externalURL:
+                  type: string
+                proxyTarget:
+                  type: string
+                lastError:
+                  type: string
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Image
+          type: string
+          jsonPath: .spec.image
+        - name: Ready
+          type: integer
+          jsonPath: .status.readyReplicas

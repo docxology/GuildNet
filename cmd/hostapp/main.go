@@ -33,10 +33,14 @@ import (
 	"github.com/your/module/internal/ts"
 	"github.com/your/module/pkg/config"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 
 	// no direct transport import; use rest.TransportFor
 
+	"github.com/your/module/internal/permission"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -127,6 +131,30 @@ func dns1123Name(s string) string {
 	return res
 }
 
+// deriveAgentHost attempts to pick a stable host base from job spec image or name.
+func deriveAgentHost(spec model.JobSpec) string {
+	base := strings.TrimSpace(spec.Name)
+	if base == "" {
+		img := spec.Image
+		last := img
+		if i := strings.LastIndex(img, "/"); i >= 0 && i+1 < len(img) {
+			last = img[i+1:]
+		}
+		if j := strings.IndexByte(last, ':'); j >= 0 {
+			last = last[:j]
+		}
+		base = last
+	}
+	if base == "" {
+		base = "workload"
+	}
+	host := dns1123Name(base)
+	if host == "" {
+		host = "workload"
+	}
+	return host
+}
+
 func main() {
 	log.SetFlags(0)
 	cmd := "serve"
@@ -188,6 +216,22 @@ func main() {
 	kcli, err := k8s.New(ctx)
 	if err != nil {
 		log.Fatalf("k8s client: %v", err)
+	}
+	var dyn dynamic.Interface
+	// Always use Workspace CRDs (legacy deployment path removed)
+	if kcli != nil && kcli.Rest != nil {
+		if d, derr := dynamic.NewForConfig(kcli.Rest); derr == nil {
+			dyn = d
+		} else {
+			log.Printf("dynamic client init failed: %v", derr)
+		}
+	}
+	log.Printf("Workspace CRD mode active (legacy paths removed)")
+
+	// Permission cache (prototype) – only used in CRD mode for admin/destructive actions.
+	var permCache *permission.Cache
+	if dyn != nil {
+		permCache = permission.NewCache(dyn, "default", 10*time.Second)
 	}
 	defaultNS := strings.TrimSpace(os.Getenv("K8S_NAMESPACE"))
 	if defaultNS == "" {
@@ -281,21 +325,75 @@ func main() {
 		httpx.JSON(w, http.StatusOK, resp)
 	})
 
-	// servers list (from Kubernetes)
+	// servers list (Workspace CRDs only; legacy Deployment path removed during cleanup)
 	mux.HandleFunc("/api/servers", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		svcs, err := kcli.ListServers(r.Context(), defaultNS)
-		if err != nil {
-			httpx.JSONError(w, http.StatusInternalServerError, err.Error())
+		if dyn == nil { // dynamic client required now that only CRD mode exists
+			httpx.JSONError(w, http.StatusInternalServerError, "dynamic client unavailable", "dyn_unavailable")
 			return
 		}
-		httpx.JSON(w, http.StatusOK, svcs)
+		gvr := schema.GroupVersionResource{Group: "guildnet.io", Version: "v1alpha1", Resource: "workspaces"}
+		lst, err := dyn.Resource(gvr).Namespace(defaultNS).List(r.Context(), metav1.ListOptions{})
+		if err != nil {
+			httpx.JSONError(w, http.StatusInternalServerError, "list workspaces failed", "list_failed", err.Error())
+			return
+		}
+		var out []*model.Server
+		for _, item := range lst.Items {
+			obj := item.Object
+			meta := obj["metadata"].(map[string]any)
+			spec := obj["spec"].(map[string]any)
+			status, _ := obj["status"].(map[string]any)
+			name := meta["name"].(string)
+			image, _ := spec["image"].(string)
+			phase, _ := status["phase"].(string)
+			readyReplicas := int32(0)
+			if rr, ok := status["readyReplicas"].(int64); ok {
+				readyReplicas = int32(rr)
+			}
+			proxyTarget, _ := status["proxyTarget"].(string)
+			ports := []model.Port{}
+			if rawPorts, ok := spec["ports"].([]any); ok {
+				for _, rp := range rawPorts {
+					if pm, ok := rp.(map[string]any); ok {
+						pnum := 0
+						if pv, ok := pm["containerPort"].(int64); ok {
+							pnum = int(pv)
+						}
+						if pnum == 0 {
+							if pvf, ok := pm["containerPort"].(float64); ok {
+								pnum = int(pvf)
+							}
+						}
+						if pnum > 0 {
+							ports = append(ports, model.Port{Name: strings.TrimSpace(fmt.Sprint(pm["name"])), Port: pnum})
+						}
+					}
+				}
+			} else if proxyTarget != "" { // fallback parse if spec.ports absent
+				if i := strings.LastIndex(proxyTarget, ":"); i > 0 {
+					var pnum int
+					fmt.Sscanf(proxyTarget[i+1:], "%d", &pnum)
+					if pnum > 0 {
+						ports = append(ports, model.Port{Name: "main", Port: pnum})
+					}
+				}
+			}
+			statusStr := "pending"
+			if phase == "Running" && readyReplicas > 0 {
+				statusStr = "running"
+			} else if phase == "Failed" {
+				statusStr = "failed"
+			}
+			out = append(out, &model.Server{ID: name, Name: name, Image: image, Status: statusStr, Ports: ports, URL: ""})
+		}
+		httpx.JSON(w, http.StatusOK, out)
 	})
 
-	// server detail and logs
+	// server detail and logs (Workspace CRDs only)
 	mux.HandleFunc("/api/servers/", func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/api/servers/")
 		if path == "" {
@@ -304,16 +402,77 @@ func main() {
 		}
 		parts := strings.Split(path, "/")
 		id := parts[0]
-		if len(parts) == 1 && r.Method == http.MethodGet {
-			srv, err := kcli.GetServer(r.Context(), defaultNS, id)
-			if err != nil {
-				w.WriteHeader(http.StatusNotFound)
+		// CRD path only now
+		if dyn == nil { // dynamic client mandatory
+			httpx.JSONError(w, http.StatusInternalServerError, "dynamic client unavailable", "dyn_unavailable")
+			return
+		}
+		gvr := schema.GroupVersionResource{Group: "guildnet.io", Version: "v1alpha1", Resource: "workspaces"}
+		if len(parts) == 1 && r.Method == http.MethodDelete {
+			gvr := schema.GroupVersionResource{Group: "guildnet.io", Version: "v1alpha1", Resource: "workspaces"}
+			if err := dyn.Resource(gvr).Namespace(defaultNS).Delete(r.Context(), id, metav1.DeleteOptions{}); err != nil {
+				httpx.JSONError(w, http.StatusNotFound, "workspace not found", "not_found")
 				return
 			}
-			httpx.JSON(w, http.StatusOK, srv)
+			httpx.JSON(w, http.StatusOK, map[string]any{"deleted": id})
+			return
+		}
+		if len(parts) == 1 && r.Method == http.MethodGet {
+			ws, err := dyn.Resource(gvr).Namespace(defaultNS).Get(r.Context(), id, metav1.GetOptions{})
+			if err != nil {
+				httpx.JSONError(w, http.StatusNotFound, "workspace not found", "not_found")
+				return
+			}
+			obj := ws.Object
+			spec := obj["spec"].(map[string]any)
+			status, _ := obj["status"].(map[string]any)
+			image, _ := spec["image"].(string)
+			phase, _ := status["phase"].(string)
+			proxyTarget, _ := status["proxyTarget"].(string)
+			readyReplicas := int32(0)
+			if rr, ok := status["readyReplicas"].(int64); ok {
+				readyReplicas = int32(rr)
+			}
+			statusStr := "pending"
+			if phase == "Running" && readyReplicas > 0 {
+				statusStr = "running"
+			} else if phase == "Failed" {
+				statusStr = "failed"
+			}
+			ports := []model.Port{}
+			if rawPorts, ok := spec["ports"].([]any); ok {
+				for _, rp := range rawPorts {
+					if pm, ok := rp.(map[string]any); ok {
+						pnum := 0
+						if pv, ok := pm["containerPort"].(int64); ok {
+							pnum = int(pv)
+						} else if pvf, ok := pm["containerPort"].(float64); ok {
+							pnum = int(pvf)
+						}
+						if pnum > 0 {
+							ports = append(ports, model.Port{Name: strings.TrimSpace(fmt.Sprint(pm["name"])), Port: pnum})
+						}
+					}
+				}
+			} else if proxyTarget != "" {
+				if i := strings.LastIndex(proxyTarget, ":"); i > 0 {
+					var pnum int
+					fmt.Sscanf(proxyTarget[i+1:], "%d", &pnum)
+					if pnum > 0 {
+						ports = append(ports, model.Port{Name: "main", Port: pnum})
+					}
+				}
+			}
+			httpx.JSON(w, http.StatusOK, &model.Server{ID: id, Name: id, Image: image, Status: statusStr, Ports: ports, URL: ""})
 			return
 		}
 		if len(parts) == 2 && parts[1] == "logs" && r.Method == http.MethodGet {
+			// list pods by label guildnet.io/workspace=<id>
+			pods, err := kcli.K.CoreV1().Pods(defaultNS).List(r.Context(), metav1.ListOptions{LabelSelector: fmt.Sprintf("guildnet.io/workspace=%s", id)})
+			if err != nil || len(pods.Items) == 0 {
+				httpx.JSONError(w, http.StatusNotFound, "no pods for workspace", "no_pods")
+				return
+			}
 			q := r.URL.Query()
 			level := q.Get("level")
 			if level == "" {
@@ -323,18 +482,63 @@ func main() {
 			if v := q.Get("limit"); v != "" {
 				fmt.Sscanf(v, "%d", &limit)
 			}
-			lines, err := kcli.GetLogs(r.Context(), defaultNS, id, level, limit)
-			if err != nil {
-				httpx.JSONError(w, http.StatusNotFound, err.Error())
-				return
+			// Sort pods: ready first
+			readyPods := []corev1.Pod{}
+			unreadyPods := []corev1.Pod{}
+			for _, p := range pods.Items {
+				isReady := false
+				for _, c := range p.Status.Conditions {
+					if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
+						isReady = true
+						break
+					}
+				}
+				if isReady {
+					readyPods = append(readyPods, p)
+				} else {
+					unreadyPods = append(unreadyPods, p)
+				}
 			}
-			httpx.JSON(w, http.StatusOK, lines)
+			ordered := append(readyPods, unreadyPods...)
+			// Aggregate logs from up to N pods (cap at 5 to bound cost)
+			maxPods := 5
+			if len(ordered) < maxPods {
+				maxPods = len(ordered)
+			}
+			tail := int64(limit / maxPods)
+			if tail < 10 {
+				tail = int64(limit)
+			} // if very small limit, just pull full per pod
+			out := []model.LogLine{}
+			for i := 0; i < maxPods; i++ {
+				p := ordered[i]
+				container := ""
+				if len(p.Spec.Containers) > 0 {
+					container = p.Spec.Containers[0].Name
+				}
+				req := kcli.K.CoreV1().Pods(defaultNS).GetLogs(p.Name, &corev1.PodLogOptions{Container: container, TailLines: &tail})
+				data, err := req.Do(r.Context()).Raw()
+				if err != nil {
+					continue
+				}
+				linesRaw := strings.Split(strings.TrimSpace(string(data)), "\n")
+				for _, ln := range linesRaw {
+					if ln != "" {
+						out = append(out, model.LogLine{T: model.NowISO(), LVL: level, MSG: fmt.Sprintf("[%s] %s", p.Name, ln)})
+					}
+				}
+			}
+			// Truncate to requested limit if aggregated exceeded it
+			if len(out) > limit {
+				out = out[len(out)-limit:]
+			}
+			httpx.JSON(w, http.StatusOK, out)
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
 	})
 
-	// jobs
+	// jobs (Workspace CRD only; legacy Deployment path removed)
 	mux.HandleFunc("/api/jobs", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -342,50 +546,55 @@ func main() {
 		}
 		b, err := io.ReadAll(r.Body)
 		if err != nil {
-			httpx.JSONError(w, http.StatusBadRequest, "bad body")
+			httpx.JSONError(w, http.StatusBadRequest, "unable to read body", "bad_body")
 			return
 		}
 		defer r.Body.Close()
 		var spec model.JobSpec
 		if err := json.Unmarshal(b, &spec); err != nil || spec.Image == "" {
-			httpx.JSONError(w, http.StatusBadRequest, "invalid spec")
+			httpx.JSONError(w, http.StatusBadRequest, "invalid job spec", "invalid_spec", err)
 			return
 		}
 
-		// Ensure env map and default AGENT_HOST if missing/empty.
-		if spec.Env == nil {
-			spec.Env = map[string]string{}
-		}
-		if strings.TrimSpace(spec.Env["AGENT_HOST"]) == "" {
-			base := strings.TrimSpace(spec.Name)
-			if base == "" {
-				// Derive base name from image last path segment without tag.
-				img := spec.Image
-				last := img
-				if i := strings.LastIndex(img, "/"); i >= 0 && i+1 < len(img) {
-					last = img[i+1:]
-				}
-				if j := strings.IndexByte(last, ':'); j >= 0 {
-					last = last[:j]
-				}
-				base = last
-			}
-			if base == "" {
-				base = "workload"
-			}
-			host := dns1123Name(base)
-			if host == "" {
-				host = "workload"
-			}
-			spec.Env["AGENT_HOST"] = host
-		}
-		name, id, err := kcli.EnsureDeploymentAndService(r.Context(), spec, k8s.EnsureOpts{Namespace: defaultNS})
-		if err != nil {
-			httpx.JSONError(w, http.StatusInternalServerError, err.Error())
+		if dyn == nil { // dynamic client required
+			httpx.JSONError(w, http.StatusInternalServerError, "dynamic client unavailable", "dyn_unavailable")
 			return
 		}
-		_ = name
-		httpx.JSON(w, http.StatusAccepted, model.JobAccepted{ID: id, Status: "pending"})
+		wsName := spec.Name
+		if wsName == "" {
+			wsName = dns1123Name(deriveAgentHost(spec))
+		}
+		gvr := schema.GroupVersionResource{Group: "guildnet.io", Version: "v1alpha1", Resource: "workspaces"}
+		specMap := map[string]any{"image": spec.Image}
+		if len(spec.Env) > 0 {
+			var envArr []any
+			for k, v := range spec.Env {
+				envArr = append(envArr, map[string]any{"name": k, "value": v})
+			}
+			specMap["env"] = envArr
+		}
+		if len(spec.Expose) > 0 {
+			var portsArr []any
+			for _, p := range spec.Expose {
+				if p.Port > 0 {
+					portsArr = append(portsArr, map[string]any{"containerPort": p.Port, "name": p.Name})
+				}
+			}
+			if len(portsArr) > 0 {
+				specMap["ports"] = portsArr
+			}
+		}
+		obj := map[string]any{
+			"apiVersion": "guildnet.io/v1alpha1",
+			"kind":       "Workspace",
+			"metadata":   map[string]any{"name": wsName},
+			"spec":       specMap,
+		}
+		if _, err := dyn.Resource(gvr).Namespace(defaultNS).Create(r.Context(), &unstructured.Unstructured{Object: obj}, metav1.CreateOptions{}); err != nil {
+			httpx.JSONError(w, http.StatusInternalServerError, "workspace create failed", "create_failed", err.Error())
+			return
+		}
+		httpx.JSON(w, http.StatusAccepted, model.JobAccepted{ID: wsName, Status: "pending"})
 	})
 
 	// admin: stop all servers (delete managed workloads)
@@ -395,11 +604,31 @@ func main() {
 			return
 		}
 		log.Printf("admin: stop-all requested from %s", r.RemoteAddr)
-		if err := kcli.DeleteManaged(r.Context(), defaultNS); err != nil {
-			httpx.JSONError(w, http.StatusInternalServerError, err.Error())
+		if permCache != nil {
+			if !permCache.Allow(r.Context(), permission.ActionStopAll, map[string]string{}) {
+				httpx.JSONError(w, http.StatusForbidden, "permission denied", "forbidden")
+				return
+			}
+		}
+		// Workspace CRD deletion only
+		if dyn == nil { // dynamic client required
+			httpx.JSONError(w, http.StatusInternalServerError, "dynamic client unavailable", "dyn_unavailable")
 			return
 		}
-		httpx.JSON(w, http.StatusOK, map[string]any{"status": "ok"})
+		gvr := schema.GroupVersionResource{Group: "guildnet.io", Version: "v1alpha1", Resource: "workspaces"}
+		lst, err := dyn.Resource(gvr).Namespace(defaultNS).List(r.Context(), metav1.ListOptions{})
+		if err != nil {
+			httpx.JSONError(w, http.StatusInternalServerError, "list workspaces failed", "list_failed", err.Error())
+			return
+		}
+		deleted := []string{}
+		for _, item := range lst.Items {
+			name := item.GetName()
+			if err := dyn.Resource(gvr).Namespace(defaultNS).Delete(r.Context(), name, metav1.DeleteOptions{}); err == nil {
+				deleted = append(deleted, name)
+			}
+		}
+		httpx.JSON(w, http.StatusOK, map[string]any{"deleted": deleted})
 	}
 	mux.HandleFunc("/api/admin/stop-all", adminStopAll)
 	mux.HandleFunc("/api/admin/stop-all/", adminStopAll)
@@ -439,17 +668,17 @@ func main() {
 
 		// Validate before switching to SSE
 		if id == "" {
-			httpx.JSONError(w, http.StatusBadRequest, "missing target")
+			httpx.JSONError(w, http.StatusBadRequest, "missing target", "missing_target")
 			return
 		}
 		if _, err := kcli.GetServer(r.Context(), defaultNS, id); err != nil {
-			httpx.JSONError(w, http.StatusNotFound, "unknown target")
+			httpx.JSONError(w, http.StatusNotFound, "unknown target", "not_found")
 			return
 		}
 
 		flusher, ok := w.(http.Flusher)
 		if !ok {
-			httpx.JSONError(w, http.StatusInternalServerError, "streaming unsupported")
+			httpx.JSONError(w, http.StatusInternalServerError, "streaming unsupported", "stream_unsupported")
 			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -521,7 +750,7 @@ func main() {
 		}
 	})
 
-	// proxy handler
+	// proxy handler (CRD-aware resolution)
 	proxyHandler := proxy.NewReverseProxy(proxy.Options{
 		MaxBody: 10 * 1024 * 1024,
 		Timeout: 10 * time.Second,
@@ -538,13 +767,34 @@ func main() {
 					return d.DialContext(ctx, network, address)
 				}
 			}
-			conn, err := ts.DialContext(ctx, tsServer, network, address)
-			if err != nil {
-				return nil, err
-			}
-			return conn, nil
+			return ts.DialContext(ctx, tsServer, network, address)
 		},
 		Logger: httpx.Logger(),
+		ResolveServer: func(ctx context.Context, serverID string, subPath string) (string, string, string, error) {
+			if dyn != nil {
+				gvr := schema.GroupVersionResource{Group: "guildnet.io", Version: "v1alpha1", Resource: "workspaces"}
+				if ws, err := dyn.Resource(gvr).Namespace(defaultNS).Get(ctx, serverID, metav1.GetOptions{}); err == nil {
+					if status, ok := ws.Object["status"].(map[string]any); ok {
+						if pt, ok := status["proxyTarget"].(string); ok && pt != "" {
+							if i := strings.Index(pt, "://"); i > 0 {
+								sch := pt[:i]
+								rest := pt[i+3:]
+								return sch, rest, subPath, nil
+							}
+						}
+					}
+				}
+			}
+			host, port, https, err := kcli.ResolveServiceAddress(ctx, defaultNS, serverID)
+			if err != nil {
+				return "", "", "", err
+			}
+			sch := "http"
+			if https {
+				sch = "https"
+			}
+			return sch, fmt.Sprintf("%s:%d", host, port), subPath, nil
+		},
 		APIProxy: func() (http.RoundTripper, func(req *http.Request, scheme, hostport, subPath string), bool) {
 			// Allow disabling API proxy (pods proxy) to validate WS directly via tsnet/ClusterIP.
 			if strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_DISABLE_API_PROXY")), "1") ||
@@ -701,91 +951,6 @@ func main() {
 				log.Printf("proxy director: no pod found for service=%s ns=%s; failing fast path=%s", name, defaultNS, req.URL.Path)
 			}
 			return rt, set, true
-		},
-		ResolveServer: func(ctx context.Context, serverID string, subPath string) (string, string, string, error) {
-			if host, port, isHTTPS, err := kcli.ResolveServiceAddress(ctx, defaultNS, serverID); err == nil && host != "" && port > 0 {
-				scheme := "http"
-				if isHTTPS {
-					scheme = "https"
-				}
-				log.Printf("resolve server: direct svc ip match id=%s target=%s:%d scheme=%s sub=%s", serverID, host, port, scheme, subPath)
-				return scheme, net.JoinHostPort(host, fmt.Sprintf("%d", port)), subPath, nil
-			}
-			srv, err := kcli.GetServer(ctx, defaultNS, serverID)
-			if err != nil {
-				log.Printf("resolve server: unknown server id=%s", serverID)
-				return "", "", "", fmt.Errorf("unknown server: %s", serverID)
-			}
-			if srv.Env != nil {
-				if v := strings.TrimSpace(srv.Env["AGENT_HOST"]); v != "" {
-					if strings.Contains(v, ":") {
-						_, sp, _ := strings.Cut(v, ":")
-						pp := 8080
-						fmt.Sscanf(sp, "%d", &pp)
-						scheme := map[int]string{8443: "https"}[pp]
-						if scheme == "" {
-							scheme = "http"
-						}
-						log.Printf("resolve server: env hostport=%s scheme=%s sub=%s id=%s", v, scheme, subPath, serverID)
-						return scheme, v, subPath, nil
-					}
-					p := 0
-					for _, pr := range srv.Ports {
-						if pr.Port == 8080 {
-							p = 8080
-							break
-						}
-					}
-					if p == 0 {
-						for _, pr := range srv.Ports {
-							if pr.Port == 8443 {
-								p = 8443
-								break
-							}
-						}
-					}
-					if p == 0 && len(srv.Ports) > 0 {
-						p = srv.Ports[0].Port
-					}
-					scheme := map[int]string{8443: "https"}[p]
-					if scheme == "" {
-						scheme = "http"
-					}
-					log.Printf("resolve server: env host=%s port=%d scheme=%s sub=%s id=%s", v, p, scheme, subPath, serverID)
-					return scheme, net.JoinHostPort(v, fmt.Sprintf("%d", p)), subPath, nil
-				}
-			}
-			host := strings.TrimSpace(srv.Node)
-			if host == "" && srv.Name != "" {
-				host = dns1123Name(srv.Name) + ".default.svc.cluster.local"
-			}
-			if host != "" {
-				p := 0
-				for _, pr := range srv.Ports {
-					if pr.Port == 8080 {
-						p = 8080
-						break
-					}
-				}
-				if p == 0 {
-					for _, pr := range srv.Ports {
-						if pr.Port == 8443 {
-							p = 8443
-							break
-						}
-					}
-				}
-				if p == 0 && len(srv.Ports) > 0 {
-					p = srv.Ports[0].Port
-				}
-				scheme := map[int]string{8443: "https"}[p]
-				if scheme == "" {
-					scheme = "http"
-				}
-				log.Printf("resolve server: fallback host=%s port=%d scheme=%s sub=%s id=%s", host, p, scheme, subPath, serverID)
-				return scheme, net.JoinHostPort(host, fmt.Sprintf("%d", p)), subPath, nil
-			}
-			return "", "", "", fmt.Errorf("no upstream hint; set Env.AGENT_HOST or ensure service exists and ports are populated")
 		},
 	})
 	// Lightweight debug endpoint to check routing without hitting upstream
