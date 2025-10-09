@@ -152,17 +152,9 @@ install_hint() {
   esac
 }
 
-NO_TAILSCALE=0
-for arg in "$@"; do
-  case "$arg" in
-    --no-tailscale) NO_TAILSCALE=1 ;;
-  esac
-done
-
 main() {
-  if [[ -z "$TS_AUTHKEY" && $NO_TAILSCALE -ne 1 ]]; then
+  if [[ -z "$TS_AUTHKEY" ]]; then
     err "TS_AUTHKEY is required (Tailscale/Headscale pre-auth key)."
-    err "Use --no-tailscale to skip subnet router deployment for local testing."
     err "Hint: create $ROOT/.env with values, e.g.:"
     err "  TS_LOGIN_SERVER=https://headscale.example.com"
     err "  TS_AUTHKEY=tskey-..."
@@ -217,9 +209,8 @@ main() {
     exit 1
   fi
 
-  if [[ $NO_TAILSCALE -ne 1 ]]; then
-    log "Applying Tailscale subnet router (routes=$TS_ROUTES, login=$TS_LOGIN_SERVER)"
-    kubectl -n kube-system apply -f - <<YAML
+  log "Applying Tailscale subnet router (routes=$TS_ROUTES, login=$TS_LOGIN_SERVER)"
+  kubectl -n kube-system apply -f - <<YAML
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -280,12 +271,9 @@ spec:
           type: CharDevice
 YAML
 
-    log "Waiting for Tailscale router to be ready"
-    kubectl -n kube-system rollout status ds/tailscale-subnet-router --timeout=120s || true
-    log "Talos cluster ready and (if auth succeeded) advertised to Tailscale."
-  else
-    log "Skipping Tailscale deployment (--no-tailscale)."
-  fi
+  log "Waiting for Tailscale router to be ready"
+  kubectl -n kube-system rollout status ds/tailscale-subnet-router --timeout=180s || true
+  log "Talos cluster ready and (if auth succeeded) advertised to Tailscale."
   log "Kubeconfig: \${KUBECONFIG:-\"~/.kube/config\"}; Namespace: $NAMESPACE; Cluster: $CLUSTER_NAME"
 }
 
