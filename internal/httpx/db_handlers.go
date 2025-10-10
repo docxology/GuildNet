@@ -100,6 +100,10 @@ func (a *DBAPI) handleDatabases(w http.ResponseWriter, r *http.Request) {
 			JSONError(w, http.StatusInternalServerError, "database create failed", "db_create_failed", err.Error())
 			return
 		}
+		// Auto-grant maintainer on the new DB to the creator principal (MVP convenience)
+		if a.RBAC != nil && strings.TrimSpace(principal) != "" {
+			a.RBAC.Grant(model.PermissionBinding{Principal: principal, Scope: "db:" + req.ID, Role: model.RoleMaintainer, CreatedAt: model.NowISO()})
+		}
 		JSON(w, http.StatusCreated, inst)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -189,7 +193,7 @@ func (a *DBAPI) handleDatabaseSubroutes(w http.ResponseWriter, r *http.Request) 
 		}
 		if r.Method == http.MethodPost {
 			principal := PrincipalFromRequest(r.Header.Get("X-Debug-Principal"))
-			if !Allow(a.RBAC.RoleFor(principal, "", dbID), "table.schema") {
+			if !Allow(a.roleFor(principal, "", dbID), "table.schema") {
 				JSONError(w, http.StatusForbidden, "permission denied", "forbidden")
 				return
 			}
@@ -207,7 +211,7 @@ func (a *DBAPI) handleDatabaseSubroutes(w http.ResponseWriter, r *http.Request) 
 		}
 		if r.Method == http.MethodDelete {
 			principal := PrincipalFromRequest(r.Header.Get("X-Debug-Principal"))
-			if !Allow(a.RBAC.RoleFor(principal, "", dbID), "table.schema") {
+			if !Allow(a.roleFor(principal, "", dbID), "table.schema") {
 				JSONError(w, http.StatusForbidden, "permission denied", "forbidden")
 				return
 			}
@@ -225,6 +229,15 @@ func (a *DBAPI) handleDatabaseSubroutes(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	w.WriteHeader(http.StatusNotFound)
+}
+
+// roleFor returns the role resolved by table->db->org fallback.
+func (a *DBAPI) roleFor(principal, tableID, dbID string) model.Role {
+	role := a.RBAC.RoleFor(principal, tableID, dbID)
+	if role == "" {
+		role = a.RBAC.RoleFor(principal, "", a.OrgID)
+	}
+	return role
 }
 
 func (a *DBAPI) handleTables(w http.ResponseWriter, r *http.Request, dbID string, rest []string) {
@@ -246,7 +259,7 @@ func (a *DBAPI) handleTables(w http.ResponseWriter, r *http.Request, dbID string
 			}
 			JSON(w, http.StatusOK, tbls)
 		case http.MethodPost:
-			if !Allow(a.RBAC.RoleFor(principal, "", dbID), "table.create") {
+			if !Allow(a.roleFor(principal, "", dbID), "table.create") {
 				JSONError(w, http.StatusForbidden, "permission denied", "forbidden")
 				return
 			}
@@ -288,7 +301,7 @@ func (a *DBAPI) handleTables(w http.ResponseWriter, r *http.Request, dbID string
 		}
 		if r.Method == http.MethodPatch {
 			principal := PrincipalFromRequest(r.Header.Get("X-Debug-Principal"))
-			if !Allow(a.RBAC.RoleFor(principal, tableName, dbID), "table.schema") {
+			if !Allow(a.roleFor(principal, tableName, dbID), "table.schema") {
 				JSONError(w, http.StatusForbidden, "permission denied", "forbidden")
 				return
 			}
@@ -310,7 +323,7 @@ func (a *DBAPI) handleTables(w http.ResponseWriter, r *http.Request, dbID string
 			return
 		}
 		if r.Method == http.MethodDelete {
-			if !Allow(a.RBAC.RoleFor(principal, tableName, dbID), "table.delete") {
+			if !Allow(a.roleFor(principal, tableName, dbID), "table.delete") {
 				JSONError(w, http.StatusForbidden, "permission denied", "forbidden")
 				return
 			}
@@ -333,7 +346,7 @@ func (a *DBAPI) handleTables(w http.ResponseWriter, r *http.Request, dbID string
 	// /import
 	if len(rest) >= 2 && rest[1] == "import" {
 		principal := PrincipalFromRequest(r.Header.Get("X-Debug-Principal"))
-		if !Allow(a.RBAC.RoleFor(principal, tableName, dbID), "row.write") {
+		if !Allow(a.roleFor(principal, tableName, dbID), "row.write") {
 			JSONError(w, http.StatusForbidden, "permission denied", "forbidden")
 			return
 		}
@@ -493,7 +506,7 @@ func (a *DBAPI) handleTables(w http.ResponseWriter, r *http.Request, dbID string
 	// /export
 	if len(rest) >= 2 && rest[1] == "export" {
 		principal := PrincipalFromRequest(r.Header.Get("X-Debug-Principal"))
-		role := a.RBAC.RoleFor(principal, tableName, dbID)
+		role := a.roleFor(principal, tableName, dbID)
 		if !Allow(role, "row.read") {
 			JSONError(w, http.StatusForbidden, "permission denied", "forbidden")
 			return
@@ -574,7 +587,7 @@ func (a *DBAPI) handleRows(w http.ResponseWriter, r *http.Request, dbID, table s
 	if len(rest) == 0 {
 		switch r.Method {
 		case http.MethodGet:
-			role := a.RBAC.RoleFor(principal, table, dbID)
+			role := a.roleFor(principal, table, dbID)
 			if !Allow(role, "row.read") {
 				JSONError(w, http.StatusForbidden, "permission denied", "forbidden")
 				return
@@ -600,7 +613,7 @@ func (a *DBAPI) handleRows(w http.ResponseWriter, r *http.Request, dbID, table s
 			}
 			JSON(w, http.StatusOK, model.QueryPage[map[string]any]{Items: masked, NextCursor: next})
 		case http.MethodPost:
-			if !Allow(a.RBAC.RoleFor(principal, table, dbID), "row.write") {
+			if !Allow(a.roleFor(principal, table, dbID), "row.write") {
 				JSONError(w, http.StatusForbidden, "permission denied", "forbidden")
 				return
 			}
@@ -644,7 +657,7 @@ func (a *DBAPI) handleRows(w http.ResponseWriter, r *http.Request, dbID, table s
 		return
 	}
 	if r.Method == http.MethodPatch {
-		if !Allow(a.RBAC.RoleFor(principal, table, dbID), "row.write") {
+		if !Allow(a.roleFor(principal, table, dbID), "row.write") {
 			JSONError(w, http.StatusForbidden, "permission denied", "forbidden")
 			return
 		}
@@ -663,7 +676,7 @@ func (a *DBAPI) handleRows(w http.ResponseWriter, r *http.Request, dbID, table s
 		return
 	}
 	if r.Method == http.MethodDelete {
-		if !Allow(a.RBAC.RoleFor(principal, table, dbID), "row.write") {
+		if !Allow(a.roleFor(principal, table, dbID), "row.write") {
 			JSONError(w, http.StatusForbidden, "permission denied", "forbidden")
 			return
 		}
