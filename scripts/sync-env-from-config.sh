@@ -7,7 +7,7 @@ OUT="$ROOT/.env"
 log(){ printf "%s | %s\n" "$(date -Iseconds)" "$*"; }
 
 if [ ! -f "$CFG" ]; then
-  echo "No config at $CFG; run scripts/dev-host-run.sh once or hostapp init." >&2
+  echo "No config at $CFG; run hostapp init." >&2
   exit 1
 fi
 

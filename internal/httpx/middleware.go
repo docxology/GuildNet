@@ -135,7 +135,8 @@ func (w *respWriter) ReadFrom(r io.Reader) (n int64, err error) {
 	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
 		return rf.ReadFrom(r)
 	}
-	return 0, nil
+	// Fallback to standard copy when underlying writer doesn't support ReaderFrom
+	return io.Copy(w.ResponseWriter, r)
 }
 
 // request id context key

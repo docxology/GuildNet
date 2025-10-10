@@ -29,30 +29,11 @@
       "group": "build"
     },
 
-    // Dev
+    // Run
     {
       "label": "Run backend (serve)",
       "type": "shell",
       "command": "make run",
-      "group": "build"
-    },
-    {
-      "label": "Dev: backend",
-      "type": "shell",
-      "command": "make dev-backend",
-      "group": "build"
-    },
-    {
-      "label": "Dev: UI (Vite)",
-      "type": "shell",
-      "command": "make dev-ui",
-      "group": "build",
-      "isBackground": true
-    },
-    {
-      "label": "Dev: all (backend + UI)",
-      "type": "shell",
-      "command": "make dev-all",
       "group": "build"
     },
 
@@ -95,12 +76,7 @@
       "command": "make tls-check-backend",
       "group": "test"
     },
-    {
-      "label": "TLS check: Dev UI (Vite 5173, proxied to 8080)",
-      "type": "shell",
-      "command": "make tls-check-ui",
-      "group": "test"
-    },
+    
     {
       "label": "Admin: stop all workloads",
       "type": "shell",

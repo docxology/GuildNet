@@ -2,17 +2,16 @@ BINARY := hostapp
 PKG := ./...
 
 # Defaults (override as needed)
-ORIGIN ?= https://localhost:5173
 LISTEN_LOCAL ?= 127.0.0.1:8080
-VITE_API_BASE ?= https://localhost:8080
 
 .PHONY: all help \
 	build build-backend build-ui \
-	run dev-backend dev-run dev-ui \
+	run \
 	test lint tidy clean setup ui-setup \
-	health tls-check-backend tls-check-ui regen-certs stop-all \
+	health tls-check-backend regen-certs stop-all \
 	talos-fresh talos-upgrade agent-build \
-	crd-apply operator-run operator-build db-health
+	crd-apply operator-run operator-build db-health \
+	rethink-deploy rethink-info
 rethink-deploy: ## Deploy RethinkDB (single replica) into current kube-context
 	kubectl apply -f k8s/rethinkdb.yaml
 	@echo "Waiting for RethinkDB Service external IP (if using LoadBalancer)..."
@@ -51,35 +50,26 @@ operator-build: ## Build operator manager binary (reuses hostapp for now if inte
 build-ui: ## Build UI (Vite)
 	cd ui && npm ci && npm run build
 
-# ---------- Run / Dev ----------
-run: build-backend ## Run compiled backend (serve)
-	./bin/$(BINARY) serve
-
-dev-all: ## Run backend and UI in dev mode (tsnet + Vite), CORS origin=$(ORIGIN)
-	$(MAKE) build-backend && $(MAKE) -j2 dev-backend dev-ui
-
-dev-backend: ## Run backend in dev mode (tsnet), CORS origin=$(ORIGIN)
-	LISTEN_LOCAL=$(LISTEN_LOCAL) ORIGIN=$(ORIGIN) $(MAKE) dev-run
-
-# Dev helper: builds, generates certs, sets CORS origin, runs with Tailscale (tsnet)
-# Usage examples:
-#   make dev-run                    # default ORIGIN=$(ORIGIN)
-#   make dev-backend ORIGIN=https://app.example.com RENEW_CERTS=1
-dev-run: ## Low-level dev runner (invokes scripts/dev-host-run.sh)
-	@set -e; \
-	ARGS=""; \
-	if [ -n "$(RENEW_CERTS)" = "1" ]; then ARGS="$$ARGS --no-certs"; fi; \
-	if [ -n "$(ORIGIN)" ]; then ARGS="$$ARGS --origin $(ORIGIN)"; fi; \
-	LISTEN_LOCAL=$(LISTEN_LOCAL) sh ./scripts/dev-host-run.sh $$ARGS
+# ---------- Run ----------
+run: build ## Build all (backend+UI) and run backend (serve)
+	# Best-effort: ensure RethinkDB exists in the current cluster before starting
+	-kubectl apply -f k8s/rethinkdb.yaml >/dev/null 2>&1 || true
+	# If local 28015 is not listening, attempt a kubectl port-forward to svc/rethinkdb
+	@if ! nc -z 127.0.0.1 28015 >/dev/null 2>&1; then \
+		if kubectl get svc rethinkdb >/dev/null 2>&1; then \
+			echo "Starting kubectl port-forward for RethinkDB (127.0.0.1:28015)"; \
+			(kubectl port-forward svc/rethinkdb 28015:28015 >/dev/null 2>&1 & echo $$! > .rethinkdb-pf.pid; sleep 1); \
+		else \
+			echo "Warning: RethinkDB service not found; DB API may be unavailable"; \
+		fi; \
+	fi
+	RETHINKDB_ADDR=127.0.0.1:28015 LISTEN_LOCAL=$(LISTEN_LOCAL) ./bin/$(BINARY) serve
 
 # ---------- DB / Health ----------
 db-health: ## Check database API and report availability
 	@echo "Checking backend health and DB API..."; \
 	(set -x; curl -sk https://127.0.0.1:8080/healthz); echo; \
 	(set -x; curl -sk https://127.0.0.1:8080/api/db) || true; echo
-
-dev-ui: ## Run UI (Vite) pointing at backend API ($(VITE_API_BASE))
-	cd ui && VITE_API_BASE=$(VITE_API_BASE) npm run dev
 
 # ---------- Quality ----------
 test: ## Run Go tests (race)
@@ -100,9 +90,6 @@ health: ## Check backend health endpoint
 
 tls-check-backend: ## Show TLS info for backend :8080
 	echo | openssl s_client -connect 127.0.0.1:8080 -servername localhost -tls1_2 2>/dev/null | head -n 20
-
-tls-check-ui: ## Show TLS info for Vite :5173
-	echo | openssl s_client -connect localhost:5173 -servername localhost -tls1_2 2>/dev/null | head -n 20
 
 stop-all: ## Stop all managed workloads via admin API
 	@curl -sk -X POST https://127.0.0.1:8080/api/admin/stop-all || curl -sk -X POST https://127.0.0.1:8080/api/stop-all || true

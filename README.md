@@ -38,23 +38,14 @@ Prereqs: Go, Node.js, Docker (for agent builds), and access to Tailscale/Headsca
 make setup
 ```
 
-2. Run the backend (dev, tsnet + CORS)
+2. Build and run (prod mode only)
 
 ```sh
-# Optional: override origin/listen address
-# ORIGIN=https://127.0.0.1:8080 LISTEN_LOCAL=127.0.0.1:8080 make dev-backend
-make dev-backend
+# Build backend + UI, deploy DB manifest (best-effort), then run hostapp
+make run
 ```
 
-3. Run the UI (Vite)
-
-```sh
-# Optional: override API base, defaults to https://localhost:8080
-# VITE_API_BASE=https://127.0.0.1:8080 make dev-ui
-make dev-ui
-```
-
-4. Verify
+3. Verify
 
 ```sh
 # Backend health (self-signed):
@@ -95,7 +86,7 @@ POST /api/jobs
 POST /api/admin/stop-all   (also /api/stop-all)
 GET  /sse/logs?target=&level=&tail=
 GET  /api/proxy-debug
-/*  (UI dev proxy -> Vite) in dev
+/  (static UI served from ui/dist if present; set UI_DEV_ORIGIN to proxy Vite explicitly)
 /proxy[...] (reverse proxy variants)
 ```
 
@@ -116,13 +107,13 @@ Preference order:
 
 Regenerate with SANs: `scripts/generate-server-cert.sh -H "localhost,127.0.0.1,<ts-hostname>,<ts-ip>" -f`.
 
-## Development Flags / Env
+## Runtime Env
 
 | Variable | Purpose |
 |----------|---------|
 | LISTEN_LOCAL | Local HTTPS bind address (e.g. 127.0.0.1:8080) |
-| FRONTEND_ORIGIN | CORS allowlist origin (default dev: https://127.0.0.1:8080) |
-| UI_DEV_ORIGIN | Vite dev origin (proxied at /) |
+| FRONTEND_ORIGIN | CORS allowlist origin (default: https://localhost:5173 for convenience) |
+| UI_DEV_ORIGIN | Optional Vite dev origin (proxied at / when set) |
 | HOSTAPP_DISABLE_API_PROXY | Dial services directly (ClusterIP) instead of API pod proxy |
 | WORKSPACE_DOMAIN | (Future) Ingress domain base (currently unused in CRD prototype) |
 

@@ -14,9 +14,9 @@ import (
 	"io"
 	"log"
 	"math/big"
+	"mime"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/signal"
@@ -242,6 +242,10 @@ func main() {
 
 	mux := http.NewServeMux()
 
+	// Ensure JS files are served with a broadly-compatible MIME type for module scripts
+	// Some embedded browsers are strict about application/javascript
+	_ = mime.AddExtensionType(".js", "application/javascript")
+
 	// Initialize RethinkDB (best-effort; feature is optional if DB not reachable)
 	var dbMgr *db.Manager
 	if mgr, derr := db.Connect(ctx); derr != nil {
@@ -312,42 +316,101 @@ func main() {
 		httpx.JSON(w, http.StatusOK, map[string]any{"name": cfg.Name})
 	})
 
-	// Same-origin dev UI: proxy Vite from :5173 at '/'.
-	// Keep API and proxy routes taking precedence by registering them before the catch-all.
-	// This simplifies cookies/CSP by using a single origin in dev.
-	{
-		uiOrigin := strings.TrimSpace(os.Getenv("UI_DEV_ORIGIN"))
-		if uiOrigin == "" {
-			uiOrigin = "https://localhost:5173"
+	// Simple non-module debug page to verify script execution in embedded browsers
+	mux.HandleFunc("/debug", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		io.WriteString(w, `<!doctype html>
+<html><head><meta charset="utf-8"><title>GuildNet Debug</title></head>
+<body>
+	<h1>GuildNet Debug</h1>
+	<div id="out">Loading…</div>
+	<script>
+		(function(){
+			var el = document.getElementById('out');
+			function log(msg){ try { el.textContent = msg } catch(e) {} }
+			log('Running inline script…');
+			fetch('/api/ui-config').then(function(r){ return r.json() }).then(function(j){
+				log('OK: '+JSON.stringify(j));
+				try { navigator.sendBeacon('/api/ui-error', new Blob([JSON.stringify({type:'debug',ok:true,time:new Date().toISOString()})],{type:'application/json'})); } catch(e) {}
+			}).catch(function(e){
+				log('Fetch failed: '+e);
+				try { navigator.sendBeacon('/api/ui-error', new Blob([JSON.stringify({type:'debug',ok:false,err:String(e),time:new Date().toISOString()})],{type:'application/json'})); } catch(_) {}
+			});
+		})();
+	</script>
+</body></html>`)
+	})
+
+	// Receive client-side UI error reports for diagnostics
+	mux.HandleFunc("/api/ui-error", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
 		}
-		u, err := url.Parse(uiOrigin)
-		if err == nil && u.Scheme != "" && u.Host != "" {
-			uiProxy := &httputil.ReverseProxy{
-				Director: func(req *http.Request) {
-					// Don't steal API or proxy routes
-					if strings.HasPrefix(req.URL.Path, "/api/") || strings.HasPrefix(req.URL.Path, "/proxy/") || req.URL.Path == "/healthz" {
-						return
+		b, _ := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		ua := r.Header.Get("User-Agent")
+		ct := r.Header.Get("Content-Type")
+		log.Printf("ui-error: ua=%q ct=%q body=%s", ua, ct, strings.TrimSpace(string(b)))
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	// UI handling: serve compiled UI from ui/dist with SPA fallback to index.html (no redirects)
+	{
+		dist := filepath.Join("ui", "dist")
+		indexPath := filepath.Join(dist, "index.html")
+		if fi, err := os.Stat(dist); err == nil && fi.IsDir() {
+			// Favicon: serve from dist if present, else 204 to avoid 404 noise
+			mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+				fav := filepath.Join(dist, "favicon.ico")
+				if fi, err := os.Stat(fav); err == nil && !fi.IsDir() {
+					http.ServeFile(w, r, fav)
+					return
+				}
+				w.WriteHeader(http.StatusNoContent)
+			})
+
+			mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				// Only handle UI paths here (API/proxy matched earlier)
+				// Normalize and prevent path traversal
+				path := r.URL.Path
+				if path == "" || path == "/" {
+					// Avoid caching HTML to ensure latest hashed asset URLs are used
+					w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+					http.ServeFile(w, r, indexPath)
+					return
+				}
+				// Clean the path and ensure it stays within dist
+				cleanPath := filepath.Clean(strings.TrimPrefix(path, "/"))
+				full := filepath.Join(dist, cleanPath)
+				// Security: ensure the full path is under dist
+				if !strings.HasPrefix(full, dist+string(os.PathSeparator)) && full != dist {
+					http.NotFound(w, r)
+					return
+				}
+				// If file exists and is not a directory, serve it
+				if fi, err := os.Stat(full); err == nil && !fi.IsDir() {
+					// Long cache for hashed assets
+					if strings.HasPrefix(cleanPath, "assets/") {
+						w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 					}
-					req.URL.Scheme = u.Scheme
-					req.URL.Host = u.Host
-					req.Host = u.Host
-					// map path as-is to Vite
-				},
-				Transport: &http.Transport{
-					Proxy:               http.ProxyFromEnvironment,
-					TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
-					ForceAttemptHTTP2:   true,
-					DisableKeepAlives:   false,
-					MaxIdleConns:        100,
-					IdleConnTimeout:     90 * time.Second,
-					TLSHandshakeTimeout: 10 * time.Second,
-				},
-			}
-			// Note: We do not special-case /api or /proxy here; net/http ServeMux will route
-			// those to longer, more specific patterns registered above. This handler only
-			// runs for paths that didn't match any earlier /api/* or /proxy/* handlers.
-			mux.HandleFunc("/", uiProxy.ServeHTTP)
-			log.Printf("dev UI proxied at / -> %s", uiOrigin)
+					http.ServeFile(w, r, full)
+					return
+				}
+				// SPA fallback only for non-asset paths (no dot in last segment)
+				base := filepath.Base(cleanPath)
+				if !strings.Contains(base, ".") {
+					w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+					http.ServeFile(w, r, indexPath)
+					return
+				}
+				// Otherwise, not found (avoid redirect loops)
+				http.NotFound(w, r)
+			})
+			log.Printf("serving static UI from %s", dist)
+		} else {
+			log.Printf("ui/dist directory not found; UI will return 404 at root")
 		}
 	}
 
