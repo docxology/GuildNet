@@ -316,46 +316,6 @@ func main() {
 		httpx.JSON(w, http.StatusOK, map[string]any{"name": cfg.Name})
 	})
 
-	// Simple non-module debug page to verify script execution in embedded browsers
-	mux.HandleFunc("/debug", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
-		io.WriteString(w, `<!doctype html>
-<html><head><meta charset="utf-8"><title>GuildNet Debug</title></head>
-<body>
-	<h1>GuildNet Debug</h1>
-	<div id="out">Loading…</div>
-	<script>
-		(function(){
-			var el = document.getElementById('out');
-			function log(msg){ try { el.textContent = msg } catch(e) {} }
-			log('Running inline script…');
-			fetch('/api/ui-config').then(function(r){ return r.json() }).then(function(j){
-				log('OK: '+JSON.stringify(j));
-				try { navigator.sendBeacon('/api/ui-error', new Blob([JSON.stringify({type:'debug',ok:true,time:new Date().toISOString()})],{type:'application/json'})); } catch(e) {}
-			}).catch(function(e){
-				log('Fetch failed: '+e);
-				try { navigator.sendBeacon('/api/ui-error', new Blob([JSON.stringify({type:'debug',ok:false,err:String(e),time:new Date().toISOString()})],{type:'application/json'})); } catch(_) {}
-			});
-		})();
-	</script>
-</body></html>`)
-	})
-
-	// Receive client-side UI error reports for diagnostics
-	mux.HandleFunc("/api/ui-error", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		b, _ := io.ReadAll(r.Body)
-		_ = r.Body.Close()
-		ua := r.Header.Get("User-Agent")
-		ct := r.Header.Get("Content-Type")
-		log.Printf("ui-error: ua=%q ct=%q body=%s", ua, ct, strings.TrimSpace(string(b)))
-		w.WriteHeader(http.StatusNoContent)
-	})
-
 	// UI handling: serve compiled UI from ui/dist with SPA fallback to index.html (no redirects)
 	{
 		dist := filepath.Join("ui", "dist")
