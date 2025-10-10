@@ -66,9 +66,14 @@ Run everything over an embedded tsnet overlay without installing Tailscale on th
 	- `TS_AUTHKEY=<preauth-key>`
 	- `TS_HOSTNAME=<your-hostname>`
 	- `TS_ROUTES=10.0.0.0/24,10.96.0.0/12,10.244.0.0/16`
-3. Build and run the subnet router near Talos:
-	- `make tsnet-subnet-router`
-	- `make run-subnet-router`
+3. Choose a route propagation method (one is enough):
+	 - Option A (recommended to bootstrap): Host subnet router on a LAN machine with native Tailscale
+		 - `make router-install` (one-time)
+		 - `make router-up` (advertises TS_ROUTES, includes 10.0.0.0/24 by default)
+		 - `make router-status` (verify it’s up)
+	 - Option B (containerized or in-cluster):
+		 - Local helper: `make tsnet-subnet-router` then `make run-subnet-router` on a machine that can reach 10.0.0.0/24
+		 - Or deploy the DaemonSet snippet from `scripts/talos-vm-up.sh` into Kubernetes later
 4. Start the hostapp: `make run` and open `https://127.0.0.1:8080`.
 5. Agents register via `/api/v1/agents/register` and can be resolved with `/api/v1/resolve?id=...`.
 

@@ -12,19 +12,20 @@ import (
 
 // Options holds tsnet server init configuration.
 type Options struct {
-	StateDir  string
-	Hostname  string
-	LoginURL  string
-	AuthKey   string
+	StateDir string
+	Hostname string
+	LoginURL string
+	AuthKey  string
 }
 
 // StartServer initializes and starts a tsnet.Server.
 func StartServer(ctx context.Context, opts Options) (*tsnet.Server, error) {
 	s := &tsnet.Server{
-		Dir:       opts.StateDir,
-		Hostname:  opts.Hostname,
-		AuthKey:   opts.AuthKey,
-	ControlURL:  opts.LoginURL,
+		Dir:      opts.StateDir,
+		Hostname: opts.Hostname,
+		AuthKey:  opts.AuthKey,
+		// ControlURL was renamed from LoginServer in older tailscale versions; current API uses ControlURL
+		ControlURL: opts.LoginURL,
 	}
 	if err := s.Start(); err != nil {
 		return nil, fmt.Errorf("tsnet start: %w", err)
@@ -52,7 +53,9 @@ type InfoResult struct {
 
 func Info(ctx context.Context, s *tsnet.Server) (*InfoResult, error) {
 	lc, err := s.LocalClient()
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	// Wait until we have an IP or timeout
 	deadline := time.Now().Add(30 * time.Second)
 	var ipStr, fqdn string
@@ -69,7 +72,9 @@ func Info(ctx context.Context, s *tsnet.Server) (*InfoResult, error) {
 				break
 			}
 		}
-		if time.Now().After(deadline) { break }
+		if time.Now().After(deadline) {
+			break
+		}
 		time.Sleep(200 * time.Millisecond)
 	}
 	return &InfoResult{IP: ipStr, FQDN: fqdn}, nil

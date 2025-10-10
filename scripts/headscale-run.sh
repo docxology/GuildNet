@@ -33,6 +33,28 @@ CONFIG="$CONF_DIR/config.yaml"
 IMAGE=${HEADSCALE_IMAGE:-"ghcr.io/juanfont/headscale:0.22.3"}
 CONTAINER=${HEADSCALE_CONTAINER_NAME:-"guildnet-headscale"}
 
+# Choose host bind address and port (auto-detect LAN IP; auto-bump port if busy when not explicitly set)
+detect_lan_ip() {
+  case "$(uname -s)" in
+    Darwin)
+      # Find default route interface, then its IPv4 address
+      local ifc
+      ifc=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}' | head -n1)
+      if [ -n "$ifc" ]; then ipconfig getifaddr "$ifc" 2>/dev/null || true; fi
+      ;;
+    Linux)
+      ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}' | head -n1
+      ;;
+  esac
+}
+
+BIND_HOST=${HEADSCALE_BIND_HOST:-}
+if [ -z "$BIND_HOST" ]; then
+  BIND_HOST=$(detect_lan_ip || true)
+  # Fallback to 0.0.0.0 if detection fails
+  if [ -z "$BIND_HOST" ]; then BIND_HOST=0.0.0.0; fi
+fi
+
 # Choose host port (auto-bump if busy when not explicitly set)
 DEFAULT_PORT=8081
 if [ -n "${HEADSCALE_PORT:-}" ]; then
@@ -41,9 +63,10 @@ else
   HOST_PORT="$DEFAULT_PORT"
   is_busy() {
     if command -v lsof >/dev/null 2>&1; then
+      # Check on both 0.0.0.0 and specific bind host to be safe
       lsof -nP -iTCP:"$1" -sTCP:LISTEN -t >/dev/null 2>&1
     else
-      nc -z 127.0.0.1 "$1" >/dev/null 2>&1
+      nc -z 127.0.0.1 "$1" >/dev/null 2>&1 || nc -z "$BIND_HOST" "$1" >/dev/null 2>&1
     fi
   }
   tries=0; max=20
@@ -58,7 +81,7 @@ fi
 if [ -n "${HEADSCALE_SERVER_URL:-}" ]; then
   SERVER_URL="$HEADSCALE_SERVER_URL"
 else
-  SERVER_URL="http://127.0.0.1:${HOST_PORT}"
+  SERVER_URL="http://${BIND_HOST}:${HOST_PORT}"
 fi
 
 mkdir -p "$CONF_DIR" "$DATA_DIR"
@@ -119,27 +142,39 @@ up() {
     else
       echo "[headscale] Recreating container $CONTAINER with current config."
       docker rm -f "$CONTAINER" >/dev/null || true
-      echo "[headscale] Starting container $CONTAINER on 127.0.0.1:${HOST_PORT}"
+      echo "[headscale] Starting container $CONTAINER on ${BIND_HOST}:${HOST_PORT}"
       docker run -d \
         --name "$CONTAINER" \
         --restart unless-stopped \
-        -p 127.0.0.1:${HOST_PORT}:8080 \
+        -p ${BIND_HOST}:${HOST_PORT}:8080 \
         -v "$DATA_DIR:/var/lib/headscale" \
         -v "$CONF_DIR:/etc/headscale:ro" \
         "$IMAGE" headscale serve >/dev/null
     fi
   else
-    echo "[headscale] Starting container $CONTAINER on 127.0.0.1:${HOST_PORT}"
+    echo "[headscale] Starting container $CONTAINER on ${BIND_HOST}:${HOST_PORT}"
     docker run -d \
       --name "$CONTAINER" \
       --restart unless-stopped \
-      -p 127.0.0.1:${HOST_PORT}:8080 \
+      -p ${BIND_HOST}:${HOST_PORT}:8080 \
       -v "$DATA_DIR:/var/lib/headscale" \
       -v "$CONF_DIR:/etc/headscale:ro" \
       "$IMAGE" headscale serve >/dev/null
   fi
+  # Determine the actual mapped host:port for 8080/tcp
+  MAPPED_HOST=$(docker inspect -f '{{ (index (index .NetworkSettings.Ports "8080/tcp") 0).HostIp }}' "$CONTAINER" 2>/dev/null || echo "")
+  MAPPED_PORT=$(docker inspect -f '{{ (index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort }}' "$CONTAINER" 2>/dev/null || echo "")
+  if [ -n "$MAPPED_PORT" ]; then
+    # If Docker binds to 0.0.0.0, prefer the detected LAN IP for a usable URL
+    if [ "$MAPPED_HOST" = "0.0.0.0" ] || [ -z "$MAPPED_HOST" ]; then
+      MAPPED_HOST=$(detect_lan_ip || echo 127.0.0.1)
+    fi
+    SERVER_URL="http://${MAPPED_HOST}:${MAPPED_PORT}"
+  fi
   echo "[headscale] Server URL: ${SERVER_URL}"
   echo "[headscale] Data dir:  $STATE_DIR"
+  # Persist the chosen URL for other scripts to consume
+  printf "%s" "$SERVER_URL" > "$STATE_DIR/server_url"
 }
 
 down() {
@@ -154,6 +189,14 @@ down() {
 status() {
   if docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep -q "^${CONTAINER}\b"; then
     docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | (head -n1; grep "^${CONTAINER}\b")
+    MAPPED_HOST=$(docker inspect -f '{{ (index (index .NetworkSettings.Ports "8080/tcp") 0).HostIp }}' "$CONTAINER" 2>/dev/null || echo "")
+    MAPPED_PORT=$(docker inspect -f '{{ (index (index .NetworkSettings.Ports "8080/tcp") 0).HostPort }}' "$CONTAINER" 2>/dev/null || echo "")
+    if [ -n "$MAPPED_PORT" ]; then
+      if [ "$MAPPED_HOST" = "0.0.0.0" ] || [ -z "$MAPPED_HOST" ]; then
+        MAPPED_HOST=$(detect_lan_ip || echo 127.0.0.1)
+      fi
+      echo "[headscale] Effective URL: http://${MAPPED_HOST}:${MAPPED_PORT}"
+    fi
   else
     echo "[headscale] Not running. Use: $0 up"
   fi

@@ -89,6 +89,46 @@ operator-run: ## Run workspace operator (controller-runtime manager) locally
 agent-build: ## Build agent image (see scripts)
 	sh ./scripts/agent-build-load.sh
 
+# ---------- Host subnet router (Option A) ----------
+.PHONY: router-install router-up router-down router-status
+
+router-install: ## Install native tailscale client (host subnet router)
+	bash ./scripts/tailscale-router.sh install
+
+router-up: ## Bring up host subnet router (advertise TS_ROUTES)
+	bash ./scripts/tailscale-router.sh up
+
+router-down: ## Bring down host subnet router
+	bash ./scripts/tailscale-router.sh down
+
+router-status: ## Show tailscale router status
+	bash ./scripts/tailscale-router.sh status
+
+# ---------- Local Headscale (LAN bind) ----------
+.PHONY: headscale-up headscale-down headscale-status env-sync-lan headscale-bootstrap local-overlay-up
+
+headscale-up: ## Start Headscale bound to LAN IP (auto-detected)
+	bash ./scripts/headscale-run.sh up
+
+headscale-down: ## Stop & remove Headscale container
+	bash ./scripts/headscale-run.sh down
+
+headscale-status: ## Show Headscale container status
+	bash ./scripts/headscale-run.sh status
+
+headscale-bootstrap: ## Create Headscale user+preauth key and sync TS_AUTHKEY in .env
+	bash ./scripts/headscale-bootstrap.sh
+
+env-sync-lan: ## Rewrite TS_LOGIN_SERVER in .env to use LAN IP if it is 127.0.0.1
+	bash ./scripts/detect-lan-and-sync-env.sh
+
+local-overlay-up: ## Bring up local Headscale on LAN + router; prepares a working local overlay
+	$(MAKE) headscale-up
+	$(MAKE) env-sync-lan
+	$(MAKE) headscale-bootstrap
+	$(MAKE) router-install
+	$(MAKE) router-up
+
 # ---------- Talos helpers ----------
 # Examples:
 #   make talos-fresh FRESH_ARGS="--cluster myc --endpoint https://10.0.0.10:6443 --cp 10.0.0.10 --workers 10.0.0.20"
@@ -101,10 +141,22 @@ talos-upgrade: ## Talos cluster in-place upgrade
 	bash ./scripts/talos-upgrade-inplace.sh $(UPGRADE_ARGS)
 
 # ---------- tsnet subnet router ----------
-.PHONY: tsnet-subnet-router run-subnet-router
+.PHONY: tsnet-subnet-router run-subnet-router tsnet-router-up tsnet-router-down tsnet-router-status tsnet-router-logs
 
 tsnet-subnet-router: ## Build tsnet subnet router binary
 	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/tsnet-subnet-router ./cmd/tsnet-subnet-router
 
 run-subnet-router: tsnet-subnet-router ## Run tsnet subnet router with .env
-	TS_LOGIN_SERVER=${TS_LOGIN_SERVER} TS_AUTHKEY=${TS_AUTHKEY} TS_HOSTNAME=${TS_HOSTNAME}-router TS_ROUTES=${TS_ROUTES} ./bin/tsnet-subnet-router
+	/bin/bash -lc 'set -a; [ -f ./.env ] && . ./.env; TS_HOSTNAME="${TS_HOSTNAME:-host-app}-router" ./bin/tsnet-subnet-router'
+
+tsnet-router-up: tsnet-subnet-router ## Start tsnet subnet router in background
+	bash ./scripts/tsnet-router.sh up
+
+tsnet-router-down: ## Stop tsnet subnet router
+	bash ./scripts/tsnet-router.sh down
+
+tsnet-router-status: ## Show tsnet subnet router status and recent logs
+	bash ./scripts/tsnet-router.sh status
+
+tsnet-router-logs: ## Tail tsnet subnet router logs
+	bash ./scripts/tsnet-router.sh logs

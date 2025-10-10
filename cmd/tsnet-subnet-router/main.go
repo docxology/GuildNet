@@ -17,6 +17,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Force tsnet to use auth key when provided (avoid interactive URL)
+	_ = os.Setenv("TSNET_FORCE_LOGIN", "1")
+
 	login := os.Getenv("TS_LOGIN_SERVER")
 	auth := os.Getenv("TS_AUTHKEY")
 	host := os.Getenv("TS_HOSTNAME")
@@ -42,22 +45,19 @@ func main() {
 		log.Fatalf("local client: %v", err)
 	}
 
-	// Best-effort: advertise routes via LocalClient prefs (tsnet respects tailscaled state)
-	// Many tsnet deployments rely on env TS_ROUTES; keep both to be robust.
-	if routes != "" {
+	// Rely on TS_ROUTES env var for advertising subnets. tsnet honors tailscaled state and env.
+	if strings.TrimSpace(routes) != "" {
 		rs := strings.Split(routes, ",")
-		log.Printf("advertising subnet routes: %s", strings.Join(rs, ", "))
-		// There isn't a direct public API on tsnet to set routes; we keep the process alive so tailscaled state honors TS_ROUTES.
-		// Long-running process with periodic status log for visibility.
+		log.Printf("advertising subnet routes (via env): %s", strings.Join(rs, ", "))
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(30 * time.Second):
+		case <-time.After(15 * time.Second):
 			if info, err := ts.Info(ctx, srv); err == nil {
-				log.Printf("tsnet up: ip=%s fqdn=%s", info.IP, info.FQDN)
+				log.Printf("tsnet up: ip=%s fqdn=%s routes=%s", info.IP, info.FQDN, routes)
 			}
 		}
 	}

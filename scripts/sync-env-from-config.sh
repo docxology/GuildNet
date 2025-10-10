@@ -20,13 +20,16 @@ if [ -z "$login" ] || [ -z "$auth" ] || [ -z "$host" ]; then
   exit 1
 fi
 
+router_host=$(printf "%s" "$host" | sed 's/$/-router/')
+
 cat > "$OUT" <<ENV
 # Shared Tailscale/Headscale config for GuildNet
 TS_LOGIN_SERVER=${login}
 TS_AUTHKEY=${auth}
 TS_HOSTNAME=${host}
+ROUTER_HOSTNAME=${ROUTER_HOSTNAME:-$router_host}
 # Default routes for Talos cluster and services
-TS_ROUTES=${TS_ROUTES:-10.96.0.0/12,10.244.0.0/16}
+TS_ROUTES=${TS_ROUTES:-10.0.0.0/24,10.96.0.0/12,10.244.0.0/16}
 # Optional Headscale aliases
 HEADSCALE_URL=${HEADSCALE_URL:-}
 HEADSCALE_AUTHKEY=${HEADSCALE_AUTHKEY:-}

@@ -217,9 +217,11 @@ What this means:
   that advertises the route 10.0.0.0/24 to your Headscale/Tailscale control plane.
 
 How to fix:
-1) On any machine that can reach 10.0.0.10/20 directly, run a Tailscale/Headscale client and advertise routes:
-   tailscale up --login-server=$TS_LOGIN_SERVER --authkey=... --advertise-routes=10.0.0.0/24 --accept-routes
-   -or- build & run our helper: make tsnet-subnet-router && make run-subnet-router (must run on that LAN host)
+1) Recommended: on a machine that can reach 10.0.0.10/20 directly, bring up the host subnet router:
+  make router-install   # one-time
+  make router-up        # advertises 10.0.0.0/24, uses TS_* from .env
+  make router-status    # verify it’s up
+  -or- build & run the containerized helper: make tsnet-subnet-router && make run-subnet-router (must run on that LAN host)
 2) Re-run this script. The [1.5/7] check should pass before proceeding.
 MSG
   exit 1
