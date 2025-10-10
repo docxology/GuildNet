@@ -56,6 +56,40 @@ open https://127.0.0.1:8080
 
 Tip: `make help` lists all common targets (build, test, lint, CRD apply, utilities).
 
+## Scripts and Makefile responsibilities (spec)
+
+Core setup scripts (one per component):
+- `scripts/setup-headscale.sh`
+  - Start/ensure Headscale (Docker) is running.
+  - Detect LAN bind and sync `.env` (TS_LOGIN_SERVER, HEADSCALE_URL).
+  - Bootstrap a user and reusable preauth key; write TS_AUTHKEY into `.env`.
+- `scripts/setup-tailscale.sh`
+  - Ensure IP forwarding (invokes `scripts/enable-ip-forwarding.sh`, may prompt once for sudo).
+  - Install Tailscale client if missing; bring up router advertising `TS_ROUTES`.
+  - Approve advertised routes in Headscale (best effort).
+- `scripts/setup-talos.sh`
+  - Run Talos fresh deploy via `scripts/talos-fresh-deploy.sh` using `.env`.
+  - Fetch kubeconfig via talosctl and validate nodes/pods readiness.
+
+Support/verification scripts:
+- `scripts/enable-ip-forwarding.sh` – idempotent forwarding enable (sudo).
+- `scripts/detect-lan-and-sync-env.sh` – sync `.env` URLs to reachable LAN URL.
+- `scripts/rethinkdb-setup.sh` – optional DB service deployment/validation.
+- `scripts/verify_cluster.sh` – extra k8s readiness checks (future).
+
+Make targets:
+- `make setup-headscale` – runs Headscale setup.
+- `make setup-tailscale` – runs Tailscale router setup.
+- `make setup-talos` – runs Talos setup.
+- `make setup-all` – runs all three in order.
+
+Operational tasks:
+- Join a device to Headscale/Tailscale: use the preauth key in `.env` (TS_AUTHKEY) on the device; subnet router uses `scripts/tailscale-router.sh` via `make router-up`.
+- Tear down:
+  - `make headscale-down` to stop/remove container.
+  - `make router-down` to bring down router.
+  - `make clean` to remove build artifacts; `scripts/cleanup.sh --all` to purge local state.
+
 ## No-DNS overlay (tsnet) quickstart
 
 Run everything over an embedded tsnet overlay without installing Tailscale on the host or using MagicDNS.

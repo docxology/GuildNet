@@ -38,16 +38,10 @@ install() {
   case "$(uname -s)" in
     Darwin)
       if ! need brew; then err "Homebrew is required to install tailscale on macOS. https://brew.sh"; exit 1; fi
-      brew install tailscale ;; 
+      brew install tailscale ;;
     Linux)
-      # Try apt first, else use official script
-      if command -v apt-get >/dev/null 2>&1; then
-        curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-        curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
-        sudo apt-get update -y && sudo apt-get install -y tailscale
-      else
-        curl -fsSL https://tailscale.com/install.sh | sh
-      fi ;;
+      # Use official cross-distro install script for reliability
+      curl -fsSL https://tailscale.com/install.sh | sh ;;
     *) err "Unsupported OS: $(uname -s)"; exit 1 ;;
   esac
 }

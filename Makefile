@@ -10,7 +10,8 @@ LISTEN_LOCAL ?= 127.0.0.1:8080
 	test lint tidy clean setup ui-setup \
 	health tls-check-backend regen-certs stop-all \
 	talos-fresh talos-upgrade agent-build \
-	crd-apply operator-run operator-build db-health
+	crd-apply operator-run operator-build db-health \
+	setup-headscale setup-tailscale setup-talos setup-all
 
 
 
@@ -28,6 +29,20 @@ ui-setup: ## Install UI dependencies (npm ci)
 
 regen-certs: ## Regenerate local server TLS certificate
 	./scripts/generate-server-cert.sh -f
+
+setup-headscale: ## Setup Headscale (Docker) and bootstrap preauth
+	bash ./scripts/setup-headscale.sh
+
+setup-tailscale: ## Setup Tailscale router (enable forwarding, up, approve routes)
+	bash ./scripts/setup-tailscale.sh
+
+setup-talos: ## Fresh deploy Talos and validate
+	bash ./scripts/setup-talos.sh
+
+setup-all: ## Run Headscale, Tailscale, and Talos setup in order
+	$(MAKE) setup-headscale
+	$(MAKE) setup-tailscale
+	$(MAKE) setup-talos
 
 # ---------- Build ----------
 build: build-backend build-ui ## Build backend and UI
@@ -89,7 +104,7 @@ operator-run: ## Run workspace operator (controller-runtime manager) locally
 agent-build: ## Build agent image (see scripts)
 	sh ./scripts/agent-build-load.sh
 
-# ---------- Host subnet router (Option A) ----------
+# ---------- Host subnet router (native tailscale) ----------
 .PHONY: router-install router-up router-down router-status
 
 router-install: ## Install native tailscale client (host subnet router)
@@ -135,28 +150,20 @@ local-overlay-up: ## Bring up local Headscale on LAN + router; prepares a workin
 #   make talos-upgrade UPGRADE_ARGS="--image ghcr.io/siderolabs/installer:v1.7.0 --nodes 10.0.0.10,10.0.0.20 --k8s v1.30.2"
 
 talos-fresh: ## Talos cluster fresh deploy
-	bash ./scripts/talos-fresh-deploy.sh $(FRESH_ARGS)
+	bash ./scripts/setup-talos.sh $(FRESH_ARGS)
 
 talos-upgrade: ## Talos cluster in-place upgrade
 	bash ./scripts/talos-upgrade-inplace.sh $(UPGRADE_ARGS)
 
-# ---------- tsnet subnet router ----------
-.PHONY: tsnet-subnet-router run-subnet-router tsnet-router-up tsnet-router-down tsnet-router-status tsnet-router-logs
+.PHONY: setup-talos-preflight setup-talos-config setup-talos-apply setup-talos-wait-kube
+setup-talos-preflight: ## Talos preflight checks (reachability + overlay)
+	bash ./scripts/setup-talos-preflight.sh
 
-tsnet-subnet-router: ## Build tsnet subnet router binary
-	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/tsnet-subnet-router ./cmd/tsnet-subnet-router
+setup-talos-config: ## Talos config generation
+	bash ./scripts/setup-talos-config.sh
 
-run-subnet-router: tsnet-subnet-router ## Run tsnet subnet router with .env
-	/bin/bash -lc 'set -a; [ -f ./.env ] && . ./.env; TS_HOSTNAME="${TS_HOSTNAME:-host-app}-router" ./bin/tsnet-subnet-router'
+setup-talos-apply: ## Talos reset/apply/bootstrap
+	bash ./scripts/setup-talos-apply.sh
 
-tsnet-router-up: tsnet-subnet-router ## Start tsnet subnet router in background
-	bash ./scripts/tsnet-router.sh up
-
-tsnet-router-down: ## Stop tsnet subnet router
-	bash ./scripts/tsnet-router.sh down
-
-tsnet-router-status: ## Show tsnet subnet router status and recent logs
-	bash ./scripts/tsnet-router.sh status
-
-tsnet-router-logs: ## Tail tsnet subnet router logs
-	bash ./scripts/tsnet-router.sh logs
+setup-talos-wait-kube: ## Wait for Kubernetes and fetch kubeconfig
+	bash ./scripts/setup-talos-wait-kube.sh
