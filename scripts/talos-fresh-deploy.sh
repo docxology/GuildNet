@@ -34,6 +34,9 @@ CLUSTER="${CLUSTER:-mycluster}"
 ENDPOINT="${ENDPOINT:-}"
 CP_NODES="${CP_NODES:-}"
 WK_NODES="${WK_NODES:-}"
+# Optional: real node IPs (without ports) to use for talosctl --nodes when CP/WK_NODES are host:port forwards
+CP_NODES_REAL="${CP_NODES_REAL:-}"
+WK_NODES_REAL="${WK_NODES_REAL:-}"
 OUT_DIR="./talos"
 FORCE=0
 declare -a WK_ARR=()
@@ -82,6 +85,34 @@ need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; };
 need talosctl
 need kubectl
 
+# helpers
+parse_host_port() { # input -> host port
+  local in="$1"
+  if [[ "$in" == *:* ]]; then
+    printf '%s %s' "${in%%:*}" "${in##*:}"
+  else
+    printf '%s %s' "$in" "$PRECHECK_PORT"
+  fi
+}
+
+real_ip_for() { # forward_host forward_port idx kind
+  local fhost="$1" fport="$2" idx="$3" kind="$4" # kind=cp|wk
+  local -a real_list=()
+  local IFS=','
+  if [[ "$kind" == "cp" && -n "$CP_NODES_REAL" ]]; then real_list=( $CP_NODES_REAL ); fi
+  if [[ "$kind" == "wk" && -n "$WK_NODES_REAL" ]]; then real_list=( $WK_NODES_REAL ); fi
+  if [[ ${#real_list[@]} -gt 0 ]]; then
+    echo "${real_list[$idx]}"; return 0
+  fi
+  # heuristic fallback: map common forwarded ports to 10.0.0.x
+  case "$fport" in
+    50010) echo "10.0.0.10"; return 0 ;;
+    50020) echo "10.0.0.20"; return 0 ;;
+  esac
+  # last resort: if input looked like host:port, strip port
+  echo "$fhost"
+}
+
 # Preflight: basic TCP reachability test for Talos API on nodes
 check_tcp() { # host port timeout_seconds
   local h="$1" p="$2" t="${3:-3}"
@@ -96,14 +127,6 @@ check_tcp() { # host port timeout_seconds
 # If nodes appear unreachable, fail fast with guidance and optional local fallback when AUTO_LOCAL=1
 echo "[0/7] Preflight: checking node reachability on TCP :$PRECHECK_PORT"
 UNREACH=0
-parse_host_port() { # input -> host port
-  local in="$1"
-  if [[ "$in" == *:* ]]; then
-    printf '%s %s' "${in%%:*}" "${in##*:}"
-  else
-    printf '%s %s' "$in" "$PRECHECK_PORT"
-  fi
-}
 
 if [[ -n "$CP_NODES" ]]; then
   IFS=',' read -r -a CP_ARR <<< "$CP_NODES"
@@ -171,6 +194,37 @@ else
   WK_ARR=()
 fi
 
+# End-to-end overlay check: verify Talos maintenance API is reachable through the forwarder
+echo "[1.5/7] Verifying Talos maintenance API via forwarder (talosctl version)..."
+overlay_ok=1
+for i in "${!CP_ARR[@]}"; do
+  fwd="${CP_ARR[$i]}"; read -r host port <<< "$(parse_host_port "$fwd")"; real="$(real_ip_for "$host" "$port" "$i" cp)"
+  echo "  checking control-plane node=$real via $host:$port"
+  if ! talosctl version -e "$host:$port" -n "$real" -i --short >/dev/null 2>&1; then
+    echo "    ERROR: talosctl couldn't reach $real via $host:$port (overlay route likely missing)"
+    overlay_ok=0
+  else
+    echo "    OK: talosctl maintenance API reachable"
+  fi
+done
+if [[ $overlay_ok -ne 1 ]]; then
+  cat >&2 <<'MSG'
+FATAL: Unable to reach Talos maintenance API through the tsnet forwarder.
+
+What this means:
+- Your local forwarder is listening on localhost, but it can't dial 10.0.0.0/24 over the tailnet.
+- You need a subnet router inside the 10.0.0.0/24 network (or on a host with L2/L3 reachability to the nodes)
+  that advertises the route 10.0.0.0/24 to your Headscale/Tailscale control plane.
+
+How to fix:
+1) On any machine that can reach 10.0.0.10/20 directly, run a Tailscale/Headscale client and advertise routes:
+   tailscale up --login-server=$TS_LOGIN_SERVER --authkey=... --advertise-routes=10.0.0.0/24 --accept-routes
+   -or- build & run our helper: make tsnet-subnet-router && make run-subnet-router (must run on that LAN host)
+2) Re-run this script. The [1.5/7] check should pass before proceeding.
+MSG
+  exit 1
+fi
+
 mkdir -p "$OUT_DIR"
 
 echo "[1/7] Generating cluster config..."
@@ -186,22 +240,27 @@ else
 fi
 
 echo "[2/7] Resetting any existing nodes (if reachable)..."
-for n in "${CP_ARR[@]}"; do
-  echo "  resetting control-plane $n"
-  talosctl reset --nodes "$n" --reboot --graceful=false || true
+# reset per-node using forwarded endpoint and real node IP
+for i in "${!CP_ARR[@]}"; do
+  fwd="${CP_ARR[$i]}"; read -r host port <<< "$(parse_host_port "$fwd")"
+  real="$(real_ip_for "$host" "$port" "$i" cp)"
+  echo "  resetting control-plane (node=$real via $host:$port)"
+  talosctl reset --endpoints "$host:$port" --nodes "$real" --reboot --graceful=false || true
 done
 if [[ ${#WK_ARR[@]} -gt 0 ]]; then
-  for n in "${WK_ARR[@]}"; do
-    echo "  resetting worker $n"
-    talosctl reset --nodes "$n" --reboot --graceful=false || true
+  for i in "${!WK_ARR[@]}"; do
+    fwd="${WK_ARR[$i]}"; read -r host port <<< "$(parse_host_port "$fwd")"
+    real="$(real_ip_for "$host" "$port" "$i" wk)"
+    echo "  resetting worker (node=$real via $host:$port)"
+    talosctl reset --endpoints "$host:$port" --nodes "$real" --reboot --graceful=false || true
   done
 fi
 
 echo "[3/7] Waiting for nodes to become reachable (post-reset) ..."
 wait_node() {
-  local node=$1; local tries=60; local delay=5
+  local endpoint=$1; local node=$2; local tries=60; local delay=5
   while (( tries > 0 )); do
-    if talosctl version --nodes "$node" >/dev/null 2>&1; then
+    if talosctl version --endpoints "$endpoint" --nodes "$node" >/dev/null 2>&1; then
       echo "    node $node is reachable"
       return 0
     fi
@@ -211,19 +270,20 @@ wait_node() {
   echo "WARNING: node $node not reachable after wait" >&2
   return 1
 }
-for n in "${CP_ARR[@]}"; do wait_node "$n" || true; done
+for i in "${!CP_ARR[@]}"; do fwd="${CP_ARR[$i]}"; read -r host port <<< "$(parse_host_port "$fwd")"; real="$(real_ip_for "$host" "$port" "$i" cp)"; wait_node "$host:$port" "$real" || true; done
 if [[ ${#WK_ARR[@]} -gt 0 ]]; then
-  for n in "${WK_ARR[@]}"; do wait_node "$n" || true; done
+  for i in "${!WK_ARR[@]}"; do fwd="${WK_ARR[$i]}"; read -r host port <<< "$(parse_host_port "$fwd")"; real="$(real_ip_for "$host" "$port" "$i" wk)"; wait_node "$host:$port" "$real" || true; done
 fi
 
 echo "[4/7] Applying control-plane configs..."
-for n in "${CP_ARR[@]}"; do
-  echo "  apply config to control-plane $n"
+for i in "${!CP_ARR[@]}"; do
+  fwd="${CP_ARR[$i]}"; read -r host port <<< "$(parse_host_port "$fwd")"; real="$(real_ip_for "$host" "$port" "$i" cp)"
+  echo "  apply config to control-plane (node=$real via $host:$port)"
   tries=$APPLY_RETRIES
-  until talosctl apply-config --insecure --nodes "$n" --file "$OUT_DIR/controlplane.yaml"; do
+  until talosctl apply-config --insecure --endpoints "$host:$port" --nodes "$real" --file "$OUT_DIR/controlplane.yaml"; do
     ((tries--)) || true
     if (( tries <= 0 )); then
-      echo "ERROR: failed to apply control-plane config to $n after retries" >&2
+      echo "ERROR: failed to apply control-plane config to $real via $host:$port after retries" >&2
       exit 1
     fi
     echo "  retrying apply-config for $n in ${APPLY_RETRY_DELAY}s..."; sleep "$APPLY_RETRY_DELAY"
@@ -231,8 +291,12 @@ for n in "${CP_ARR[@]}"; do
 done
 
 echo "[5/7] Bootstrapping etcd on first CP node (idempotent)..."
-if ! talosctl get etcdmember --nodes "${CP_ARR[0]}" >/dev/null 2>&1; then
-  talosctl --nodes "${CP_ARR[0]}" bootstrap || {
+# Use forwarded endpoint and real node IP for bootstrap/get checks
+first_cp_fwd="${CP_ARR[0]}"
+read -r first_host first_port <<< "$(parse_host_port "$first_cp_fwd")"
+first_real_cp="$(real_ip_for "$first_host" "$first_port" 0 cp)"
+if ! talosctl get etcdmember --endpoints "$first_host:$first_port" --nodes "$first_real_cp" >/dev/null 2>&1; then
+  talosctl --endpoints "$first_host:$first_port" --nodes "$first_real_cp" bootstrap || {
     echo "Bootstrap attempt failed; will still proceed (may already be bootstrapped)" >&2
   }
 else
@@ -241,13 +305,14 @@ fi
 
 if [[ ${#WK_ARR[@]} -gt 0 ]]; then
   echo "[6/7] Applying worker configs..."
-  for n in "${WK_ARR[@]}"; do
-    echo "  apply config to worker $n"
+  for i in "${!WK_ARR[@]}"; do
+    fwd="${WK_ARR[$i]}"; read -r host port <<< "$(parse_host_port "$fwd")"; real="$(real_ip_for "$host" "$port" "$i" wk)"
+    echo "  apply config to worker (node=$real via $host:$port)"
     tries=$APPLY_RETRIES
-    until talosctl apply-config --insecure --nodes "$n" --file "$OUT_DIR/worker.yaml"; do
+    until talosctl apply-config --insecure --endpoints "$host:$port" --nodes "$real" --file "$OUT_DIR/worker.yaml"; do
       ((tries--)) || true
       if (( tries <= 0 )); then
-        echo "ERROR: failed to apply worker config to $n after retries" >&2
+        echo "ERROR: failed to apply worker config to $real via $host:$port after retries" >&2
         exit 1
       fi
       echo "  retrying apply-config for $n in ${APPLY_RETRY_DELAY}s..."; sleep "$APPLY_RETRY_DELAY"
@@ -274,7 +339,8 @@ wait_kube() {
 wait_kube || true
 
 echo "Fetching kubeconfig..."
-talosctl kubeconfig --nodes "${CP_ARR[0]}" --force
+# Fetch kubeconfig using the same endpoint/node mapping as above
+talosctl kubeconfig --endpoints "$first_host:$first_port" --nodes "$first_real_cp" --force
 
 if [ "$DB_SETUP" = "1" ]; then
   echo "[8/8] Ensuring RethinkDB Service is deployed and reachable..."
