@@ -55,7 +55,8 @@ export async function listDatabases(): Promise<DatabaseInstance[]> {
 }
 
 export async function createDatabase(payload: {
-  name: string
+  id: string
+  name?: string
   description?: string
 }): Promise<DatabaseInstance | null> {
   try {
@@ -64,10 +65,21 @@ export async function createDatabase(payload: {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     })
-    if (!res.ok) return null
-    return await res.json()
+    return await handle<DatabaseInstance>(res)
   } catch {
     return null
+  }
+}
+
+export async function deleteDatabase(dbId: string): Promise<boolean> {
+  try {
+    const res = await fetch(apiUrl(`/api/db/${encodeURIComponent(dbId)}`), {
+      method: 'DELETE'
+    })
+    if (!res.ok) return false
+    return true
+  } catch {
+    return false
   }
 }
 

@@ -59,10 +59,17 @@ func (a *DBAPI) handleDatabases(w http.ResponseWriter, r *http.Request) {
 	principal := PrincipalFromRequest(r.Header.Get("X-Debug-Principal"))
 	switch r.Method {
 	case http.MethodGet:
-		// For MVP list returns a synthetic single DB derived from org env, even if DB is down.
-		// This keeps the UI navigable; writes will still be guarded.
-		inst := model.DatabaseInstance{ID: a.OrgID, OrgID: a.OrgID, Name: "default", CreatedAt: model.NowISO()}
-		JSON(w, http.StatusOK, []model.DatabaseInstance{inst})
+		// List databases for org
+		if a.Manager == nil {
+			JSON(w, http.StatusOK, []model.DatabaseInstance{})
+			return
+		}
+		dbs, err := a.Manager.ListDatabases(r.Context(), a.OrgID)
+		if err != nil {
+			JSONError(w, http.StatusInternalServerError, "list failed", "list_failed", err.Error())
+			return
+		}
+		JSON(w, http.StatusOK, dbs)
 	case http.MethodPost:
 		if !Allow(a.RBAC.RoleFor(principal, "", a.OrgID), "db.create") {
 			JSONError(w, http.StatusForbidden, "permission denied", "forbidden")
@@ -72,20 +79,26 @@ func (a *DBAPI) handleDatabases(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		_ = r.Body.Close()
 		var req struct {
+			ID          string `json:"id"`
 			Name        string `json:"name"`
 			Description string `json:"description"`
 		}
 		_ = json.Unmarshal(b, &req)
-		if strings.TrimSpace(req.Name) == "" {
-			req.Name = "default"
+		if strings.TrimSpace(req.ID) == "" {
+			JSONError(w, http.StatusBadRequest, "missing id", "invalid_id")
+			return
 		}
-		inst := model.DatabaseInstance{ID: a.OrgID, OrgID: a.OrgID, Name: req.Name, Description: req.Description, CreatedAt: model.NowISO()}
-		// Ensure backing DB if manager available; otherwise, return metadata-only (dev mode)
-		if a.Manager != nil {
-			if err := a.Manager.EnsureOrgDatabase(r.Context(), a.OrgID); err != nil {
-				JSONError(w, http.StatusInternalServerError, "database create failed", "db_create_failed", err.Error())
-				return
-			}
+		if strings.TrimSpace(req.Name) == "" {
+			req.Name = req.ID
+		}
+		if a.Manager == nil {
+			JSONError(w, http.StatusServiceUnavailable, "database unavailable", "db_unavailable")
+			return
+		}
+		inst, err := a.Manager.CreateDatabase(r.Context(), a.OrgID, req.ID, req.Name, req.Description)
+		if err != nil {
+			JSONError(w, http.StatusInternalServerError, "database create failed", "db_create_failed", err.Error())
+			return
 		}
 		JSON(w, http.StatusCreated, inst)
 	default:
@@ -113,17 +126,33 @@ func (a *DBAPI) handleDatabaseSubroutes(w http.ResponseWriter, r *http.Request) 
 	}
 	if len(parts) == 1 {
 		if r.Method == http.MethodGet {
-			inst := model.DatabaseInstance{ID: dbID, OrgID: a.OrgID, Name: dbID, CreatedAt: model.NowISO()}
-			JSON(w, http.StatusOK, inst)
+			if a.Manager == nil {
+				JSONError(w, http.StatusServiceUnavailable, "database unavailable", "db_unavailable")
+				return
+			}
+			info, err := a.Manager.GetDatabase(r.Context(), a.OrgID, dbID)
+			if err != nil {
+				JSONError(w, http.StatusNotFound, "database not found", "not_found")
+				return
+			}
+			JSON(w, http.StatusOK, info)
 			return
 		}
 		if r.Method == http.MethodPatch {
-			// no-op for now
-			JSON(w, http.StatusOK, map[string]any{"updated": dbID})
+			// For MVP, PATCH not implemented for multi-DB (future: update _info)
+			JSONError(w, http.StatusBadRequest, "update not implemented", "not_implemented")
 			return
 		}
 		if r.Method == http.MethodDelete {
-			JSONError(w, http.StatusBadRequest, "delete not implemented", "not_implemented")
+			if a.Manager == nil {
+				JSONError(w, http.StatusServiceUnavailable, "database unavailable", "db_unavailable")
+				return
+			}
+			if err := a.Manager.DeleteDatabase(r.Context(), a.OrgID, dbID); err != nil {
+				JSONError(w, http.StatusInternalServerError, "delete failed", "delete_failed", err.Error())
+				return
+			}
+			JSON(w, http.StatusOK, map[string]any{"deleted": dbID})
 			return
 		}
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -138,7 +167,7 @@ func (a *DBAPI) handleDatabaseSubroutes(w http.ResponseWriter, r *http.Request) 
 	if len(parts) >= 2 && parts[1] == "audit" {
 		principal := PrincipalFromRequest(r.Header.Get("X-Debug-Principal"))
 		_ = principal // future: filter by role, actor
-		events, err := a.Manager.ListAudit(r.Context(), a.OrgID, 200)
+		events, err := a.Manager.ListAudit(r.Context(), a.OrgID, dbID, 200)
 		if err != nil {
 			JSONError(w, http.StatusInternalServerError, "audit list failed", "audit_failed", err.Error())
 			return
@@ -207,7 +236,7 @@ func (a *DBAPI) handleTables(w http.ResponseWriter, r *http.Request, dbID string
 	if len(rest) == 0 { // /api/db/:dbId/tables
 		switch r.Method {
 		case http.MethodGet:
-			tbls, err := a.Manager.GetTables(r.Context(), a.OrgID)
+			tbls, err := a.Manager.GetTables(r.Context(), a.OrgID, dbID)
 			if err != nil {
 				JSONError(w, http.StatusInternalServerError, "list tables failed", "list_failed", err.Error())
 				return
@@ -233,7 +262,7 @@ func (a *DBAPI) handleTables(w http.ResponseWriter, r *http.Request, dbID string
 				return
 			}
 			tbl := model.Table{ID: req.Name, Name: req.Name, PrimaryKey: req.PrimaryKey, Schema: req.Schema}
-			if err := a.Manager.CreateTable(r.Context(), a.OrgID, tbl); err != nil {
+			if err := a.Manager.CreateTable(r.Context(), a.OrgID, dbID, tbl); err != nil {
 				JSONError(w, http.StatusInternalServerError, "table create failed", "create_failed", err.Error())
 				return
 			}
@@ -247,7 +276,7 @@ func (a *DBAPI) handleTables(w http.ResponseWriter, r *http.Request, dbID string
 	if len(rest) == 1 { // metadata GET/PATCH/DELETE
 		if r.Method == http.MethodGet {
 			// naive lookup
-			tbls, _ := a.Manager.GetTables(r.Context(), a.OrgID)
+			tbls, _ := a.Manager.GetTables(r.Context(), a.OrgID, dbID)
 			for _, t := range tbls {
 				if t.Name == tableName {
 					JSON(w, http.StatusOK, t)
@@ -273,7 +302,7 @@ func (a *DBAPI) handleTables(w http.ResponseWriter, r *http.Request, dbID string
 				JSONError(w, http.StatusBadRequest, "invalid schema", "invalid_schema")
 				return
 			}
-			if err := a.Manager.UpdateTableSchema(r.Context(), a.OrgID, tableName, req.Schema, req.PrimaryKey); err != nil {
+			if err := a.Manager.UpdateTableSchema(r.Context(), a.OrgID, dbID, tableName, req.Schema, req.PrimaryKey); err != nil {
 				JSONError(w, http.StatusInternalServerError, "schema update failed", "schema_failed", err.Error())
 				return
 			}
@@ -314,7 +343,7 @@ func (a *DBAPI) handleTables(w http.ResponseWriter, r *http.Request, dbID string
 		}
 		// obtain schema for validation
 		schema := []model.ColumnDef{}
-		if tbls, _ := a.Manager.GetTables(r.Context(), a.OrgID); true {
+		if tbls, _ := a.Manager.GetTables(r.Context(), a.OrgID, dbID); true {
 			for _, t := range tbls {
 				if t.Name == tableName {
 					schema = t.Schema
@@ -452,7 +481,7 @@ func (a *DBAPI) handleTables(w http.ResponseWriter, r *http.Request, dbID string
 			}
 			rows = remapped
 		}
-		ids, err := a.Manager.InsertRows(r.Context(), a.OrgID, tableName, rows)
+		ids, err := a.Manager.InsertRows(r.Context(), a.OrgID, dbID, tableName, rows)
 		if err != nil {
 			JSONError(w, http.StatusInternalServerError, "import failed", "import_failed", err.Error())
 			return
@@ -483,14 +512,14 @@ func (a *DBAPI) handleTables(w http.ResponseWriter, r *http.Request, dbID string
 		cursor := ""
 		rowsAccum := make([]map[string]any, 0, limit)
 		for len(rowsAccum) < limit {
-			rows, next, err := a.Manager.QueryRows(r.Context(), a.OrgID, tableName, "id", 200, cursor, true)
+			rows, next, err := a.Manager.QueryRows(r.Context(), a.OrgID, dbID, tableName, "id", 200, cursor, true)
 			if err != nil {
 				JSONError(w, http.StatusInternalServerError, "export query failed", "export_query", err.Error())
 				return
 			}
 			// mask
 			schema := []model.ColumnDef{}
-			if tbls, _ := a.Manager.GetTables(r.Context(), a.OrgID); true {
+			if tbls, _ := a.Manager.GetTables(r.Context(), a.OrgID, dbID); true {
 				for _, t := range tbls {
 					if t.Name == tableName {
 						schema = t.Schema
@@ -550,14 +579,14 @@ func (a *DBAPI) handleRows(w http.ResponseWriter, r *http.Request, dbID, table s
 				JSONError(w, http.StatusForbidden, "permission denied", "forbidden")
 				return
 			}
-			rows, next, err := a.Manager.QueryRows(r.Context(), a.OrgID, table, "id", 50, r.URL.Query().Get("cursor"), true)
+			rows, next, err := a.Manager.QueryRows(r.Context(), a.OrgID, dbID, table, "id", 50, r.URL.Query().Get("cursor"), true)
 			if err != nil {
 				JSONError(w, http.StatusInternalServerError, "query failed", "query_failed", err.Error())
 				return
 			}
 			// schema for masking
 			schema := []model.ColumnDef{}
-			if tbls, _ := a.Manager.GetTables(r.Context(), a.OrgID); true {
+			if tbls, _ := a.Manager.GetTables(r.Context(), a.OrgID, dbID); true {
 				for _, t := range tbls {
 					if t.Name == table {
 						schema = t.Schema
@@ -596,7 +625,7 @@ func (a *DBAPI) handleRows(w http.ResponseWriter, r *http.Request, dbID, table s
 				JSONError(w, http.StatusBadRequest, "unsupported payload", "bad_payload")
 				return
 			}
-			ids, err := a.Manager.InsertRows(r.Context(), a.OrgID, table, rows)
+			ids, err := a.Manager.InsertRows(r.Context(), a.OrgID, dbID, table, rows)
 			if err != nil {
 				JSONError(w, http.StatusInternalServerError, "insert failed", "insert_failed", err.Error())
 				return
@@ -626,7 +655,7 @@ func (a *DBAPI) handleRows(w http.ResponseWriter, r *http.Request, dbID, table s
 			JSONError(w, http.StatusBadRequest, "invalid json", "bad_json")
 			return
 		}
-		if err := a.Manager.UpdateRow(r.Context(), a.OrgID, table, rowID, patch); err != nil {
+		if err := a.Manager.UpdateRow(r.Context(), a.OrgID, dbID, table, rowID, patch); err != nil {
 			JSONError(w, http.StatusInternalServerError, "update failed", "update_failed", err.Error())
 			return
 		}
@@ -638,7 +667,7 @@ func (a *DBAPI) handleRows(w http.ResponseWriter, r *http.Request, dbID, table s
 			JSONError(w, http.StatusForbidden, "permission denied", "forbidden")
 			return
 		}
-		if err := a.Manager.DeleteRow(r.Context(), a.OrgID, table, rowID); err != nil {
+		if err := a.Manager.DeleteRow(r.Context(), a.OrgID, dbID, table, rowID); err != nil {
 			JSONError(w, http.StatusInternalServerError, "delete failed", "delete_failed", err.Error())
 			return
 		}
@@ -665,7 +694,7 @@ func (a *DBAPI) handleChangefeed(w http.ResponseWriter, r *http.Request) {
 	// Basic validation (dbID ignored for now since single-org stub)
 	_ = dbID
 	// Establish changefeed
-	stream, err := a.Manager.SubscribeTable(r.Context(), a.OrgID, table)
+	stream, err := a.Manager.SubscribeTable(r.Context(), a.OrgID, dbID, table)
 	if err != nil {
 		JSONError(w, http.StatusInternalServerError, "subscribe failed", "subscribe_failed", err.Error())
 		return

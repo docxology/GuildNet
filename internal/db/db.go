@@ -124,12 +124,35 @@ func canDialFast(addr string, d time.Duration) bool {
 	return true
 }
 
-// dbName returns the physical database name for an org.
-func dbName(orgID string) string { return "org_" + strings.ToLower(orgID) }
+// dbName returns the physical database name for an org+database.
+func dbName(orgID, dbID string) string {
+	org := strings.ToLower(strings.TrimSpace(orgID))
+	db := strings.ToLower(strings.TrimSpace(dbID))
+	if org == "" {
+		org = "default"
+	}
+	if db == "" {
+		db = "default"
+	}
+	// Restrict to safe characters for RethinkDB identifiers
+	sanitize := func(s string) string {
+		b := make([]rune, 0, len(s))
+		for _, ch := range s {
+			if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' {
+				b = append(b, ch)
+			} else {
+				b = append(b, '_')
+			}
+		}
+		return string(b)
+	}
+	return fmt.Sprintf("org_%s__%s", sanitize(org), sanitize(db))
+}
 
 // EnsureOrgDatabase creates the database if absent.
-func (m *Manager) EnsureOrgDatabase(ctx context.Context, orgID string) error {
-	name := dbName(orgID)
+// EnsureDatabase creates the database if absent for the given org and dbID
+func (m *Manager) EnsureDatabase(ctx context.Context, orgID, dbID string) error {
+	name := dbName(orgID, dbID)
 	cur, err := r.DBList().Run(m.sess)
 	if err != nil {
 		return err
@@ -151,13 +174,13 @@ func (m *Manager) EnsureOrgDatabase(ctx context.Context, orgID string) error {
 			return err
 		}
 	}
-	// Always ensure meta tables exist for this org database
-	return m.ensureMetaTables(ctx, orgID)
+	// Always ensure meta tables exist for this database
+	return m.ensureMetaTables(ctx, orgID, dbID)
 }
 
 // ensureMetaTables creates internal meta tables (_schemas, _audit) if absent.
-func (m *Manager) ensureMetaTables(ctx context.Context, orgID string) error {
-	dbn := dbName(orgID)
+func (m *Manager) ensureMetaTables(ctx context.Context, orgID, dbID string) error {
+	dbn := dbName(orgID, dbID)
 	// Ensure schemas and audit tables exist
 	if _, err := r.DB(dbn).TableCreate("_schemas").RunWrite(m.sess); err != nil && !strings.Contains(err.Error(), "already exists") {
 		return err
@@ -165,18 +188,22 @@ func (m *Manager) ensureMetaTables(ctx context.Context, orgID string) error {
 	if _, err := r.DB(dbn).TableCreate("_audit").RunWrite(m.sess); err != nil && !strings.Contains(err.Error(), "already exists") {
 		return err
 	}
+	// Ensure a one-row _info table for database metadata
+	if _, err := r.DB(dbn).TableCreate("_info").RunWrite(m.sess); err != nil && !strings.Contains(err.Error(), "already exists") {
+		return err
+	}
 	return nil
 }
 
 // CreateTable creates a table with primary key. Schema is stored in a meta table.
-func (m *Manager) CreateTable(ctx context.Context, orgID string, tbl model.Table) error {
+func (m *Manager) CreateTable(ctx context.Context, orgID, dbID string, tbl model.Table) error {
 	if tbl.PrimaryKey == "" {
 		tbl.PrimaryKey = "id"
 	}
-	if err := m.EnsureOrgDatabase(ctx, orgID); err != nil {
+	if err := m.EnsureDatabase(ctx, orgID, dbID); err != nil {
 		return err
 	}
-	dbn := dbName(orgID)
+	dbn := dbName(orgID, dbID)
 	_, err := r.DB(dbn).TableCreate(tbl.Name, r.TableCreateOpts{PrimaryKey: tbl.PrimaryKey}).RunWrite(m.sess)
 	if err != nil && !strings.Contains(err.Error(), "already exists") {
 		return err
@@ -189,18 +216,18 @@ func (m *Manager) CreateTable(ctx context.Context, orgID string, tbl model.Table
 	tbl.CreatedAt = model.NowISO()
 	_, err = r.DB(dbn).Table("_schemas").Insert(tbl, r.InsertOpts{Conflict: "replace"}).RunWrite(m.sess)
 	if err == nil {
-		_ = m.ensureMetaTables(ctx, orgID)
-		_ = m.InsertAudit(ctx, orgID, model.AuditEvent{ID: tbl.ID + "/schema", Scope: model.ScopeTable, ScopeID: tbl.ID, Actor: "system", Action: "create_table", TS: model.NowISO(), Diff: tbl})
+		_ = m.ensureMetaTables(ctx, orgID, dbID)
+		_ = m.InsertAudit(ctx, orgID, dbID, model.AuditEvent{ID: tbl.ID + "/schema", Scope: model.ScopeTable, ScopeID: tbl.ID, Actor: "system", Action: "create_table", TS: model.NowISO(), Diff: tbl})
 	}
 	return err
 }
 
 // UpdateTableSchema replaces the schema entry for a table (no data migration performed in MVP).
-func (m *Manager) UpdateTableSchema(ctx context.Context, orgID string, table string, schema []model.ColumnDef, primaryKey string) error {
+func (m *Manager) UpdateTableSchema(ctx context.Context, orgID, dbID string, table string, schema []model.ColumnDef, primaryKey string) error {
 	if primaryKey == "" {
 		primaryKey = "id"
 	}
-	dbn := dbName(orgID)
+	dbn := dbName(orgID, dbID)
 	// fetch current record (best-effort)
 	cur, err := r.DB(dbn).Table("_schemas").Get(table).Run(m.sess)
 	var existing model.Table
@@ -214,16 +241,16 @@ func (m *Manager) UpdateTableSchema(ctx context.Context, orgID string, table str
 	}
 	_, err = r.DB(dbn).Table("_schemas").Insert(updated, r.InsertOpts{Conflict: "replace"}).RunWrite(m.sess)
 	if err == nil {
-		_ = m.InsertAudit(ctx, orgID, model.AuditEvent{ID: fmt.Sprintf("%s/%d/schema", table, time.Now().UnixNano()), Scope: model.ScopeTable, ScopeID: table, Actor: "system", Action: "update_schema", TS: model.NowISO(), Diff: map[string]any{"schema": schema}})
+		_ = m.InsertAudit(ctx, orgID, dbID, model.AuditEvent{ID: fmt.Sprintf("%s/%d/schema", table, time.Now().UnixNano()), Scope: model.ScopeTable, ScopeID: table, Actor: "system", Action: "update_schema", TS: model.NowISO(), Diff: map[string]any{"schema": schema}})
 	}
 	return err
 }
 
 // GetTables returns table metadata for an org DB.
-func (m *Manager) GetTables(ctx context.Context, orgID string) ([]model.Table, error) {
-	dbn := dbName(orgID)
-	// Ensure database and meta tables exist so listing works on a fresh org
-	if err := m.EnsureOrgDatabase(ctx, orgID); err != nil {
+func (m *Manager) GetTables(ctx context.Context, orgID, dbID string) ([]model.Table, error) {
+	dbn := dbName(orgID, dbID)
+	// Ensure database and meta tables exist so listing works on a fresh db
+	if err := m.EnsureDatabase(ctx, orgID, dbID); err != nil {
 		return nil, err
 	}
 	cur, err := r.DB(dbn).Table("_schemas").Run(m.sess)
@@ -242,25 +269,25 @@ func (m *Manager) GetTables(ctx context.Context, orgID string) ([]model.Table, e
 }
 
 // InsertRows bulk inserts.
-func (m *Manager) InsertRows(ctx context.Context, orgID, table string, rows []map[string]any) ([]string, error) {
+func (m *Manager) InsertRows(ctx context.Context, orgID, dbID, table string, rows []map[string]any) ([]string, error) {
 	if len(rows) == 0 {
 		return nil, nil
 	}
-	dbn := dbName(orgID)
+	dbn := dbName(orgID, dbID)
 	res, err := r.DB(dbn).Table(table).Insert(rows).RunWrite(m.sess)
 	if err != nil {
 		return nil, err
 	}
-	_ = m.InsertAudit(ctx, orgID, model.AuditEvent{ID: fmt.Sprintf("%s/%d", table, time.Now().UnixNano()), Scope: model.ScopeTable, ScopeID: table, Actor: "system", Action: "insert", TS: model.NowISO(), Diff: map[string]any{"count": len(res.GeneratedKeys), "ids": res.GeneratedKeys}})
+	_ = m.InsertAudit(ctx, orgID, dbID, model.AuditEvent{ID: fmt.Sprintf("%s/%d", table, time.Now().UnixNano()), Scope: model.ScopeTable, ScopeID: table, Actor: "system", Action: "insert", TS: model.NowISO(), Diff: map[string]any{"count": len(res.GeneratedKeys), "ids": res.GeneratedKeys}})
 	return res.GeneratedKeys, nil
 }
 
 // QueryRows simple paginated scan with optional sort by primary key.
-func (m *Manager) QueryRows(ctx context.Context, orgID, table, pk string, limit int, cursor string, ascending bool) ([]map[string]any, string, error) {
+func (m *Manager) QueryRows(ctx context.Context, orgID, dbID, table, pk string, limit int, cursor string, ascending bool) ([]map[string]any, string, error) {
 	if limit <= 0 {
 		limit = 50
 	}
-	dbn := dbName(orgID)
+	dbn := dbName(orgID, dbID)
 	term := r.DB(dbn).Table(table)
 	if pk != "" {
 		if cursor != "" {
@@ -302,32 +329,32 @@ func (m *Manager) QueryRows(ctx context.Context, orgID, table, pk string, limit 
 }
 
 // UpdateRow merges partial doc.
-func (m *Manager) UpdateRow(ctx context.Context, orgID, table, id string, patch map[string]any) error {
-	dbn := dbName(orgID)
+func (m *Manager) UpdateRow(ctx context.Context, orgID, dbID, table, id string, patch map[string]any) error {
+	dbn := dbName(orgID, dbID)
 	_, err := r.DB(dbn).Table(table).Get(id).Update(patch).RunWrite(m.sess)
 	if err == nil {
-		_ = m.InsertAudit(ctx, orgID, model.AuditEvent{ID: fmt.Sprintf("%s/%s/upd", table, id), Scope: model.ScopeRow, ScopeID: id, Actor: "system", Action: "update", TS: model.NowISO(), Diff: patch})
+		_ = m.InsertAudit(ctx, orgID, dbID, model.AuditEvent{ID: fmt.Sprintf("%s/%s/upd", table, id), Scope: model.ScopeRow, ScopeID: id, Actor: "system", Action: "update", TS: model.NowISO(), Diff: patch})
 	}
 	return err
 }
 
 // DeleteRow removes by id.
-func (m *Manager) DeleteRow(ctx context.Context, orgID, table, id string) error {
-	dbn := dbName(orgID)
+func (m *Manager) DeleteRow(ctx context.Context, orgID, dbID, table, id string) error {
+	dbn := dbName(orgID, dbID)
 	_, err := r.DB(dbn).Table(table).Get(id).Delete().RunWrite(m.sess)
 	if err == nil {
-		_ = m.InsertAudit(ctx, orgID, model.AuditEvent{ID: fmt.Sprintf("%s/%s/del", table, id), Scope: model.ScopeRow, ScopeID: id, Actor: "system", Action: "delete", TS: model.NowISO()})
+		_ = m.InsertAudit(ctx, orgID, dbID, model.AuditEvent{ID: fmt.Sprintf("%s/%s/del", table, id), Scope: model.ScopeRow, ScopeID: id, Actor: "system", Action: "delete", TS: model.NowISO()})
 	}
 	return err
 }
 
 // InsertAudit writes an audit event (best-effort; errors ignored by callers when logging).
-func (m *Manager) InsertAudit(ctx context.Context, orgID string, ev model.AuditEvent) error {
+func (m *Manager) InsertAudit(ctx context.Context, orgID, dbID string, ev model.AuditEvent) error {
 	if ev.ID == "" {
 		ev.ID = fmt.Sprintf("a-%d", time.Now().UnixNano())
 	}
-	dbn := dbName(orgID)
-	if err := m.ensureMetaTables(ctx, orgID); err != nil {
+	dbn := dbName(orgID, dbID)
+	if err := m.ensureMetaTables(ctx, orgID, dbID); err != nil {
 		return err
 	}
 	_, err := r.DB(dbn).Table("_audit").Insert(ev).RunWrite(m.sess)
@@ -335,11 +362,11 @@ func (m *Manager) InsertAudit(ctx context.Context, orgID string, ev model.AuditE
 }
 
 // ListAudit returns recent audit events (simple limit & time descending by ID heuristic).
-func (m *Manager) ListAudit(ctx context.Context, orgID string, limit int) ([]model.AuditEvent, error) {
+func (m *Manager) ListAudit(ctx context.Context, orgID, dbID string, limit int) ([]model.AuditEvent, error) {
 	if limit <= 0 {
 		limit = 200
 	}
-	dbn := dbName(orgID)
+	dbn := dbName(orgID, dbID)
 	cur, err := r.DB(dbn).Table("_audit").OrderBy(r.OrderByOpts{Index: r.Desc("id")}).Limit(limit).Run(m.sess)
 	if err != nil {
 		return nil, err
@@ -359,13 +386,13 @@ type ChangefeedStream struct {
 }
 
 // SubscribeTable produces events for inserts/updates/deletes. Resume token currently unused (placeholder).
-func (m *Manager) SubscribeTable(ctx context.Context, orgID, table string) (*ChangefeedStream, error) {
+func (m *Manager) SubscribeTable(ctx context.Context, orgID, dbID, table string) (*ChangefeedStream, error) {
 	// Increment a simple sequence to form a monotonic token (future: expose for resume)
 	m.mu.Lock()
 	m.seq++
 	_ = m.seq // currently unused outside of increment; keeps linter happy for now
 	m.mu.Unlock()
-	dbn := dbName(orgID)
+	dbn := dbName(orgID, dbID)
 	term := r.DB(dbn).Table(table).Changes(r.ChangesOpts{IncludeInitial: true, IncludeStates: false})
 	cur, err := term.Run(m.sess)
 	if err != nil {
@@ -417,6 +444,116 @@ func (m *Manager) Close() error {
 	}
 	m.sess.Close()
 	return nil
+}
+
+// Database management
+
+// ListDatabases returns logical databases for an org by scanning DBList for prefixed names.
+func (m *Manager) ListDatabases(ctx context.Context, orgID string) ([]model.DatabaseInstance, error) {
+	cur, err := r.DBList().Run(m.sess)
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close()
+	var dbs []string
+	if err := cur.All(&dbs); err != nil {
+		return nil, err
+	}
+	prefix := "org_" + strings.ToLower(strings.TrimSpace(orgID)) + "__"
+	out := []model.DatabaseInstance{}
+	for _, name := range dbs {
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		dbID := strings.TrimPrefix(name, prefix)
+		info := model.DatabaseInstance{ID: dbID, OrgID: orgID, Name: dbID}
+		// try _info
+		if _, err := r.DB(name).TableCreate("_info").RunWrite(m.sess); err != nil && !strings.Contains(err.Error(), "already exists") {
+			// ignore
+		}
+		cur2, err2 := r.DB(name).Table("_info").Get("db").Run(m.sess)
+		if err2 == nil {
+			var meta map[string]any
+			if cur2.One(&meta) == nil {
+				if v, ok := meta["name"].(string); ok && v != "" {
+					info.Name = v
+				}
+				if v, ok := meta["description"].(string); ok {
+					info.Description = v
+				}
+				if v, ok := meta["created_at"].(string); ok {
+					info.CreatedAt = v
+				}
+			}
+			cur2.Close()
+		}
+		out = append(out, info)
+	}
+	return out, nil
+}
+
+// CreateDatabase creates a new logical database with metadata.
+func (m *Manager) CreateDatabase(ctx context.Context, orgID, dbID, name, description string) (model.DatabaseInstance, error) {
+	if err := m.EnsureDatabase(ctx, orgID, dbID); err != nil {
+		return model.DatabaseInstance{}, err
+	}
+	dbn := dbName(orgID, dbID)
+	// write metadata
+	_ = m.ensureMetaTables(ctx, orgID, dbID)
+	meta := map[string]any{"id": "db", "name": name, "description": description, "created_at": model.NowISO()}
+	_, _ = r.DB(dbn).Table("_info").Insert(meta, r.InsertOpts{Conflict: "replace"}).RunWrite(m.sess)
+	return model.DatabaseInstance{ID: dbID, OrgID: orgID, Name: name, Description: description, CreatedAt: meta["created_at"].(string)}, nil
+}
+
+// GetDatabase returns metadata for a database.
+func (m *Manager) GetDatabase(ctx context.Context, orgID, dbID string) (model.DatabaseInstance, error) {
+	dbn := dbName(orgID, dbID)
+	info := model.DatabaseInstance{ID: dbID, OrgID: orgID, Name: dbID}
+	cur, err := r.DBList().Run(m.sess)
+	if err != nil {
+		return info, err
+	}
+	var names []string
+	if err := cur.All(&names); err != nil {
+		cur.Close()
+		return info, err
+	}
+	cur.Close()
+	found := false
+	for _, n := range names {
+		if n == dbn {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return info, fmt.Errorf("not found")
+	}
+	// fetch _info
+	cur2, err2 := r.DB(dbn).Table("_info").Get("db").Run(m.sess)
+	if err2 == nil {
+		var meta map[string]any
+		if cur2.One(&meta) == nil {
+			if v, ok := meta["name"].(string); ok && v != "" {
+				info.Name = v
+			}
+			if v, ok := meta["description"].(string); ok {
+				info.Description = v
+			}
+			if v, ok := meta["created_at"].(string); ok {
+				info.CreatedAt = v
+			}
+		}
+		cur2.Close()
+	}
+	return info, nil
+}
+
+// DeleteDatabase drops the database.
+func (m *Manager) DeleteDatabase(ctx context.Context, orgID, dbID string) error {
+	dbn := dbName(orgID, dbID)
+	_, err := r.DBDrop(dbn).RunWrite(m.sess)
+	return err
 }
 
 // ErrNotFound sentinel.
