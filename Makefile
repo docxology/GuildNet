@@ -10,17 +10,8 @@ LISTEN_LOCAL ?= 127.0.0.1:8080
 	test lint tidy clean setup ui-setup \
 	health tls-check-backend regen-certs stop-all \
 	talos-fresh talos-upgrade agent-build \
-	crd-apply operator-run operator-build db-health \
-	rethink-deploy rethink-info
-rethink-deploy: ## Deploy RethinkDB (single replica) into current kube-context
-	kubectl apply -f k8s/rethinkdb.yaml
-	@echo "Waiting for RethinkDB Service external IP (if using LoadBalancer)..."
-	@kubectl get svc rethinkdb -o wide || true
+	crd-apply operator-run operator-build db-health
 
-rethink-info: ## Show RethinkDB Service address and hints for RETHINKDB_ADDR
-	@echo "RethinkDB Service:"; kubectl get svc rethinkdb -o wide || true; echo
-	@echo "If hostapp runs outside the cluster, set RETHINKDB_ADDR to <EXTERNAL-IP>:28015 (or use 'kubectl port-forward svc/rethinkdb 28015')."
-	@echo "If hostapp runs in-cluster, it can reach 'rethinkdb:28015' directly."
 
 
 all: build ## Build backend and UI
@@ -52,18 +43,7 @@ build-ui: ## Build UI (Vite)
 
 # ---------- Run ----------
 run: build ## Build all (backend+UI) and run backend (serve)
-	# Best-effort: ensure RethinkDB exists in the current cluster before starting
-	-kubectl apply -f k8s/rethinkdb.yaml >/dev/null 2>&1 || true
-	# If local 28015 is not listening, attempt a kubectl port-forward to svc/rethinkdb
-	@if ! nc -z 127.0.0.1 28015 >/dev/null 2>&1; then \
-		if kubectl get svc rethinkdb >/dev/null 2>&1; then \
-			echo "Starting kubectl port-forward for RethinkDB (127.0.0.1:28015)"; \
-			(kubectl port-forward svc/rethinkdb 28015:28015 >/dev/null 2>&1 & echo $$! > .rethinkdb-pf.pid; sleep 1); \
-		else \
-			echo "Warning: RethinkDB service not found; DB API may be unavailable"; \
-		fi; \
-	fi
-	RETHINKDB_ADDR=127.0.0.1:28015 LISTEN_LOCAL=$(LISTEN_LOCAL) ./bin/$(BINARY) serve
+	LISTEN_LOCAL=$(LISTEN_LOCAL) ./bin/$(BINARY) serve
 
 # ---------- DB / Health ----------
 db-health: ## Check database API and report availability

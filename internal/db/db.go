@@ -14,6 +14,9 @@ import (
 	r "gopkg.in/rethinkdb/rethinkdb-go.v6"
 
 	"github.com/your/module/internal/model"
+	// For Kubernetes-based service discovery when running outside the cluster
+	k8sclient "github.com/your/module/internal/k8s"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // Manager wraps a single RethinkDB cluster connection and provides per-org helpers.
@@ -62,6 +65,43 @@ func AutoDiscoverAddr() string {
 		// Outside Kubernetes: prefer local loopback port-forward in dev if it is available
 		if canDialFast("127.0.0.1:28015", 150*time.Millisecond) {
 			return "127.0.0.1:28015"
+		}
+		// Otherwise, consult the Kubernetes API (via kubeconfig) to resolve the Service external address.
+		// This keeps the cluster as the source of truth without requiring server-managed port-forwards.
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if kc, err := k8sclient.New(ctx); err == nil && kc != nil && kc.K != nil {
+			svcName := strings.TrimSpace(os.Getenv("RETHINKDB_SERVICE_NAME"))
+			if svcName == "" {
+				svcName = "rethinkdb"
+			}
+			ns := strings.TrimSpace(os.Getenv("RETHINKDB_NAMESPACE"))
+			if ns == "" {
+				ns = strings.TrimSpace(os.Getenv("K8S_NAMESPACE"))
+			}
+			if ns == "" {
+				ns = "default"
+			}
+			if svc, err := kc.K.CoreV1().Services(ns).Get(ctx, svcName, metav1.GetOptions{}); err == nil && svc != nil {
+				// Prefer LoadBalancer ingress IP/hostname
+				if ing := svc.Status.LoadBalancer.Ingress; len(ing) > 0 {
+					host := ing[0].IP
+					if host == "" {
+						host = ing[0].Hostname
+					}
+					// choose client port (28015) if present, else first port
+					port := int32(28015)
+					for _, sp := range svc.Spec.Ports {
+						if sp.Name == "client" || sp.Port == 28015 {
+							port = sp.Port
+							break
+						}
+					}
+					if host != "" && port > 0 {
+						return fmt.Sprintf("%s:%d", host, port)
+					}
+				}
+			}
 		}
 	}
 	// Direct service host/port envs (set automatically for Services)
