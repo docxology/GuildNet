@@ -96,31 +96,42 @@ check_tcp() { # host port timeout_seconds
 # If nodes appear unreachable, fail fast with guidance and optional local fallback when AUTO_LOCAL=1
 echo "[0/7] Preflight: checking node reachability on TCP :$PRECHECK_PORT"
 UNREACH=0
+parse_host_port() { # input -> host port
+  local in="$1"
+  if [[ "$in" == *:* ]]; then
+    printf '%s %s' "${in%%:*}" "${in##*:}"
+  else
+    printf '%s %s' "$in" "$PRECHECK_PORT"
+  fi
+}
+
 if [[ -n "$CP_NODES" ]]; then
   IFS=',' read -r -a CP_ARR <<< "$CP_NODES"
   for n in "${CP_ARR[@]}"; do
-    if ! check_tcp "$n" "$PRECHECK_PORT" "$PRECHECK_TIMEOUT"; then
-      echo "  WARN: control-plane $n not reachable on :$PRECHECK_PORT"
+    read -r host port <<< "$(parse_host_port "$n")"
+    if ! check_tcp "$host" "$port" "$PRECHECK_TIMEOUT"; then
+      echo "  WARN: control-plane $host not reachable on :$port"
       UNREACH=1
     else
-      echo "  OK: control-plane $n reachable"
+      echo "  OK: control-plane $host:$port reachable"
     fi
     if [ "$PRECHECK_PING" = "1" ] && command -v ping >/dev/null 2>&1; then
-      if ping -c 1 -W 2 "$n" >/dev/null 2>&1; then echo "    ping ok"; else echo "    ping failed"; fi
+      if ping -c 1 -W 2 "$host" >/dev/null 2>&1; then echo "    ping ok"; else echo "    ping failed"; fi
     fi
   done
 fi
 if [[ -n "$WK_NODES" ]]; then
   IFS=',' read -r -a WK_ARR <<< "$WK_NODES"
   for n in "${WK_ARR[@]}"; do
-    if ! check_tcp "$n" "$PRECHECK_PORT" "$PRECHECK_TIMEOUT"; then
-      echo "  WARN: worker $n not reachable on :$PRECHECK_PORT"
+    read -r host port <<< "$(parse_host_port "$n")"
+    if ! check_tcp "$host" "$port" "$PRECHECK_TIMEOUT"; then
+      echo "  WARN: worker $host not reachable on :$port"
       UNREACH=1
     else
-      echo "  OK: worker $n reachable"
+      echo "  OK: worker $host:$port reachable"
     fi
     if [ "$PRECHECK_PING" = "1" ] && command -v ping >/dev/null 2>&1; then
-      if ping -c 1 -W 2 "$n" >/dev/null 2>&1; then echo "    ping ok"; else echo "    ping failed"; fi
+      if ping -c 1 -W 2 "$host" >/dev/null 2>&1; then echo "    ping ok"; else echo "    ping failed"; fi
     fi
   done
 fi
@@ -132,13 +143,15 @@ if [[ $UNREACH -eq 1 ]]; then
     if [[ -n "$CP_NODES" ]]; then
       IFS=',' read -r -a CP_ARR <<< "$CP_NODES"
       for n in "${CP_ARR[@]}"; do
-        if ! check_tcp "$n" "$PRECHECK_PORT" "$PRECHECK_TIMEOUT"; then all_ok=0; break; fi
+        read -r host port <<< "$(parse_host_port "$n")"
+        if ! check_tcp "$host" "$port" "$PRECHECK_TIMEOUT"; then all_ok=0; break; fi
       done
     fi
     if [[ $all_ok -eq 1 && -n "$WK_NODES" ]]; then
       IFS=',' read -r -a WK_ARR <<< "$WK_NODES"
       for n in "${WK_ARR[@]}"; do
-        if ! check_tcp "$n" "$PRECHECK_PORT" "$PRECHECK_TIMEOUT"; then all_ok=0; break; fi
+        read -r host port <<< "$(parse_host_port "$n")"
+        if ! check_tcp "$host" "$port" "$PRECHECK_TIMEOUT"; then all_ok=0; break; fi
       done
     fi
     if [[ $all_ok -eq 1 ]]; then break; fi

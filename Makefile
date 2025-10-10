@@ -99,3 +99,12 @@ talos-fresh: ## Talos cluster fresh deploy
 
 talos-upgrade: ## Talos cluster in-place upgrade
 	bash ./scripts/talos-upgrade-inplace.sh $(UPGRADE_ARGS)
+
+# ---------- tsnet subnet router ----------
+.PHONY: tsnet-subnet-router run-subnet-router
+
+tsnet-subnet-router: ## Build tsnet subnet router binary
+	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/tsnet-subnet-router ./cmd/tsnet-subnet-router
+
+run-subnet-router: tsnet-subnet-router ## Run tsnet subnet router with .env
+	TS_LOGIN_SERVER=${TS_LOGIN_SERVER} TS_AUTHKEY=${TS_AUTHKEY} TS_HOSTNAME=${TS_HOSTNAME}-router TS_ROUTES=${TS_ROUTES} ./bin/tsnet-subnet-router

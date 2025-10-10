@@ -56,6 +56,24 @@ open https://127.0.0.1:8080
 
 Tip: `make help` lists all common targets (build, test, lint, CRD apply, utilities).
 
+## No-DNS overlay (tsnet) quickstart
+
+Run everything over an embedded tsnet overlay without installing Tailscale on the host or using MagicDNS.
+
+1. Ensure a Headscale/Tailscale control server is reachable and generate a preauth key.
+2. Create `.env` with at least:
+	- `TS_LOGIN_SERVER=http://127.0.0.1:8082`
+	- `TS_AUTHKEY=<preauth-key>`
+	- `TS_HOSTNAME=<your-hostname>`
+	- `TS_ROUTES=10.0.0.0/24,10.96.0.0/12,10.244.0.0/16`
+3. Build and run the subnet router near Talos:
+	- `make tsnet-subnet-router`
+	- `make run-subnet-router`
+4. Start the hostapp: `make run` and open `https://127.0.0.1:8080`.
+5. Agents register via `/api/v1/agents/register` and can be resolved with `/api/v1/resolve?id=...`.
+
+No DNS is required—numeric IPs are resolved via the registry and routed by tsnet.
+
 ## Networking / Multi-Device
 
 Run the Host App on any tailnet device; others reach it at `https://<ts-hostname-or-ip>:443`. Include that hostname/IP in the server certificate SANs (see cert generation script) or accept the self-signed cert in dev.

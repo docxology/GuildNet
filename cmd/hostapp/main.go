@@ -39,6 +39,7 @@ import (
 	"github.com/your/module/internal/proxy"
 
 	//"github.com/your/module/internal/store"
+	"github.com/your/module/internal/store"
 	"github.com/your/module/internal/ts"
 	"github.com/your/module/pkg/config"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -242,6 +243,22 @@ func main() {
 
 	mux := http.NewServeMux()
 
+	// In-memory store (includes registry)
+	mem := store.New()
+	go func() {
+		// Periodically prune stale agents (e.g., >2 minutes)
+		t := time.NewTicker(120 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				mem.PruneAgents(2 * time.Minute)
+			}
+		}
+	}()
+
 	// Ensure JS files are served with a broadly-compatible MIME type for module scripts
 	// Some embedded browsers are strict about application/javascript
 	_ = mime.AddExtensionType(".js", "application/javascript")
@@ -261,6 +278,55 @@ func main() {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
+	})
+
+	// Registry endpoints (minimal)
+	mux.HandleFunc("/api/v1/agents/register", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var rec model.AgentRecord
+		if err := json.NewDecoder(r.Body).Decode(&rec); err != nil {
+			httpx.JSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		if strings.TrimSpace(rec.ID) == "" || strings.TrimSpace(rec.IP) == "" {
+			httpx.JSON(w, http.StatusBadRequest, map[string]string{"error": "id and ip required"})
+			return
+		}
+		rec.LastSeen = model.NowISO()
+		mem.UpsertAgent(&rec)
+		httpx.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+
+	mux.HandleFunc("/api/v1/resolve", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		id := strings.TrimSpace(r.URL.Query().Get("id"))
+		org := strings.TrimSpace(r.URL.Query().Get("org"))
+		if id == "" {
+			httpx.JSON(w, http.StatusBadRequest, map[string]string{"error": "id required"})
+			return
+		}
+		if a, ok := mem.GetAgent(org, id); ok {
+			resp := model.ResolveResponse{IP: a.IP, Ports: a.Ports, ExpiresAt: time.Now().Add(60 * time.Second).UTC().Format(time.RFC3339)}
+			httpx.JSON(w, http.StatusOK, resp)
+			return
+		}
+		httpx.JSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+	})
+
+	mux.HandleFunc("/api/v1/agents", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		org := strings.TrimSpace(r.URL.Query().Get("org"))
+		list := mem.ListAgents(org)
+		httpx.JSON(w, http.StatusOK, list)
 	})
 
 	// lightweight in-memory metrics (JSON)
@@ -314,6 +380,63 @@ func main() {
 	// UI config (optional)
 	mux.HandleFunc("/api/ui-config", func(w http.ResponseWriter, r *http.Request) {
 		httpx.JSON(w, http.StatusOK, map[string]any{"name": cfg.Name})
+	})
+
+	// Register hostapp presence (type=gateway) to local in-memory registry
+	go func() {
+		info, _ := ts.Info(ctx, tsServer)
+		rec := &model.AgentRecord{
+			ID:       cfg.Hostname,
+			Org:      os.Getenv("ORG_ID"),
+			Hostname: cfg.Hostname,
+			IP:       "", // fill with tsnet IP if available
+			Ports:    map[string]int{"ui": 8080},
+			Version:  "hostapp",
+		}
+		if info != nil && info.IP != "" {
+			rec.IP = info.IP
+		}
+		if rec.IP == "" {
+			rec.IP = "100.64.0.1"
+		} // placeholder if info fails
+		rec.LastSeen = model.NowISO()
+		mem.UpsertAgent(rec)
+		// refresh periodically
+		tick := time.NewTicker(60 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				rec.LastSeen = model.NowISO()
+				mem.UpsertAgent(rec)
+			}
+		}
+	}()
+
+	// Smoke: resolve and attempt a tsnet dial to given id:port
+	mux.HandleFunc("/api/v1/smoke-dial", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimSpace(r.URL.Query().Get("id"))
+		port := strings.TrimSpace(r.URL.Query().Get("port"))
+		if id == "" || port == "" {
+			httpx.JSON(w, http.StatusBadRequest, map[string]string{"error": "id and port required"})
+			return
+		}
+		if a, ok := mem.GetAgent("", id); ok {
+			addr := a.IP + ":" + port
+			ctxDial, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			c, err := ts.DialContext(ctxDial, tsServer, "tcp", addr)
+			if err != nil {
+				httpx.JSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+				return
+			}
+			_ = c.Close()
+			httpx.JSON(w, http.StatusOK, map[string]string{"ok": addr})
+			return
+		}
+		httpx.JSON(w, http.StatusNotFound, map[string]string{"error": "id not found"})
 	})
 
 	// UI handling: serve compiled UI from ui/dist with SPA fallback to index.html (no redirects)
