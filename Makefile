@@ -4,6 +4,9 @@ PKG := ./...
 # Defaults (override as needed)
 LISTEN_LOCAL ?= 127.0.0.1:8080
 
+# User-scoped kubeconfig location (used by scripts and docs)
+GN_KUBECONFIG ?= $(HOME)/.guildnet/kubeconfig
+
 .PHONY: all help \
 	build build-backend build-ui \
 	run \
@@ -58,7 +61,7 @@ build-ui: ## Build UI (Vite)
 
 # ---------- Run ----------
 run: build ## Build all (backend+UI) and run backend (serve)
-	LISTEN_LOCAL=$(LISTEN_LOCAL) ./bin/$(BINARY) serve
+	KUBECONFIG=$(GN_KUBECONFIG) LISTEN_LOCAL=$(LISTEN_LOCAL) ./bin/$(BINARY) serve
 
 # ---------- DB / Health ----------
 db-health: ## Check database API and report availability
@@ -95,7 +98,7 @@ crd-apply: ## Apply (or update) GuildNet CRDs into current kube-context
 	@[ -d $(CRD_DIR) ] || { echo "CRD dir $(CRD_DIR) missing"; exit 1; }
 	@for f in $(CRD_DIR)/*.yaml; do \
 		echo "kubectl apply -f $$f"; \
-		kubectl apply -f $$f >/dev/null || exit 1; \
+		KUBECONFIG=$(GN_KUBECONFIG) kubectl apply -f $$f >/dev/null || exit 1; \
 	done; echo "CRDs applied"
 
 operator-run: ## Run workspace operator (controller-runtime manager) locally
@@ -148,6 +151,9 @@ local-overlay-up: ## Bring up local Headscale on LAN + router; prepares a workin
 # Examples:
 #   make talos-fresh FRESH_ARGS="--cluster myc --endpoint https://10.0.0.10:6443 --cp 10.0.0.10 --workers 10.0.0.20"
 #   make talos-upgrade UPGRADE_ARGS="--image ghcr.io/siderolabs/installer:v1.7.0 --nodes 10.0.0.10,10.0.0.20 --k8s v1.30.2"
+
+# Export KUBECONFIG for kubectl invocations that run via Make targets
+export KUBECONFIG := $(GN_KUBECONFIG)
 
 talos-fresh: ## Talos cluster fresh deploy
 	bash ./scripts/setup-talos.sh $(FRESH_ARGS)

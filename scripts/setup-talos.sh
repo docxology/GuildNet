@@ -3,6 +3,9 @@ set -euo pipefail
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$ROOT"
 
+# Export default kubeconfig path for consistency across steps
+export KUBECONFIG="${GN_KUBECONFIG:-$HOME/.guildnet/kubeconfig}"
+
 # 1) Preflight (reachability + overlay)
 bash "$ROOT/scripts/setup-talos-preflight.sh"
 

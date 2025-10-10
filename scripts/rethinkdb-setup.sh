@@ -15,6 +15,10 @@ set -euo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 [ -f "$ROOT/.env" ] && . "$ROOT/.env"
+
+# Ensure kubectl uses the GuildNet kubeconfig when available
+export KUBECONFIG="${KUBECONFIG:-${GN_KUBECONFIG:-$HOME/.guildnet/kubeconfig}}"
+
 NAMESPACE=${RETHINKDB_NAMESPACE:-${NAMESPACE:-default}}
 SERVICE_NAME=${RETHINKDB_SERVICE_NAME:-${SERVICE_NAME:-rethinkdb}}
 WAIT_SECONDS=${WAIT_SECONDS:-30}

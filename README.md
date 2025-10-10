@@ -68,8 +68,12 @@ Core setup scripts (one per component):
   - Install Tailscale client if missing; bring up router advertising `TS_ROUTES`.
   - Approve advertised routes in Headscale (best effort).
 - `scripts/setup-talos.sh`
-  - Run Talos fresh deploy via `scripts/talos-fresh-deploy.sh` using `.env`.
-  - Fetch kubeconfig via talosctl and validate nodes/pods readiness.
+  - Orchestrates modular Talos steps:
+    - `scripts/setup-talos-preflight.sh` (reachability + overlay checks)
+    - `scripts/setup-talos-config.sh` (talosctl gen config)
+    - `scripts/setup-talos-apply.sh` (reset/apply/bootstrap)
+    - `scripts/setup-talos-wait-kube.sh` (fetch kubeconfig, wait for API/nodes)
+  - Kubeconfig is written to `~/.guildnet/kubeconfig` and exported for subsequent kubectl operations.
 
 Support/verification scripts:
 - `scripts/enable-ip-forwarding.sh` – idempotent forwarding enable (sudo).
@@ -82,6 +86,10 @@ Make targets:
 - `make setup-tailscale` – runs Tailscale router setup.
 - `make setup-talos` – runs Talos setup.
 - `make setup-all` – runs all three in order.
+
+Kubeconfig:
+- Default path is user-scoped: `~/.guildnet/kubeconfig`.
+- The Makefile exports `KUBECONFIG=$(HOME)/.guildnet/kubeconfig` for kubectl-based targets (e.g., `crd-apply`).
 
 Operational tasks:
 - Join a device to Headscale/Tailscale: use the preauth key in `.env` (TS_AUTHKEY) on the device; subnet router uses `scripts/tailscale-router.sh` via `make router-up`.

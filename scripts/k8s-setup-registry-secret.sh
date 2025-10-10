@@ -3,6 +3,9 @@ set -euo pipefail
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 [ -f "$ROOT/.env" ] && . "$ROOT/.env"
 
+# Use GuildNet kubeconfig by default
+export KUBECONFIG="${KUBECONFIG:-${GN_KUBECONFIG:-$HOME/.guildnet/kubeconfig}}"
+
 NS=${K8S_NAMESPACE:-default}
 SECRET=${K8S_IMAGE_PULL_SECRET:-regcreds}
 

@@ -235,14 +235,17 @@ main() {
     fi
     # Force export of KUBECONFIG path for subshells (best effort)
     if [ -z "${KUBECONFIG:-}" ]; then
-      if [ -f "$HOME/.kube/config" ]; then
-        export KUBECONFIG="$HOME/.kube/config"
-      fi
+      export KUBECONFIG="${GN_KUBECONFIG:-$HOME/.guildnet/kubeconfig}"
     fi
   fi
 
   log "Fetching kubeconfig"
   talosctl kubeconfig --name "$CLUSTER" >/dev/null 2>&1 || true
+  # Move generated repo-local kubeconfig to user-scoped location
+  if [ -s "./kubeconfig" ]; then
+    mkdir -p "$(dirname "$KUBECONFIG")"
+    mv -f "./kubeconfig" "$KUBECONFIG" || true
+  fi
 
   log "Checking cluster health (kube API readiness)"
   total_wait=0; max_wait=300; interval=5
@@ -356,7 +359,7 @@ YAML
   else
     log "Skipping Tailscale subnet router deploy (TS_AUTHKEY not set)."
   fi
-  log "Kubeconfig: \${KUBECONFIG:-\"~/.kube/config\"}; Namespace: $NAMESPACE; Cluster: $CLUSTER"
+  log "Kubeconfig: ${KUBECONFIG:-"$HOME/.guildnet/kubeconfig"}; Namespace: $NAMESPACE; Cluster: $CLUSTER"
   # Ensure RethinkDB service is present and exposed for this local cluster
   if kubectl get nodes >/dev/null 2>&1; then
     if [ -x "$ROOT/scripts/rethinkdb-setup.sh" ]; then
