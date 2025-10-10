@@ -20,7 +20,7 @@ import (
 
 // DBAPI bundles dependencies needed by database handlers.
 type DBAPI struct {
-	Manager *db.Manager
+	Manager DBManager
 	// For MVP we assume single org until auth/tenancy implemented. Stub OrgID.
 	OrgID string
 	RBAC  *RBACStore
@@ -780,7 +780,7 @@ func (a *DBAPI) handleChangefeed(w http.ResponseWriter, r *http.Request) {
 
 // Helper to start DBAPI after manager creation.
 func InitAndRegisterDB(mux *http.ServeMux, mgr *db.Manager) {
-	api := &DBAPI{Manager: mgr, OrgID: "org-demo", RBAC: NewRBACStore()}
+	api := &DBAPI{Manager: DBManager(mgr), OrgID: "org-demo", RBAC: NewRBACStore()}
 	api.RBAC.Grant(model.PermissionBinding{Principal: "user:demo", Scope: "db:org-demo", Role: model.RoleMaintainer, CreatedAt: model.NowISO()})
 	api.Register(mux)
 	log.Printf("db api registered (org=%s)", api.OrgID)
