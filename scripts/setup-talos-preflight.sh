@@ -5,6 +5,13 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 need talosctl
 
+# Router health gate (best-effort)
+if command -v tailscale >/dev/null 2>&1; then
+  if ! tailscale status >/dev/null 2>&1; then
+    echo "WARN: tailscale not connected; run: make setup-tailscale" >&2
+  fi
+fi
+
 echo "[0/7] Preflight: checking node reachability on TCP :$PRECHECK_PORT"
 UNREACH=0
 if [[ -n "$CP_NODES" ]]; then
@@ -39,7 +46,14 @@ if [[ $UNREACH -eq 1 ]]; then
     [[ $all_ok -eq 1 ]] && break
     sleep 5
   done
-  [[ $all_ok -ne 1 ]] && { echo "ERROR: Nodes still unreachable after wait." >&2; exit 1; }
+  [[ $all_ok -ne 1 ]] && {
+    echo "ERROR: Nodes still unreachable after wait." >&2
+    echo "Hints:" >&2
+    echo "  - Ensure Talos nodes are booted and reachable (10.0.0.10/20)." >&2
+    echo "  - Or use forwarded endpoints in .env (e.g., CP_NODES=127.0.0.1:50010, WK_NODES=127.0.0.1:50020 with *_REAL set)." >&2
+    echo "  - Verify router Connected and routes Enabled (make diag-router)." >&2
+    exit 1
+  }
 fi
 
 echo "[1.5/7] Verifying Talos maintenance API via forwarder (talosctl version)..."

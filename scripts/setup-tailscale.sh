@@ -6,9 +6,13 @@ cd "$ROOT"
 # 1) Ensure forwarding (may prompt for sudo)
 bash "$ROOT/scripts/enable-ip-forwarding.sh" || true
 
+# 1.5) Ensure tailscaled is running and try to grant operator (best effort)
+make router-daemon || true
+make router-grant-operator || true
+
 # 2) Install and bring up host tailscale router
 make router-install || true
-make router-up
+make router-up || true
 make router-status || true
 
 # 3) Approve routes in Headscale (best-effort)

@@ -197,7 +197,12 @@ func main() {
 	log.SetFlags(0)
 	cmd := "serve"
 	if len(os.Args) > 1 {
-		cmd = os.Args[1]
+		// Compatibility shim: support "--mode operator"
+		if os.Args[1] == "--mode" && len(os.Args) > 2 && os.Args[2] == "operator" {
+			cmd = "operator"
+		} else {
+			cmd = os.Args[1]
+		}
 	}
 
 	switch cmd {
@@ -207,10 +212,23 @@ func main() {
 		}
 		fmt.Println("config written to", config.ConfigPath())
 		return
+	case "operator":
+		// Run only the operator manager (no tsnet or HTTP server)
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		kcli, err := k8s.New(ctx)
+		if err != nil || kcli == nil || kcli.Rest == nil {
+			log.Fatalf("k8s config: %v", err)
+		}
+		if err := startOperator(ctx, kcli.Rest); err != nil {
+			log.Fatalf("operator start: %v", err)
+		}
+		<-ctx.Done()
+		return
 	case "serve":
 		// continue
 	default:
-		log.Fatalf("unknown command: %s (use 'init' or 'serve')", cmd)
+		log.Fatalf("unknown command: %s (use 'init', 'serve', or 'operator')", cmd)
 	}
 
 	cfg, err := config.Load()

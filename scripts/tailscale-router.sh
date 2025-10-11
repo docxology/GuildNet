@@ -50,11 +50,11 @@ start() {
   if ! need tailscaled; then err "tailscaled not installed; run: scripts/tailscale-router.sh install"; exit 1; fi
   # Start daemon if not running
   if command -v systemctl >/dev/null 2>&1; then
-    # Try non-interactive start; ignore failures
+    # Try user/system, then sudo (non-interactive) as fallback
     systemctl --user enable --now tailscaled 2>/dev/null || true
-    systemctl enable --now tailscaled 2>/dev/null || true
+    systemctl enable --now tailscaled 2>/dev/null || sudo -n systemctl enable --now tailscaled 2>/dev/null || true
   elif command -v service >/dev/null 2>&1; then
-    service tailscaled start || true
+    service tailscaled start || sudo -n service tailscaled start || true
   else
     # macOS: try brew services first, otherwise run tailscaled in user space
     if command -v brew >/dev/null 2>&1; then
@@ -62,13 +62,10 @@ start() {
     fi
     # If still not running, start a user-space tailscaled without sudo
     if ! tailscale status >/dev/null 2>&1; then
-      # Use a writable state path in user space
       STATE_DIR="$HOME/Library/Application Support/tsnet-router"
       mkdir -p "$STATE_DIR"
       nohup tailscaled --state="$STATE_DIR/tailscaled.state" >/tmp/tailscaled.router.log 2>&1 &
-      # wait up to 15s for tailscaled
-      for i in $(seq 1 15); do
-        if tailscale status >/dev/null 2>&1; then break; fi; sleep 1; done
+      for i in $(seq 1 15); do if tailscale status >/dev/null 2>&1; then break; fi; sleep 1; done
     fi
   fi
 }
@@ -79,8 +76,8 @@ up() {
     err "TS_LOGIN_SERVER points to 127.0.0.1 which may not be reachable from this router host. Use a reachable URL."
   fi
   start
-  # Non-interactive tailscale up; avoid sudo to skip prompts
-  tailscale up \
+  # Try without sudo first
+  if tailscale up \
     --reset \
     --authkey="$TS_AUTHKEY" \
     --login-server="$TS_LOGIN_SERVER" \
@@ -88,15 +85,45 @@ up() {
     --hostname="$TS_HOSTNAME" \
     --accept-routes \
     --accept-dns=false \
-    --timeout=60s || {
-      err "tailscale up failed non-interactively. Ensure Tailscale app is installed and has network permissions granted once manually."
-      exit 1
-    }
+    --timeout=60s; then
+    return 0
+  fi
+  # Try non-interactive sudo
+  if command -v sudo >/dev/null 2>&1; then
+    sudo -n tailscale set --operator="$USER" >/dev/null 2>&1 || true
+    if sudo -n tailscale up \
+      --reset \
+      --authkey="$TS_AUTHKEY" \
+      --login-server="$TS_LOGIN_SERVER" \
+      --advertise-routes="$TS_ROUTES" \
+      --hostname="$TS_HOSTNAME" \
+      --accept-routes \
+      --accept-dns=false \
+      --timeout=60s; then
+      return 0
+    fi
+    echo "sudo privilege required to complete 'tailscale up' (will prompt)." >&2
+    # Interactive sudo fallback (one-time)
+    if sudo tailscale set --operator="$USER" 2>/dev/null || true; then :; fi
+    if sudo tailscale up \
+      --reset \
+      --authkey="$TS_AUTHKEY" \
+      --login-server="$TS_LOGIN_SERVER" \
+      --advertise-routes="$TS_ROUTES" \
+      --hostname="$TS_HOSTNAME" \
+      --accept-routes \
+      --accept-dns=false \
+      --timeout=60s; then
+      return 0
+    fi
+  fi
+  err "tailscale up failed. Ensure the daemon is running and the auth key is valid."
+  exit 1
 }
 
 down() {
   if need tailscale; then
-    sudo tailscale down || true
+    sudo -n tailscale down || tailscale down || true
   fi
 }
 
