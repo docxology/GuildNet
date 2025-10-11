@@ -25,4 +25,5 @@ type DBManager interface {
 
 	ListAudit(ctx context.Context, orgID, dbID string, limit int) ([]model.AuditEvent, error)
 	SubscribeTable(ctx context.Context, orgID, dbID, table string) (*db.ChangefeedStream, error)
+	Ping(ctx context.Context) error
 }

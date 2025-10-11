@@ -111,6 +111,7 @@ func (m *mockManager) ListAudit(ctx context.Context, orgID, dbID string, limit i
 func (m *mockManager) SubscribeTable(ctx context.Context, orgID, dbID, table string) (*db.ChangefeedStream, error) {
 	return nil, nil
 }
+func (m *mockManager) Ping(ctx context.Context) error { return nil }
 
 func setupTestServer(t *testing.T) *httptest.Server {
 	t.Helper()

@@ -32,7 +32,9 @@ func (a *DBAPI) ensureManager(ctx context.Context) {
 	if a.Manager != nil {
 		return
 	}
-	if mgr, err := db.Connect(ctx); err == nil {
+	cctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	if mgr, err := db.Connect(cctx); err == nil {
 		a.Manager = mgr
 	} else {
 		log.Printf("db lazy connect failed: %v", err)
@@ -48,20 +50,26 @@ func (a *DBAPI) Register(mux *http.ServeMux) {
 	// DB connectivity health
 	mux.HandleFunc("/api/db/health", func(w http.ResponseWriter, r *http.Request) {
 		status := "ok"
-		resp := map[string]any{"status": status}
+		addr := db.AutoDiscoverAddr()
+		resp := map[string]any{"status": status, "addr": addr}
 		if a.Manager == nil {
 			// Best-effort lazy connect: if DB becomes reachable after server start, initialize manager now.
 			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 			defer cancel()
-			addr := db.AutoDiscoverAddr()
 			if mgr, err := db.Connect(ctx); err == nil {
 				a.Manager = mgr
 			} else {
 				status = "unavailable"
 				resp["status"] = status
-				resp["addr"] = addr
 				resp["error"] = err.Error()
 				log.Printf("db health lazy connect failed: addr=%s err=%v", addr, err)
+			}
+		}
+		if a.Manager != nil {
+			if err := a.Manager.Ping(r.Context()); err != nil {
+				status = "unavailable"
+				resp["status"] = status
+				resp["error"] = err.Error()
 			}
 		}
 		JSON(w, http.StatusOK, resp)
@@ -804,7 +812,15 @@ func InitAndRegisterDB(mux *http.ServeMux, mgr *db.Manager) {
 	if org == "" {
 		org = "default"
 	}
-	api := &DBAPI{Manager: DBManager(mgr), OrgID: org, RBAC: NewRBACStore()}
+	// Important: do NOT wrap a nil *db.Manager into the DBManager interface, as that
+	// would produce a non-nil interface holding a typed nil, breaking nil checks.
+	var dm DBManager
+	if mgr != nil {
+		dm = mgr
+	} else {
+		dm = nil
+	}
+	api := &DBAPI{Manager: dm, OrgID: org, RBAC: NewRBACStore()}
 	// Grant demo principal maintainer on the org scope for quick-starts
 	api.RBAC.Grant(model.PermissionBinding{Principal: "user:demo", Scope: fmt.Sprintf("db:%s", org), Role: model.RoleMaintainer, CreatedAt: model.NowISO()})
 	api.Register(mux)

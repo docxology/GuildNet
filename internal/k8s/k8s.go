@@ -50,16 +50,25 @@ func kubeconfigDefault() string {
 func New(ctx context.Context) (*Client, error) {
 	var cfg *rest.Config
 	var err error
-	cfg, err = rest.InClusterConfig()
-	if err != nil {
-		// fallback to kubeconfig
-		kc := kubeconfigDefault()
-		if kc == "" {
-			return nil, fmt.Errorf("no in-cluster config and no kubeconfig")
+	// Prefer explicit proxy URL if provided (e.g., started by run-hostapp)
+	if proxy := strings.TrimSpace(os.Getenv("HOSTAPP_API_PROXY_URL")); proxy != "" {
+		cfg = &rest.Config{Host: proxy}
+		// For HTTP proxy, no TLS; for HTTPS, allow insecure if forced by env
+		if strings.HasPrefix(proxy, "https://") {
+			cfg.TLSClientConfig = rest.TLSClientConfig{Insecure: strings.TrimSpace(os.Getenv("HOSTAPP_API_PROXY_FORCE_HTTP")) == "1"}
 		}
-		cfg, err = clientcmd.BuildConfigFromFlags("", kc)
+	} else {
+		cfg, err = rest.InClusterConfig()
 		if err != nil {
-			return nil, err
+			// fallback to kubeconfig
+			kc := kubeconfigDefault()
+			if kc == "" {
+				return nil, fmt.Errorf("no in-cluster config and no kubeconfig")
+			}
+			cfg, err = clientcmd.BuildConfigFromFlags("", kc)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	cs, err := kubernetes.NewForConfig(cfg)

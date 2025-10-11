@@ -42,6 +42,12 @@ if [ -z "${HOSTAPP_API_PROXY_URL:-}" ]; then
   fi
 fi
 
+# Database discovery hints (let the server resolve via Kubernetes API using kubeconfig)
+: "${RETHINKDB_SERVICE_NAME:=rethinkdb}"
+# Allow RETHINKDB_NAMESPACE to be set via .env or fall back to K8S_NAMESPACE or "default"
+RETHINKDB_NAMESPACE="${RETHINKDB_NAMESPACE:-${K8S_NAMESPACE:-default}}"
+export RETHINKDB_SERVICE_NAME RETHINKDB_NAMESPACE
+
 # Force reliable IDE access via local port-forward fallback unless user overrides
 : "${HOSTAPP_USE_PORT_FORWARD:=1}"
 export HOSTAPP_USE_PORT_FORWARD

@@ -52,7 +52,8 @@ spec:
               name: cluster
             - containerPort: 8080
               name: admin
-          args: ["rethinkdb", "--bind", "all"]
+          command: ["rethinkdb"]
+          args: ["--bind","all","--cache-size","128"]
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -60,14 +61,15 @@ spec:
             runAsUser: 1000
             runAsGroup: 1000
           readinessProbe:
-            exec:
-              command: ["/bin/bash", "-lc", "</dev/tcp/127.0.0.1/28015"]
-            initialDelaySeconds: 3
-            periodSeconds: 5
+            tcpSocket:
+              port: 28015
+            initialDelaySeconds: 5
+            periodSeconds: 3
+            failureThreshold: 10
           livenessProbe:
-            exec:
-              command: ["/bin/bash", "-lc", "</dev/tcp/127.0.0.1/28015"]
-            initialDelaySeconds: 10
+            tcpSocket:
+              port: 28015
+            initialDelaySeconds: 15
             periodSeconds: 10
           volumeMounts:
             - name: data

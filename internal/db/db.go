@@ -26,6 +26,8 @@ type Manager struct {
 	mu   sync.RWMutex
 	// simple sequence generator for changefeed cursor tokens (monotonic per manager)
 	seq uint64
+	// keep a port-forward manager alive if we had to establish a PF to reach DB
+	pfm *k8sclient.PortForwardManager
 }
 
 // Connect creates a Manager using env vars and auto-discovery:
@@ -36,6 +38,47 @@ type Manager struct {
 //   - Outside Kubernetes: fallback localhost:28015
 func Connect(ctx context.Context) (*Manager, error) {
 	addr := AutoDiscoverAddr()
+	// If the discovered address isn’t reachable, try to create a temporary port-forward via the Kubernetes API
+	if !canDialFast(addr, 300*time.Millisecond) {
+		cctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+		defer cancel()
+		if kc, err := k8sclient.New(cctx); err == nil && kc != nil && kc.K != nil {
+			ns := strings.TrimSpace(os.Getenv("RETHINKDB_NAMESPACE"))
+			if ns == "" {
+				ns = strings.TrimSpace(os.Getenv("K8S_NAMESPACE"))
+			}
+			if ns == "" {
+				ns = "default"
+			}
+			pods, err := kc.K.CoreV1().Pods(ns).List(cctx, metav1.ListOptions{LabelSelector: "app=rethinkdb"})
+			if err == nil {
+				var podName string
+				for _, p := range pods.Items {
+					if p.Status.Phase == corev1.PodRunning {
+						// ensure container is Ready
+						ready := false
+						for _, cs := range p.Status.ContainerStatuses {
+							if cs.Ready {
+								ready = true
+								break
+							}
+						}
+						if ready {
+							podName = p.Name
+							break
+						}
+					}
+				}
+				if podName != "" {
+					pfm := k8sclient.NewPortForwardManager(kc.Rest, ns)
+					if lp, err := pfm.Ensure(cctx, ns, podName, 28015); err == nil {
+						addr = fmt.Sprintf("127.0.0.1:%d", lp)
+					}
+				}
+			}
+		}
+	}
+
 	opts := r.ConnectOpts{Address: addr, InitialCap: 5, MaxOpen: 20, Timeout: 5 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second}
 	if u := os.Getenv("RETHINKDB_USER"); u != "" {
 		opts.Username = u
@@ -45,7 +88,7 @@ func Connect(ctx context.Context) (*Manager, error) {
 	}
 	sess, err := r.Connect(opts)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("rethinkdb connect failed addr=%s: %w", addr, err)
 	}
 	return &Manager{sess: sess}, nil
 }
@@ -63,13 +106,12 @@ func AutoDiscoverAddr() string {
 	}
 	inCluster := strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_HOST")) != ""
 	if !inCluster {
-		// Outside Kubernetes: prefer local loopback port-forward in dev if it is available
-		if canDialFast("127.0.0.1:28015", 150*time.Millisecond) {
-			return "127.0.0.1:28015"
+		// If a proxy URL to the API is provided, the k8s client will honor it
+		if proxy := strings.TrimSpace(os.Getenv("HOSTAPP_API_PROXY_URL")); proxy != "" {
+			_ = proxy // presence hints that discovery via API should work even without direct apiserver access
 		}
-		// Otherwise, consult the Kubernetes API (via kubeconfig) to resolve the Service external address.
-		// This keeps the cluster as the source of truth without requiring server-managed port-forwards.
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		// Prefer Kubernetes API service discovery via kubeconfig first
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		if kc, err := k8sclient.New(ctx); err == nil && kc != nil && kc.K != nil {
 			svcName := strings.TrimSpace(os.Getenv("RETHINKDB_SERVICE_NAME"))
@@ -84,13 +126,12 @@ func AutoDiscoverAddr() string {
 				ns = "default"
 			}
 			if svc, err := kc.K.CoreV1().Services(ns).Get(ctx, svcName, metav1.GetOptions{}); err == nil && svc != nil {
-				// Prefer LoadBalancer ingress IP/hostname
+				// Prefer LoadBalancer
 				if ing := svc.Status.LoadBalancer.Ingress; len(ing) > 0 {
 					host := ing[0].IP
 					if host == "" {
 						host = ing[0].Hostname
 					}
-					// choose client port (28015) if present, else first port
 					port := int32(28015)
 					for _, sp := range svc.Spec.Ports {
 						if sp.Name == "client" || sp.Port == 28015 {
@@ -102,9 +143,8 @@ func AutoDiscoverAddr() string {
 						return fmt.Sprintf("%s:%d", host, port)
 					}
 				}
-				// Fallback: if Service is NodePort, try to build a reachable address using a node IP
+				// NodePort fallback
 				if svc.Spec.Type == corev1.ServiceTypeNodePort {
-					// pick nodePort for the client port (or first)
 					var nodePort int32
 					for _, sp := range svc.Spec.Ports {
 						if sp.Name == "client" || sp.Port == 28015 {
@@ -121,10 +161,10 @@ func AutoDiscoverAddr() string {
 								extIP := ""
 								intIP := ""
 								for _, addr := range n.Status.Addresses {
-									if addr.Type == corev1.NodeExternalIP && strings.TrimSpace(addr.Address) != "" && extIP == "" {
+									if addr.Type == corev1.NodeExternalIP && extIP == "" && strings.TrimSpace(addr.Address) != "" {
 										extIP = addr.Address
 									}
-									if addr.Type == corev1.NodeInternalIP && strings.TrimSpace(addr.Address) != "" && intIP == "" {
+									if addr.Type == corev1.NodeInternalIP && intIP == "" && strings.TrimSpace(addr.Address) != "" {
 										intIP = addr.Address
 									}
 								}
@@ -134,15 +174,29 @@ func AutoDiscoverAddr() string {
 								return intIP
 							}
 							for _, n := range nodes.Items {
-								h := pickIP(n)
-								if strings.TrimSpace(h) != "" {
+								if h := pickIP(n); strings.TrimSpace(h) != "" {
 									return fmt.Sprintf("%s:%d", h, nodePort)
 								}
 							}
 						}
 					}
 				}
+				// As a last resort (no LB/NodePort), try ClusterIP directly — often reachable via overlay/router
+				if svc.Spec.ClusterIP != "" && svc.Spec.ClusterIP != "None" {
+					port := int32(28015)
+					for _, sp := range svc.Spec.Ports {
+						if sp.Name == "client" || sp.Port == 28015 {
+							port = sp.Port
+							break
+						}
+					}
+					return fmt.Sprintf("%s:%d", svc.Spec.ClusterIP, port)
+				}
 			}
+		}
+		// As a last resort in dev, prefer local loopback if something is already listening (e.g., user port-forward)
+		if canDialFast("127.0.0.1:28015", 150*time.Millisecond) {
+			return "127.0.0.1:28015"
 		}
 	}
 	// Direct service host/port envs (set automatically for Services)
@@ -155,7 +209,6 @@ func AutoDiscoverAddr() string {
 		return host + ":" + port
 	}
 	if inCluster {
-		// Build DNS from service name and namespace
 		svc := strings.TrimSpace(os.Getenv("RETHINKDB_SERVICE_NAME"))
 		if svc == "" {
 			svc = "rethinkdb"
@@ -184,7 +237,7 @@ func AutoDiscoverAddr() string {
 		}
 		return fmt.Sprintf("%s.%s.svc.cluster.local:28015", svc, ns)
 	}
-	// Outside cluster: assume local dev; prefer IPv4 loopback to avoid IPv6 (::1) resolution mismatches
+	// Outside cluster fallback
 	return "127.0.0.1:28015"
 }
 
@@ -234,7 +287,19 @@ func dbName(orgID, dbID string) string {
 // EnsureDatabase creates the database if absent for the given org and dbID
 func (m *Manager) EnsureDatabase(ctx context.Context, orgID, dbID string) error {
 	name := dbName(orgID, dbID)
-	cur, err := r.DBList().Run(m.sess)
+	var cur *r.Cursor
+	var err error
+	// retry DBList on transient errors
+	for i := 0; i < 3; i++ {
+		cur, err = r.DBList().Run(m.sess)
+		if err == nil {
+			break
+		}
+		if !isTransientErr(err) {
+			break
+		}
+		time.Sleep(time.Duration(200*(i+1)) * time.Millisecond)
+	}
 	if err != nil {
 		return err
 	}
@@ -251,26 +316,84 @@ func (m *Manager) EnsureDatabase(ctx context.Context, orgID, dbID string) error 
 		}
 	}
 	if !found {
-		if _, err := r.DBCreate(name).RunWrite(m.sess); err != nil {
+		var wres r.WriteResponse
+		for i := 0; i < 3; i++ {
+			wres, err = r.DBCreate(name).RunWrite(m.sess)
+			if err == nil {
+				break
+			}
+			if !isTransientErr(err) {
+				break
+			}
+			time.Sleep(time.Duration(200*(i+1)) * time.Millisecond)
+		}
+		if err != nil {
 			return err
 		}
+		_ = wres
 	}
 	// Always ensure meta tables exist for this database
 	return m.ensureMetaTables(ctx, orgID, dbID)
+}
+
+func isTransientErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	if strings.Contains(s, "no primary replica") || strings.Contains(s, "not available") || strings.Contains(s, "connection reset") || strings.Contains(s, "broken pipe") || strings.Contains(s, "timed out") || strings.Contains(s, "eof") {
+		return true
+	}
+	return false
+}
+
+func retryTransient(attempts int, fn func() error) error {
+	if attempts < 1 {
+		attempts = 1
+	}
+	var err error
+	for i := 0; i < attempts; i++ {
+		err = fn()
+		if err == nil {
+			return nil
+		}
+		if !isTransientErr(err) && !strings.Contains(strings.ToLower(err.Error()), "no such database") && !strings.Contains(strings.ToLower(err.Error()), "db") {
+			return err
+		}
+		time.Sleep(time.Duration(200*(i+1)) * time.Millisecond)
+	}
+	return err
 }
 
 // ensureMetaTables creates internal meta tables (_schemas, _audit) if absent.
 func (m *Manager) ensureMetaTables(ctx context.Context, orgID, dbID string) error {
 	dbn := dbName(orgID, dbID)
 	// Ensure schemas and audit tables exist
-	if _, err := r.DB(dbn).TableCreate("_schemas").RunWrite(m.sess); err != nil && !strings.Contains(err.Error(), "already exists") {
+	if err := retryTransient(5, func() error {
+		_, err := r.DB(dbn).TableCreate("_schemas").RunWrite(m.sess)
+		if err != nil && !strings.Contains(err.Error(), "already exists") {
+			return err
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
-	if _, err := r.DB(dbn).TableCreate("_audit").RunWrite(m.sess); err != nil && !strings.Contains(err.Error(), "already exists") {
+	if err := retryTransient(5, func() error {
+		_, err := r.DB(dbn).TableCreate("_audit").RunWrite(m.sess)
+		if err != nil && !strings.Contains(err.Error(), "already exists") {
+			return err
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
-	// Ensure a one-row _info table for database metadata
-	if _, err := r.DB(dbn).TableCreate("_info").RunWrite(m.sess); err != nil && !strings.Contains(err.Error(), "already exists") {
+	if err := retryTransient(5, func() error {
+		_, err := r.DB(dbn).TableCreate("_info").RunWrite(m.sess)
+		if err != nil && !strings.Contains(err.Error(), "already exists") {
+			return err
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
 	return nil
@@ -580,9 +703,16 @@ func (m *Manager) CreateDatabase(ctx context.Context, orgID, dbID, name, descrip
 	}
 	dbn := dbName(orgID, dbID)
 	// write metadata
-	_ = m.ensureMetaTables(ctx, orgID, dbID)
+	if err := m.ensureMetaTables(ctx, orgID, dbID); err != nil {
+		return model.DatabaseInstance{}, err
+	}
 	meta := map[string]any{"id": "db", "name": name, "description": description, "created_at": model.NowISO()}
-	_, _ = r.DB(dbn).Table("_info").Insert(meta, r.InsertOpts{Conflict: "replace"}).RunWrite(m.sess)
+	if err := retryTransient(5, func() error {
+		_, err := r.DB(dbn).Table("_info").Insert(meta, r.InsertOpts{Conflict: "replace"}).RunWrite(m.sess)
+		return err
+	}); err != nil {
+		return model.DatabaseInstance{}, err
+	}
 	return model.DatabaseInstance{ID: dbID, OrgID: orgID, Name: name, Description: description, CreatedAt: meta["created_at"].(string)}, nil
 }
 
@@ -639,3 +769,28 @@ func (m *Manager) DeleteDatabase(ctx context.Context, orgID, dbID string) error 
 
 // ErrNotFound sentinel.
 var ErrNotFound = errors.New("not found")
+
+// Ping verifies the connection by issuing a lightweight query.
+func (m *Manager) Ping(ctx context.Context) error {
+	if m == nil || m.sess == nil {
+		return fmt.Errorf("no session")
+	}
+	cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		cur, err := r.DBList().Run(m.sess)
+		if err != nil {
+			done <- err
+			return
+		}
+		cur.Close()
+		done <- nil
+	}()
+	select {
+	case <-cctx.Done():
+		return cctx.Err()
+	case err := <-done:
+		return err
+	}
+}
