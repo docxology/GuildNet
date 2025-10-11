@@ -963,14 +963,22 @@ func main() {
 			fmt.Sscanf(v, "%d", &tail)
 		}
 
-		// Validate before switching to SSE
-		if id == "" {
+		// Validate target exists (CRD-aware)
+		if strings.TrimSpace(id) == "" {
 			httpx.JSONError(w, http.StatusBadRequest, "missing target", "missing_target")
 			return
 		}
-		if _, err := kcli.GetServer(r.Context(), defaultNS, id); err != nil {
-			httpx.JSONError(w, http.StatusNotFound, "unknown target", "not_found")
-			return
+		if dyn != nil {
+			gvr := schema.GroupVersionResource{Group: "guildnet.io", Version: "v1alpha1", Resource: "workspaces"}
+			if _, err := dyn.Resource(gvr).Namespace(defaultNS).Get(r.Context(), id, metav1.GetOptions{}); err != nil {
+				httpx.JSONError(w, http.StatusNotFound, "unknown target", "not_found")
+				return
+			}
+		} else {
+			if _, err := kcli.GetServer(r.Context(), defaultNS, id); err != nil {
+				httpx.JSONError(w, http.StatusNotFound, "unknown target", "not_found")
+				return
+			}
 		}
 
 		flusher, ok := w.(http.Flusher)
@@ -986,32 +994,74 @@ func main() {
 		log.Printf("sse/logs open: target=%s level=%s tail=%d from %s", id, level, tail, r.RemoteAddr)
 		enc := json.NewEncoder(w)
 
-		// send tail first (best effort) via k8s logs
-		if lines, err := kcli.GetLogs(r.Context(), defaultNS, id, level, tail); err != nil {
-			log.Printf("sse/logs tail error: target=%s level=%s err=%v", id, level, err)
-		} else {
-			for _, ln := range lines {
-				if _, err := w.Write([]byte("data: ")); err != nil {
-					log.Printf("sse/logs write error: %v", err)
-					return
-				}
-				if err := enc.Encode(ln); err != nil {
-					log.Printf("sse/logs encode error: %v", err)
-					return
-				}
-				if _, err := w.Write([]byte("\n")); err != nil {
-					log.Printf("sse/logs write error: %v", err)
-					return
-				}
-				flusher.Flush()
+		// send tail first (best effort) by reading pods matching the Workspace label
+		func() {
+			defer func() { recover() }() // keep SSE alive on tail errors
+			pods, err := kcli.K.CoreV1().Pods(defaultNS).List(r.Context(), metav1.ListOptions{LabelSelector: fmt.Sprintf("guildnet.io/workspace=%s", id)})
+			if err != nil || len(pods.Items) == 0 {
+				return
 			}
-		}
+			// Sort pods: ready first
+			readyPods := []corev1.Pod{}
+			unreadyPods := []corev1.Pod{}
+			for _, p := range pods.Items {
+				isReady := false
+				for _, c := range p.Status.Conditions {
+					if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
+						isReady = true
+						break
+					}
+				}
+				if isReady {
+					readyPods = append(readyPods, p)
+				} else {
+					unreadyPods = append(unreadyPods, p)
+				}
+			}
+			ordered := append(readyPods, unreadyPods...)
+			maxPods := 5
+			if len(ordered) < maxPods {
+				maxPods = len(ordered)
+			}
+			tailPer := int64(tail)
+			if maxPods > 1 {
+				tp := int64(tail / maxPods)
+				if tp >= 10 {
+					tailPer = tp
+				}
+			}
+			for i := 0; i < maxPods; i++ {
+				p := ordered[i]
+				container := ""
+				if len(p.Spec.Containers) > 0 {
+					container = p.Spec.Containers[0].Name
+				}
+				req := kcli.K.CoreV1().Pods(defaultNS).GetLogs(p.Name, &corev1.PodLogOptions{Container: container, TailLines: &tailPer})
+				data, err := req.Do(r.Context()).Raw()
+				if err != nil {
+					continue
+				}
+				for _, ln := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+					if ln == "" {
+						continue
+					}
+					if _, err := w.Write([]byte("data: ")); err != nil {
+						return
+					}
+					if err := enc.Encode(model.LogLine{T: model.NowISO(), LVL: level, MSG: fmt.Sprintf("[%s] %s", p.Name, ln)}); err != nil {
+						return
+					}
+					if _, err := w.Write([]byte("\n")); err != nil {
+						return
+					}
+					flusher.Flush()
+				}
+			}
+		}()
 
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
-		// For now, no live watch wired; send heartbeats and rely on polling logs endpoint in UI when needed.
-		ch := make(chan model.LogLine)
-		defer close(ch)
+		// For now, no live watch wired; send heartbeats periodically
 		heartbeat := time.NewTicker(20 * time.Second)
 		defer heartbeat.Stop()
 		for {
@@ -1022,24 +1072,6 @@ func main() {
 			case <-heartbeat.C:
 				if _, err := w.Write([]byte(": ping\n\n")); err != nil {
 					log.Printf("sse/logs heartbeat write error: %v", err)
-					return
-				}
-				flusher.Flush()
-			case ln, ok := <-ch:
-				if !ok {
-					log.Printf("sse/logs close: target=%s level=%s from=%s reason=channel-closed", id, level, r.RemoteAddr)
-					return
-				}
-				if _, err := w.Write([]byte("data: ")); err != nil {
-					log.Printf("sse/logs write error: %v", err)
-					return
-				}
-				if err := enc.Encode(ln); err != nil {
-					log.Printf("sse/logs encode error: %v", err)
-					return
-				}
-				if _, err := w.Write([]byte("\n")); err != nil {
-					log.Printf("sse/logs write error: %v", err)
 					return
 				}
 				flusher.Flush()
@@ -1303,7 +1335,26 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 	var v6Srv *http.Server
-	if host, port, err := net.SplitHostPort(cfg.ListenLocal); err == nil {
+	// Pre-bind local listener and fall back if the preferred port is unavailable.
+	bindAddr := cfg.ListenLocal
+	lnLocal, err := net.Listen("tcp", bindAddr)
+	if err != nil {
+		candidates := []string{"127.0.0.1:9443", "127.0.0.1:8081", "127.0.0.1:8443"}
+		for _, a := range candidates {
+			if l, e := net.Listen("tcp", a); e == nil {
+				lnLocal = l
+				bindAddr = a
+				localSrv.Addr = bindAddr
+				break
+			}
+		}
+		if lnLocal == nil {
+			log.Fatalf("local listen failed: %v", err)
+		}
+	}
+	// Also prepare an IPv6 loopback listener on the same port when using localhost/127.0.0.1
+	var lnLocalV6 net.Listener
+	if host, port, err := net.SplitHostPort(bindAddr); err == nil {
 		if host == "127.0.0.1" || strings.EqualFold(host, "localhost") {
 			v6Srv = &http.Server{
 				Addr:         net.JoinHostPort("::1", port),
@@ -1311,6 +1362,9 @@ func main() {
 				ReadTimeout:  10 * time.Second,
 				WriteTimeout: 10 * time.Second,
 				IdleTimeout:  60 * time.Second,
+			}
+			if l6, e6 := net.Listen("tcp", v6Srv.Addr); e6 == nil {
+				lnLocalV6 = l6
 			}
 		}
 	}
@@ -1334,12 +1388,12 @@ func main() {
 	}
 
 	errCh := make(chan error, 3)
-	go func() { errCh <- localSrv.ListenAndServeTLS(certFile, keyFile) }()
-	if v6Srv != nil {
-		go func() { errCh <- v6Srv.ListenAndServeTLS(certFile, keyFile) }()
+	go func() { errCh <- localSrv.ServeTLS(lnLocal, certFile, keyFile) }()
+	if v6Srv != nil && lnLocalV6 != nil {
+		go func() { errCh <- v6Srv.ServeTLS(lnLocalV6, certFile, keyFile) }()
 	}
 	go func() { errCh <- tsSrv.ServeTLS(ln, certFile, keyFile) }()
-	log.Printf("serving TLS on local %s and tailscale listener :443", cfg.ListenLocal)
+	log.Printf("serving TLS on local %s and tailscale listener :443", bindAddr)
 
 	select {
 	case <-ctx.Done():

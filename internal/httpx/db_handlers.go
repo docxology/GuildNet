@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -24,6 +25,18 @@ type DBAPI struct {
 	// For MVP we assume single org until auth/tenancy implemented. Stub OrgID.
 	OrgID string
 	RBAC  *RBACStore
+}
+
+// ensureManager lazily initializes the DB manager if it's nil.
+func (a *DBAPI) ensureManager(ctx context.Context) {
+	if a.Manager != nil {
+		return
+	}
+	if mgr, err := db.Connect(ctx); err == nil {
+		a.Manager = mgr
+	} else {
+		log.Printf("db lazy connect failed: %v", err)
+	}
 }
 
 // Register attaches handlers to mux.
@@ -56,6 +69,8 @@ func (a *DBAPI) Register(mux *http.ServeMux) {
 }
 
 func (a *DBAPI) handleDatabases(w http.ResponseWriter, r *http.Request) {
+	// Ensure manager is initialized on demand
+	a.ensureManager(r.Context())
 	principal := PrincipalFromRequest(r.Header.Get("X-Debug-Principal"))
 	switch r.Method {
 	case http.MethodGet:
@@ -71,9 +86,12 @@ func (a *DBAPI) handleDatabases(w http.ResponseWriter, r *http.Request) {
 		}
 		JSON(w, http.StatusOK, dbs)
 	case http.MethodPost:
-		if !Allow(a.RBAC.RoleFor(principal, "", a.OrgID), "db.create") {
-			JSONError(w, http.StatusForbidden, "permission denied", "forbidden")
-			return
+		// Relaxed MVP: if no principal provided, allow create; otherwise enforce RBAC
+		if a.RBAC != nil {
+			if principal != "" && !Allow(a.RBAC.RoleFor(principal, "", a.OrgID), "db.create") {
+				JSONError(w, http.StatusForbidden, "permission denied", "forbidden")
+				return
+			}
 		}
 		// Parse create payload (name optional)
 		b, _ := io.ReadAll(r.Body)
@@ -112,6 +130,8 @@ func (a *DBAPI) handleDatabases(w http.ResponseWriter, r *http.Request) {
 
 // /api/db/:dbId/... subroutes
 func (a *DBAPI) handleDatabaseSubroutes(w http.ResponseWriter, r *http.Request) {
+	// Ensure manager is initialized on demand
+	a.ensureManager(r.Context())
 	// path after /api/db/
 	tail := strings.TrimPrefix(r.URL.Path, "/api/db/")
 	if tail == "" {
@@ -780,8 +800,13 @@ func (a *DBAPI) handleChangefeed(w http.ResponseWriter, r *http.Request) {
 
 // Helper to start DBAPI after manager creation.
 func InitAndRegisterDB(mux *http.ServeMux, mgr *db.Manager) {
-	api := &DBAPI{Manager: DBManager(mgr), OrgID: "org-demo", RBAC: NewRBACStore()}
-	api.RBAC.Grant(model.PermissionBinding{Principal: "user:demo", Scope: "db:org-demo", Role: model.RoleMaintainer, CreatedAt: model.NowISO()})
+	org := strings.TrimSpace(os.Getenv("ORG_ID"))
+	if org == "" {
+		org = "default"
+	}
+	api := &DBAPI{Manager: DBManager(mgr), OrgID: org, RBAC: NewRBACStore()}
+	// Grant demo principal maintainer on the org scope for quick-starts
+	api.RBAC.Grant(model.PermissionBinding{Principal: "user:demo", Scope: fmt.Sprintf("db:%s", org), Role: model.RoleMaintainer, CreatedAt: model.NowISO()})
 	api.Register(mux)
 	log.Printf("db api registered (org=%s)", api.OrgID)
 }
