@@ -65,6 +65,9 @@ func startOperator(ctx context.Context, restCfg *rest.Config) error {
 	// configure controller-runtime logger (dev mode)
 	crlog.SetLogger(zap.New(zap.UseDevMode(true)))
 	opts := ctrl.Options{Scheme: scheme}
+	// Disable metrics and health probe servers to avoid port conflicts in embedded mode.
+	opts.Metrics.BindAddress = "0"
+	opts.HealthProbeBindAddress = "0"
 	mgr, err := ctrl.NewManager(restCfg, opts)
 	if err != nil {
 		return fmt.Errorf("manager create: %w", err)
@@ -373,11 +376,14 @@ func main() {
 
 	// Start operator (controller-runtime) in-process so status of Workspaces is managed.
 	if kcli != nil && kcli.Rest != nil {
-		go func() {
-			if err := startOperator(ctx, kcli.Rest); err != nil {
-				log.Printf("operator start failed: %v", err)
-			}
-		}()
+		if strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_EMBED_OPERATOR")), "1") ||
+			strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_EMBED_OPERATOR")), "true") {
+			go func() {
+				if err := startOperator(ctx, kcli.Rest); err != nil {
+					log.Printf("operator start failed: %v", err)
+				}
+			}()
+		}
 	}
 
 	// Permission cache (prototype) – only used in CRD mode for admin/destructive actions.
@@ -553,7 +559,7 @@ func main() {
 		httpx.JSON(w, http.StatusOK, resp)
 	})
 
-	// servers list (Workspace CRDs only; legacy Deployment path removed during cleanup)
+	// servers list (Workspace CRDs only; legacy Deployment path removed)
 	mux.HandleFunc("/api/servers", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.WriteHeader(http.StatusMethodNotAllowed)
