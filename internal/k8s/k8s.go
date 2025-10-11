@@ -26,9 +26,21 @@ type Client struct {
 }
 
 func kubeconfigDefault() string {
+	// Primary: explicit KUBECONFIG if set
 	if v := os.Getenv("KUBECONFIG"); v != "" {
 		return v
 	}
+	// Project standard: GN_KUBECONFIG or ~/.guildnet/kubeconfig if present
+	if v := os.Getenv("GN_KUBECONFIG"); v != "" {
+		return v
+	}
+	if h, err := os.UserHomeDir(); err == nil {
+		gn := filepath.Join(h, ".guildnet", "kubeconfig")
+		if fi, err := os.Stat(gn); err == nil && !fi.IsDir() {
+			return gn
+		}
+	}
+	// Fallback to default kubeconfig
 	if h, err := os.UserHomeDir(); err == nil {
 		return filepath.Join(h, ".kube", "config")
 	}

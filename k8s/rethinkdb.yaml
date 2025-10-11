@@ -60,14 +60,14 @@ spec:
             runAsUser: 1000
             runAsGroup: 1000
           readinessProbe:
-            tcpSocket:
-              port: 28015
-            initialDelaySeconds: 2
+            exec:
+              command: ["/bin/bash", "-lc", "</dev/tcp/127.0.0.1/28015"]
+            initialDelaySeconds: 3
             periodSeconds: 5
           livenessProbe:
-            tcpSocket:
-              port: 28015
-            initialDelaySeconds: 5
+            exec:
+              command: ["/bin/bash", "-lc", "</dev/tcp/127.0.0.1/28015"]
+            initialDelaySeconds: 10
             periodSeconds: 10
           volumeMounts:
             - name: data

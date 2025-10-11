@@ -50,15 +50,6 @@ setup-talos: ## Fresh deploy Talos and validate
 setup-all: ## Run Headscale, Tailscale, and Talos setup in order
 	$(MAKE) setup-headscale
 	$(MAKE) setup-tailscale
-	$(MAKE) setup-talos
-
-bootstrap-sudo: ## One-time privileged bootstrap (forwarding, tailscaled, operator)
-	bash ./scripts/bootstrap-sudo.sh
-
-setup-all-provision: ## Full bootstrap + setup + provision + addons + verify (uses PROVIDER)
-	$(MAKE) bootstrap-sudo
-	$(MAKE) setup-headscale
-	$(MAKE) setup-tailscale
 	@if [ "$(PROVIDER)" = "vm" ]; then \
 		$(MAKE) talos-provision-vm; \
 	else \
@@ -83,13 +74,13 @@ build-ui: ## Build UI (Vite)
 
 # ---------- Run ----------
 run: build ## Build all (backend+UI) and run backend (serve)
-	KUBECONFIG=$(GN_KUBECONFIG) LISTEN_LOCAL=$(LISTEN_LOCAL) ./bin/$(BINARY) serve
+	bash -lc 'set -a; [ -f ./.env ] && . ./.env; KUBECONFIG=$(GN_KUBECONFIG) LISTEN_LOCAL=$(LISTEN_LOCAL) ./bin/$(BINARY) serve'
 
 # ---------- DB / Health ----------
 db-health: ## Check database API and report availability
 	@echo "Checking backend health and DB API..."; \
-	(set -x; curl -sk https://127.0.0.1:8080/healthz); echo; \
-	(set -x; curl -sk https://127.0.0.1:8080/api/db) || true; echo
+	(set -x; curl -sk https://$(LISTEN_LOCAL)/healthz); echo; \
+	(set -x; curl -sk https://$(LISTEN_LOCAL)/api/db) || true; echo
 
 # ---------- Quality ----------
 test: ## Run Go tests (race)
@@ -106,7 +97,7 @@ clean: ## Remove build artifacts
 
 # ---------- Utilities ----------
 health: ## Check backend health endpoint
-	curl -k https://127.0.0.1:8080/healthz || true
+	curl -k https://$(LISTEN_LOCAL)/healthz || true
 
 tls-check-backend: ## Show TLS info for backend :8080
 	echo | openssl s_client -connect 127.0.0.1:8080 -servername localhost -tls1_2 2>/dev/null | head -n 20
@@ -194,25 +185,6 @@ headscale-approve-routes: ## Approve tailscale routes for the router in Headscal
 
 # Export KUBECONFIG for kubectl invocations that run via Make targets
 export KUBECONFIG := $(GN_KUBECONFIG)
-
-talos-fresh: ## Talos cluster fresh deploy
-	bash ./scripts/setup-talos.sh $(FRESH_ARGS)
-
-talos-upgrade: ## Talos cluster in-place upgrade
-	bash ./scripts/talos-upgrade-inplace.sh $(UPGRADE_ARGS)
-
-.PHONY: setup-talos-preflight setup-talos-config setup-talos-apply setup-talos-wait-kube
-setup-talos-preflight: ## Talos preflight checks (reachability + overlay)
-	bash ./scripts/setup-talos-preflight.sh
-
-setup-talos-config: ## Talos config generation
-	bash ./scripts/setup-talos-config.sh
-
-setup-talos-apply: ## Talos reset/apply/bootstrap
-	bash ./scripts/setup-talos-apply.sh
-
-setup-talos-wait-kube: ## Wait for Kubernetes and fetch kubeconfig
-	bash ./scripts/setup-talos-wait-kube.sh
 
 # ---------- Provision / Addons / Deploy / Verify ----------
 .PHONY: talos-provision-vm deploy-k8s-addons deploy-operator deploy-hostapp verify-e2e diag-router diag-talos diag-k8s diag-db

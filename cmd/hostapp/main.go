@@ -572,7 +572,8 @@ func main() {
 		gvr := schema.GroupVersionResource{Group: "guildnet.io", Version: "v1alpha1", Resource: "workspaces"}
 		lst, err := dyn.Resource(gvr).Namespace(defaultNS).List(r.Context(), metav1.ListOptions{})
 		if err != nil {
-			httpx.JSONError(w, http.StatusInternalServerError, "list workspaces failed", "list_failed", err.Error())
+			// Degrade gracefully: return empty list when CRDs are not installed yet or API is not ready
+			httpx.JSON(w, http.StatusOK, []any{})
 			return
 		}
 		var out []*model.Server

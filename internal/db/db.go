@@ -16,6 +16,7 @@ import (
 	"github.com/your/module/internal/model"
 	// For Kubernetes-based service discovery when running outside the cluster
 	k8sclient "github.com/your/module/internal/k8s"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -99,6 +100,46 @@ func AutoDiscoverAddr() string {
 					}
 					if host != "" && port > 0 {
 						return fmt.Sprintf("%s:%d", host, port)
+					}
+				}
+				// Fallback: if Service is NodePort, try to build a reachable address using a node IP
+				if svc.Spec.Type == corev1.ServiceTypeNodePort {
+					// pick nodePort for the client port (or first)
+					var nodePort int32
+					for _, sp := range svc.Spec.Ports {
+						if sp.Name == "client" || sp.Port == 28015 {
+							nodePort = sp.NodePort
+							break
+						}
+					}
+					if nodePort == 0 && len(svc.Spec.Ports) > 0 {
+						nodePort = svc.Spec.Ports[0].NodePort
+					}
+					if nodePort > 0 {
+						if nodes, err := kc.K.CoreV1().Nodes().List(ctx, metav1.ListOptions{}); err == nil {
+							pickIP := func(n corev1.Node) string {
+								extIP := ""
+								intIP := ""
+								for _, addr := range n.Status.Addresses {
+									if addr.Type == corev1.NodeExternalIP && strings.TrimSpace(addr.Address) != "" && extIP == "" {
+										extIP = addr.Address
+									}
+									if addr.Type == corev1.NodeInternalIP && strings.TrimSpace(addr.Address) != "" && intIP == "" {
+										intIP = addr.Address
+									}
+								}
+								if extIP != "" {
+									return extIP
+								}
+								return intIP
+							}
+							for _, n := range nodes.Items {
+								h := pickIP(n)
+								if strings.TrimSpace(h) != "" {
+									return fmt.Sprintf("%s:%d", h, nodePort)
+								}
+							}
+						}
 					}
 				}
 			}
