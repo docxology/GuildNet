@@ -364,6 +364,8 @@ func main() {
 		log.Fatalf("k8s client: %v", err)
 	}
 	var dyn dynamic.Interface
+	// Optional: local port-forward manager for pods (fallback when API server service/pod proxy is unreliable)
+	var pfMgr *k8s.PortForwardManager
 	// Always use Workspace CRDs (legacy deployment path removed)
 	if kcli != nil && kcli.Rest != nil {
 		if d, derr := dynamic.NewForConfig(kcli.Rest); derr == nil {
@@ -371,6 +373,7 @@ func main() {
 		} else {
 			log.Printf("dynamic client init failed: %v", derr)
 		}
+		pfMgr = k8s.NewPortForwardManager(kcli.Rest, "default")
 	}
 	log.Printf("Workspace CRD mode active (legacy paths removed)")
 
@@ -1082,7 +1085,7 @@ func main() {
 	// proxy handler (CRD-aware resolution)
 	proxyHandler := proxy.NewReverseProxy(proxy.Options{
 		MaxBody: 10 * 1024 * 1024,
-		Timeout: 10 * time.Second,
+		Timeout: 30 * time.Second,
 		Dial: func(ctx context.Context, network, address string) (any, error) {
 			// For loopback targets in local dev, bypass tsnet and dial OS loopback directly.
 			host, _, err := net.SplitHostPort(address)
@@ -1125,12 +1128,11 @@ func main() {
 			return sch, fmt.Sprintf("%s:%d", host, port), subPath, nil
 		},
 		APIProxy: func() (http.RoundTripper, func(req *http.Request, scheme, hostport, subPath string), bool) {
-			// Allow disabling API proxy (pods proxy) to validate WS directly via tsnet/ClusterIP.
+			// Allow disabling API proxy fully
 			if strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_DISABLE_API_PROXY")), "1") ||
 				strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_DISABLE_API_PROXY")), "true") {
 				return nil, nil, false
 			}
-			// Build a transport using the k8s rest config to go through the API server proxy
 			cfg := kcli.Config()
 			if cfg == nil {
 				return nil, nil, false
@@ -1140,63 +1142,122 @@ func main() {
 				return nil, nil, false
 			}
 			set := func(req *http.Request, scheme, hostport, subPath string) {
-				// Expect hostport either as ClusterIP:port or service DNS name + port
-				host, pstr, _ := net.SplitHostPort(hostport)
-				p := pstr
-				name := host
-				// Determine service name
-				if sid := req.Header.Get("X-Guild-Server-ID"); sid != "" {
-					ns := defaultNS
-					sname := dns1123Name(sid)
-					if svc, err := kcli.K.CoreV1().Services(ns).Get(context.Background(), sname, metav1.GetOptions{}); err == nil && svc != nil {
-						name = svc.Name
-					} else if list, err := kcli.K.CoreV1().Services(ns).List(context.Background(), metav1.ListOptions{LabelSelector: fmt.Sprintf("guildnet.io/id=%s", sid)}); err == nil && len(list.Items) > 0 {
-						name = list.Items[0].Name
-					} else {
-						name = sname
-					}
-				} else if strings.Contains(host, ".svc") {
-					parts := strings.Split(host, ".")
-					if len(parts) > 0 {
-						name = parts[0]
-					}
-				} else if ip := net.ParseIP(host); ip != nil {
-					ns := defaultNS
-					if svcList, err := kcli.K.CoreV1().Services(ns).List(context.Background(), metav1.ListOptions{}); err == nil {
-						for _, s := range svcList.Items {
-							if s.Spec.ClusterIP == host {
-								name = s.Name
-								break
-							}
+				// If we’re targeting a local PF set earlier (host is 127.0.0.1), do not rewrite to API proxy
+				hn := req.URL.Hostname()
+				if hn == "127.0.0.1" || strings.EqualFold(hn, "localhost") {
+					return
+				}
+				// Determine base URL: env override > kube config
+				baseURL, baseFromEnv := func() (*url.URL, bool) {
+					if v := strings.TrimSpace(os.Getenv("HOSTAPP_API_PROXY_URL")); v != "" {
+						if u, err := url.Parse(v); err == nil {
+							return u, true
 						}
 					}
-				}
-				// Base API server URL
-				baseURL, _ := url.Parse(cfg.Host)
-				if baseURL == nil {
-					baseURL = &url.URL{Scheme: "https"}
-				}
+					if u, err := url.Parse(cfg.Host); err == nil && u != nil {
+						return u, false
+					}
+					return &url.URL{Scheme: "https"}, false
+				}()
 				if baseURL.Scheme == "" {
 					baseURL.Scheme = "https"
+				}
+				// Only force HTTP when:
+				// - explicitly requested via HOSTAPP_API_PROXY_FORCE_HTTP, or
+				// - kubeconfig host is loopback (localhost/127.0.0.1) and not overridden by env
+				if strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_API_PROXY_FORCE_HTTP")), "1") ||
+					strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_API_PROXY_FORCE_HTTP")), "true") {
+					baseURL.Scheme = "http"
+				} else if !baseFromEnv {
+					hn := baseURL.Hostname()
+					if hn == "localhost" || hn == "127.0.0.1" {
+						baseURL.Scheme = "http"
+					}
+				}
+
+				// If using a loopback base and it appears unreachable, prefer kubectl proxy on 127.0.0.1:8001 when open.
+				if !baseFromEnv {
+					hn := baseURL.Hostname()
+					if hn == "localhost" || hn == "127.0.0.1" {
+						// quick probe current base
+						probeAddr := baseURL.Host
+						if !strings.Contains(probeAddr, ":") {
+							if baseURL.Scheme == "https" {
+								probeAddr = net.JoinHostPort(baseURL.Host, "443")
+							} else {
+								probeAddr = net.JoinHostPort(baseURL.Host, "80")
+							}
+						}
+						c, err := net.DialTimeout("tcp", probeAddr, 250*time.Millisecond)
+						if err != nil {
+							// try kubectl proxy default
+							if c2, err2 := net.DialTimeout("tcp", "127.0.0.1:8001", 250*time.Millisecond); err2 == nil {
+								_ = c2.Close()
+								baseURL.Scheme = "http"
+								baseURL.Host = "127.0.0.1:8001"
+							}
+						} else {
+							_ = c.Close()
+						}
+					}
 				}
 				req.URL.Scheme = baseURL.Scheme
 				req.URL.Host = baseURL.Host
 				req.Host = req.URL.Host
 				basePrefix := strings.TrimSuffix(baseURL.Path, "/")
 
-				// Prefer pod proxy if requested via header
-				if strings.TrimSpace(req.Header.Get("X-Guild-Prefer-Pod")) != "" {
+				// Extract service name (Workspace ID) and port from inputs
+				sid := strings.TrimSpace(req.Header.Get("X-Guild-Server-ID"))
+				_, portStr, err := net.SplitHostPort(hostport)
+				if err != nil || portStr == "" {
+					// best-effort parse if hostport is not in host:port form
+					parts := strings.Split(hostport, ":")
+					if len(parts) > 1 {
+						portStr = parts[len(parts)-1]
+					} else {
+						portStr = "80"
+					}
+				}
+
+				// Pre-resolve ClusterIP:port for direct fallback when PF fails
+				fallbackHost := ""
+				fallbackScheme := "http"
+				if sid != "" {
+					if ip, pnum, isHTTPS, rerr := kcli.ResolveServiceAddress(context.Background(), defaultNS, sid); rerr == nil {
+						fallbackHost = fmt.Sprintf("%s:%d", ip, pnum)
+						if isHTTPS {
+							fallbackScheme = "https"
+						} else {
+							fallbackScheme = "http"
+						}
+					}
+				}
+
+				// Choose proxy style: service by default; pod only if explicitly requested by header or HOSTAPP_PREFER_POD_PROXY/USE_PORT_FORWARD
+				preferPod := strings.TrimSpace(req.Header.Get("X-Guild-Prefer-Pod")) != ""
+				if !preferPod {
+					if v := strings.TrimSpace(os.Getenv("HOSTAPP_PREFER_POD_PROXY")); v == "1" || strings.EqualFold(v, "true") {
+						preferPod = true
+					}
+				}
+				usePF := false
+				if v := strings.TrimSpace(os.Getenv("HOSTAPP_USE_PORT_FORWARD")); v == "1" || strings.EqualFold(v, "true") {
+					usePF = true
+					preferPod = true
+				}
+				if preferPod && sid != "" {
+					// Discover any running pod (even if not Ready) behind the service named by sid
 					ns := defaultNS
 					podName := ""
-					// Discover pods via Service selector first
-					if svc, err := kcli.K.CoreV1().Services(ns).Get(context.Background(), name, metav1.GetOptions{}); err == nil && svc != nil && len(svc.Spec.Selector) > 0 {
+					if svc, err := kcli.K.CoreV1().Services(ns).Get(context.Background(), sid, metav1.GetOptions{}); err == nil && svc != nil && len(svc.Spec.Selector) > 0 {
 						var selParts []string
 						for k, v := range svc.Spec.Selector {
 							selParts = append(selParts, fmt.Sprintf("%s=%s", k, v))
 						}
 						selector := strings.Join(selParts, ",")
 						if pods, err := kcli.K.CoreV1().Pods(ns).List(context.Background(), metav1.ListOptions{LabelSelector: selector}); err == nil && len(pods.Items) > 0 {
-							pick := 0
+							// prefer Ready pod, else take first Running, else any
+							pick := -1
 							for i, pod := range pods.Items {
 								if pod.Status.Phase == corev1.PodRunning {
 									ready := false
@@ -1212,72 +1273,84 @@ func main() {
 									}
 								}
 							}
-							podName = pods.Items[pick].Name
-						}
-					}
-					// Fallback: guildnet.io/id label
-					if podName == "" {
-						if sid := req.Header.Get("X-Guild-Server-ID"); sid != "" {
-							selector := fmt.Sprintf("guildnet.io/id=%s", sid)
-							if pods, err := kcli.K.CoreV1().Pods(ns).List(context.Background(), metav1.ListOptions{LabelSelector: selector}); err == nil && len(pods.Items) > 0 {
-								pick := 0
+							if pick == -1 {
 								for i, pod := range pods.Items {
 									if pod.Status.Phase == corev1.PodRunning {
-										ready := false
-										for _, c := range pod.Status.Conditions {
-											if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
-												ready = true
-												break
-											}
-										}
-										if ready {
-											pick = i
-											break
-										}
-									}
-								}
-								podName = pods.Items[pick].Name
-							}
-						}
-					}
-					// Fallback: legacy app=name
-					if podName == "" {
-						if pods, err := kcli.K.CoreV1().Pods(ns).List(context.Background(), metav1.ListOptions{LabelSelector: fmt.Sprintf("app=%s", name)}); err == nil && len(pods.Items) > 0 {
-							pick := 0
-							for i, pod := range pods.Items {
-								if pod.Status.Phase == corev1.PodRunning {
-									ready := false
-									for _, c := range pod.Status.Conditions {
-										if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
-											ready = true
-											break
-										}
-									}
-									if ready {
 										pick = i
 										break
 									}
 								}
 							}
+							if pick == -1 {
+								pick = 0
+							}
 							podName = pods.Items[pick].Name
+						}
+					}
+					if podName == "" {
+						if sidHdr := req.Header.Get("X-Guild-Server-ID"); sidHdr != "" {
+							selector := fmt.Sprintf("guildnet.io/id=%s", sidHdr)
+							if pods, err := kcli.K.CoreV1().Pods(ns).List(context.Background(), metav1.ListOptions{LabelSelector: selector}); err == nil && len(pods.Items) > 0 {
+								podName = pods.Items[0].Name
+							}
 						}
 					}
 					if podName != "" {
-						podIdent := podName
-						if strings.EqualFold(scheme, "https") {
-							podIdent = "https:" + podIdent
+						if usePF && pfMgr != nil {
+							// Use local port-forward to the pod first
+							pnum := 80
+							if n, err := fmt.Sscanf(portStr, "%d", &pnum); n == 0 || err != nil {
+								pnum = 8080
+							}
+							log.Printf("proxy: attempting port-forward ns=%s pod=%s port=%d sid=%s", defaultNS, podName, pnum, sid)
+							if lp, err := pfMgr.Ensure(context.Background(), defaultNS, podName, pnum); err == nil && lp > 0 {
+								log.Printf("proxy: using port-forward localPort=%d -> %s:%d", lp, podName, pnum)
+								req.URL.Scheme = "http"
+								req.URL.Host = fmt.Sprintf("127.0.0.1:%d", lp)
+								req.Host = req.URL.Host
+								// Provide a fallback target for the transport if PF fails mid-flight (use ClusterIP if available)
+								if fallbackHost != "" {
+									req.Header.Set("X-Guild-Fallback-Hostport", fallbackHost)
+									req.Header.Set("X-Guild-Fallback-Scheme", fallbackScheme)
+								}
+								// Clear X-Guild-Server-ID so API proxy layer doesn't try to rewrite
+								req.Header.Del("X-Guild-Server-ID")
+								req.URL.Path = singleJoiningSlash("", subPath)
+								return
+							}
+							log.Printf("proxy: port-forward failed, falling back to pod proxy ns=%s pod=%s err=%v", defaultNS, podName, err)
+							// fallthrough to pods proxy if Ensure fails
 						}
-						basePath := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s:%s/proxy", defaultNS, podIdent, p)
+						// If PF was requested but failed, try direct service ClusterIP via tsnet/overlay before API pod proxy
+						if usePF && fallbackHost != "" {
+							log.Printf("proxy: PF unavailable; trying direct ClusterIP %s for sid=%s", fallbackHost, sid)
+							req.URL.Scheme = fallbackScheme
+							req.URL.Host = fallbackHost
+							req.Host = fallbackHost
+							req.URL.Path = singleJoiningSlash("", subPath)
+							return
+						}
+						// Build pods proxy path: /api/v1/namespaces/{ns}/pods/{scheme}:{pod}:{port}/proxy
+						proto := "http"
+						if strings.EqualFold(scheme, "https") {
+							proto = "https"
+						}
+						basePath := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s:%s:%s/proxy", defaultNS, proto, podName, portStr)
 						fullBase := singleJoiningSlash(basePrefix, basePath)
 						req.URL.Path = singleJoiningSlash("", fullBase) + subPath
-						log.Printf("proxy director: pods-proxy ns=%s pod=%s port=%s sub=%s path=%s", defaultNS, podIdent, p, subPath, req.URL.Path)
 						return
 					}
 				}
-
-				// No service-proxy fallback: fail fast so caller can surface a clear error
-				req.URL.Path = "/api/v1/namespaces/" + defaultNS + "/pods/unknown:0/proxy" // unreachable, yields 404 fast
-				log.Printf("proxy director: no pod found for service=%s ns=%s; failing fast path=%s", name, defaultNS, req.URL.Path)
+				// Service proxy (respect scheme) with explicit scheme prefix to avoid ambiguity
+				if strings.EqualFold(scheme, "https") {
+					req.URL.Path = "/api/v1/namespaces/" + defaultNS + "/services/https:" + sid + ":" + portStr + "/proxy"
+				} else {
+					// explicitly use http: prefix
+					req.URL.Path = "/api/v1/namespaces/" + defaultNS + "/services/http:" + sid + ":" + portStr + "/proxy"
+				}
+				req.URL.Path = singleJoiningSlash("", req.URL.Path) + subPath
+				// return is redundant at end of function literal; removing to avoid linter/compile complaint
+				// return
 			}
 			return rt, set, true
 		},
@@ -1339,7 +1412,7 @@ func main() {
 	bindAddr := cfg.ListenLocal
 	lnLocal, err := net.Listen("tcp", bindAddr)
 	if err != nil {
-		candidates := []string{"127.0.0.1:9443", "127.0.0.1:8081", "127.0.0.1:8443"}
+		candidates := []string{"127.0.0.1:9443", "127.0.0.1:8080", "127.0.0.1:8081", "127.0.0.1:8443"}
 		for _, a := range candidates {
 			if l, e := net.Listen("tcp", a); e == nil {
 				lnLocal = l

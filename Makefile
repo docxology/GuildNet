@@ -74,7 +74,7 @@ build-ui: ## Build UI (Vite)
 
 # ---------- Run ----------
 run: build ## Build all (backend+UI) and run backend (serve)
-	bash -lc 'set -a; [ -f ./.env ] && . ./.env; KUBECONFIG=$(GN_KUBECONFIG) LISTEN_LOCAL=$(LISTEN_LOCAL) ./bin/$(BINARY) serve'
+	bash ./scripts/run-hostapp.sh
 
 # ---------- DB / Health ----------
 db-health: ## Check database API and report availability

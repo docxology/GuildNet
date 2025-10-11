@@ -183,6 +183,28 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 	imgPullSecret := strings.TrimSpace(os.Getenv("K8S_IMAGE_PULL_SECRET"))
 	// Do not inject a default image; the API layer validates image is provided.
 
+	// Add explicit args for code-server so it binds correctly under our reverse proxy base path.
+	var containerArgs []string
+	imgLower := strings.ToLower(strings.TrimSpace(spec.Image))
+	if strings.Contains(imgLower, "codercom/code-server") || strings.Contains(imgLower, "code-server") {
+		// Older images may not support --base-path; omit it and rely on proxy rewrites.
+		containerArgs = []string{"--bind-addr", "0.0.0.0:8080", "--auth", "password"}
+	}
+
+	// Security context: default strict; relax for code-server (fixuid needs no_new_privs disabled)
+	secCtx := &corev1.SecurityContext{
+		AllowPrivilegeEscalation: func() *bool { b := false; return &b }(),
+		RunAsNonRoot:             func() *bool { b := true; return &b }(),
+		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+	}
+	if strings.Contains(imgLower, "codercom/code-server") || strings.Contains(imgLower, "code-server") {
+		secCtx = &corev1.SecurityContext{
+			AllowPrivilegeEscalation: func() *bool { b := true; return &b }(),
+			RunAsNonRoot:             func() *bool { b := true; return &b }(),
+			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+		}
+	}
+
 	// pick probe port: first declared container port or 8080
 	probePort := int32(8080)
 	if len(cports) > 0 {
@@ -212,17 +234,14 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 						FSGroup:    func() *int64 { v := int64(1000); return &v }(),
 					},
 					Containers: []corev1.Container{{
-						Name:           "app",
-						Image:          spec.Image,
-						Args:           spec.Args,
-						Env:            env,
-						Ports:          cports,
-						ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstr.FromInt(int(probePort))}}},
-						LivenessProbe:  &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstr.FromInt(int(probePort))}}},
-						SecurityContext: &corev1.SecurityContext{
-							AllowPrivilegeEscalation: func() *bool { b := false; return &b }(),
-							RunAsNonRoot:             func() *bool { b := true; return &b }(),
-						},
+						Name:            "app",
+						Image:           spec.Image,
+						Args:            append(containerArgs, spec.Args...),
+						Env:             env,
+						Ports:           cports,
+						ReadinessProbe:  &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstr.FromInt(int(probePort))}}},
+						LivenessProbe:   &corev1.Probe{ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstr.FromInt(int(probePort))}}},
+						SecurityContext: secCtx,
 					}},
 				},
 			},
