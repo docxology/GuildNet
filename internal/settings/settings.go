@@ -24,8 +24,11 @@ type Database struct {
 // Global holds global runtime settings not tied to a specific cluster.
 // Example: default Org ID for new nodes, UI CORS origin overrides, etc.
 type Global struct {
-	OrgID          string `json:"org_id"`
-	FrontendOrigin string `json:"frontend_origin,omitempty"`
+	OrgID            string `json:"org_id"`
+	FrontendOrigin   string `json:"frontend_origin,omitempty"`
+	EmbedOperator    bool   `json:"embed_operator,omitempty"`
+	DefaultNamespace string `json:"default_namespace,omitempty"`
+	ListenLocal      string `json:"listen_local,omitempty"`
 }
 
 // Cluster holds per-cluster runtime settings that affect connectivity and proxying.
@@ -125,13 +128,22 @@ func (m Manager) GetGlobal(out *Global) error {
 	}
 	out.OrgID = strings.TrimSpace(asString(tmp["org_id"]))
 	out.FrontendOrigin = strings.TrimSpace(asString(tmp["frontend_origin"]))
+	out.EmbedOperator = asBool(tmp["embed_operator"])
+	out.DefaultNamespace = strings.TrimSpace(asString(tmp["default_namespace"]))
+	out.ListenLocal = strings.TrimSpace(asString(tmp["listen_local"]))
+	if out.ListenLocal == "" {
+		out.ListenLocal = "127.0.0.1:8090"
+	}
 	return nil
 }
 
 func (m Manager) PutGlobal(g Global) error {
 	rec := map[string]any{
-		"org_id":          strings.TrimSpace(g.OrgID),
-		"frontend_origin": strings.TrimSpace(g.FrontendOrigin),
+		"org_id":            strings.TrimSpace(g.OrgID),
+		"frontend_origin":   strings.TrimSpace(g.FrontendOrigin),
+		"embed_operator":    g.EmbedOperator,
+		"default_namespace": strings.TrimSpace(g.DefaultNamespace),
+		"listen_local":      strings.TrimSpace(g.ListenLocal),
 	}
 	return m.DB.Put(bucket, keyGlobal, rec)
 }

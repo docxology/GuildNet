@@ -38,7 +38,7 @@ Options:
   --login-server URL   Headscale/TS control server URL for auto-init.
   --auth-key KEY       Pre-auth key for auto-init.
   --hostname NAME      Hostname for auto-init (default host-app).
-  --listen-local ADDR  Local listen addr for auto-init (default 127.0.0.1:8080).
+  --listen-local ADDR  Local listen addr for auto-init (default 127.0.0.1:8090).
   --dial-timeout-ms N  Dial timeout ms for auto-init (default 3000).
   --allowlist CSV      Comma-separated allowlist entries for auto-init.
   --help               Show this help.
@@ -58,7 +58,7 @@ AUTO_INIT=0
 AI_LOGIN=""
 AI_AUTHKEY=""
 AI_HOSTNAME="host-app"
-AI_LISTEN="127.0.0.1:8080"
+AI_LISTEN="127.0.0.1:8090"
 AI_DIAL="3000"
 AI_ALLOWLIST=""
 

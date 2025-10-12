@@ -39,7 +39,7 @@ Choose your path:
 
 When the Server is running:
 
-- Local UI: https://127.0.0.1:8080
+- Local UI: https://127.0.0.1:8090
 - Tailnet UI (from other devices): https://<ts-hostname-or-ip>:443
 
 Tip: `make help` lists the most useful targets.
@@ -118,7 +118,7 @@ One‑time local setup:
 Run the Server locally:
 
 - `make run`
-- Open https://127.0.0.1:8080
+- Open https://127.0.0.1:8090
 - From other Tailnet devices, open https://<ts-hostname-or-ip>:443
 
 What happens when running:

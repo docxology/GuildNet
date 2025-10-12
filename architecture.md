@@ -194,7 +194,7 @@ Database (per-cluster)
 
 - TLS: HTTPS on `LISTEN_LOCAL` for local access; HTTPS on `:443` inside tailnet via tsnet.
 - Certificates: preferred order — `./certs/server.crt|server.key`, `./certs/dev.crt|dev.key`, or auto‑generated self‑signed under `~/.guildnet/state/certs/`.
-- CORS: allow a single origin `FRONTEND_ORIGIN` (use `https://127.0.0.1:8080` in local dev).
+- CORS: allow a single origin `FRONTEND_ORIGIN` (use `https://127.0.0.1:8090` in local dev).
 - Reverse proxy hardening for iframes:
   - Adjust `Location` for subpaths.
   - Normalize `Set‑Cookie` (drop Domain, set `Secure`, `SameSite=None`, add `Partitioned`, fix Path).
@@ -211,7 +211,7 @@ Database (per-cluster)
   - Exports database discovery hints: `RETHINKDB_SERVICE_NAME`, `RETHINKDB_NAMESPACE`.
   - Enables embedded operator by default.
   - Runs the Host App.
-- UI: open `https://127.0.0.1:8080` (the Host App proxies the dev UI for same‑origin UX).
+- UI: open `https://127.0.0.1:8090` (the Host App proxies the dev UI for same‑origin UX).
 
 ### Environment Knobs (selected)
 

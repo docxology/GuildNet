@@ -243,9 +243,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
-	if v := os.Getenv("LISTEN_LOCAL"); v != "" {
-		cfg.ListenLocal = v
-	}
 	if err := cfg.Validate(); err != nil {
 		log.Fatalf("invalid config: %v", err)
 	}
@@ -281,6 +278,27 @@ func main() {
 		tsSet = settings.Tailscale{LoginServer: cfg.LoginServer, PreauthKey: cfg.AuthKey, Hostname: cfg.Hostname}
 		_ = setMgr.PutTailscale(tsSet)
 	}
+	// Global: migrate defaults on first run
+	var gset settings.Global
+	_ = setMgr.GetGlobal(&gset)
+	changed := false
+	if strings.TrimSpace(gset.DefaultNamespace) == "" {
+		gset.DefaultNamespace = "default"
+		changed = true
+	}
+	if strings.TrimSpace(gset.ListenLocal) == "" {
+		gset.ListenLocal = cfg.ListenLocal
+		changed = true
+	}
+	if strings.TrimSpace(gset.FrontendOrigin) == "" {
+		// Seed a sensible default; single origin on 8090
+		gset.FrontendOrigin = "https://127.0.0.1:8090"
+		changed = true
+	}
+	gset.EmbedOperator = gset.EmbedOperator // no-op; keep existing
+	if changed {
+		_ = setMgr.PutGlobal(gset)
+	}
 
 	// Start tsnet from settings
 	s, err := ts.StartServer(ctx, ts.Options{StateDir: config.StateDir(), Hostname: tsSet.Hostname, LoginURL: tsSet.LoginServer, AuthKey: tsSet.PreauthKey})
@@ -313,13 +331,13 @@ func main() {
 	_ = setMgr.GetDatabase(&dbSet)
 	if strings.TrimSpace(dbSet.Addr) != "" {
 		if mgr, derr := db.ConnectWithOptions(ctx, dbSet.Addr, dbSet.User, dbSet.Pass); derr != nil {
-			log.Printf("rethinkdb connect failed (settings): %v", derr)
+			log.Printf("rethinkdb unavailable (using without DB features): %v", derr)
 		} else {
 			dbMgr = mgr
 		}
 	} else {
 		if mgr, derr := db.Connect(ctx); derr != nil {
-			log.Printf("rethinkdb connect failed (databases feature disabled): %v", derr)
+			log.Printf("rethinkdb unavailable (databases feature off): %v", derr)
 		} else {
 			dbMgr = mgr
 		}
@@ -427,8 +445,9 @@ func main() {
 
 	// Start operator (controller-runtime) in-process so status of Workspaces is managed.
 	if kcli != nil && kcli.Rest != nil {
-		if strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_EMBED_OPERATOR")), "1") ||
-			strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_EMBED_OPERATOR")), "true") {
+		var g settings.Global
+		_ = setMgr.GetGlobal(&g)
+		if g.EmbedOperator {
 			go func() {
 				if err := startOperator(ctx, kcli.Rest); err != nil {
 					log.Printf("operator start failed: %v", err)
@@ -442,15 +461,16 @@ func main() {
 	if dyn != nil {
 		permCache = permission.NewCache(dyn, "default", 10*time.Second)
 	}
-	defaultNS := strings.TrimSpace(os.Getenv("K8S_NAMESPACE"))
-	if defaultNS == "" {
-		defaultNS = "default"
-	}
+	defaultNS := func() string {
+		var g settings.Global
+		_ = setMgr.GetGlobal(&g)
+		if strings.TrimSpace(g.DefaultNamespace) != "" {
+			return strings.TrimSpace(g.DefaultNamespace)
+		}
+		return "default"
+	}()
 
-	// Default workspace ingress knobs for dev: don't force a domain; use UI internal proxy unless explicitly configured.
-	if os.Getenv("INGRESS_CLASS_NAME") == "" {
-		os.Setenv("INGRESS_CLASS_NAME", "nginx")
-	}
+	// Default workspace ingress knobs: no implicit ingress class via env; use cluster settings per cluster when creating resources.
 
 	// UI config (optional)
 	mux.HandleFunc("/api/ui-config", func(w http.ResponseWriter, r *http.Request) {
@@ -462,10 +482,10 @@ func main() {
 		info, _ := ts.Info(ctx, tsServer)
 		rec := &model.AgentRecord{
 			ID:       cfg.Hostname,
-			Org:      os.Getenv("ORG_ID"),
+			Org:      "", // deprecated; tenants handled per-cluster
 			Hostname: cfg.Hostname,
-			IP:       "", // fill with tsnet IP if available
-			Ports:    map[string]int{"ui": 8080},
+			IP:       "",
+			Ports:    map[string]int{"ui": 8090},
 			Version:  "hostapp",
 		}
 		if info != nil && info.IP != "" {
@@ -1176,11 +1196,7 @@ func main() {
 			return sch, fmt.Sprintf("%s:%d", host, port), subPath, nil
 		},
 		APIProxy: func() (http.RoundTripper, func(req *http.Request, scheme, hostport, subPath string), bool) {
-			// Allow disabling API proxy fully
-			if strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_DISABLE_API_PROXY")), "1") ||
-				strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_DISABLE_API_PROXY")), "true") {
-				return nil, nil, false
-			}
+			// API proxy availability is determined by k8s client config already built; no HOSTAPP_* env checks here.
 			cfg := kcli.Config()
 			if cfg == nil {
 				return nil, nil, false
@@ -1190,75 +1206,25 @@ func main() {
 				return nil, nil, false
 			}
 			set := func(req *http.Request, scheme, hostport, subPath string) {
-				// If we’re targeting a local PF set earlier (host is 127.0.0.1), do not rewrite to API proxy
+				// If targeting local PF (127.0.0.1), do not rewrite to API proxy
 				hn := req.URL.Hostname()
 				if hn == "127.0.0.1" || strings.EqualFold(hn, "localhost") {
 					return
 				}
-				// Determine base URL: env override > kube config
-				baseURL, baseFromEnv := func() (*url.URL, bool) {
-					if v := strings.TrimSpace(os.Getenv("HOSTAPP_API_PROXY_URL")); v != "" {
-						if u, err := url.Parse(v); err == nil {
-							return u, true
-						}
-					}
-					if u, err := url.Parse(cfg.Host); err == nil && u != nil {
-						return u, false
-					}
-					return &url.URL{Scheme: "https"}, false
-				}()
+				baseURL, _ := url.Parse(cfg.Host)
+				if baseURL == nil {
+					baseURL = &url.URL{Scheme: "https"}
+				}
 				if baseURL.Scheme == "" {
 					baseURL.Scheme = "https"
-				}
-				// Only force HTTP when:
-				// - explicitly requested via HOSTAPP_API_PROXY_FORCE_HTTP, or
-				// - kubeconfig host is loopback (localhost/127.0.0.1) and not overridden by env
-				if strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_API_PROXY_FORCE_HTTP")), "1") ||
-					strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_API_PROXY_FORCE_HTTP")), "true") {
-					baseURL.Scheme = "http"
-				} else if !baseFromEnv {
-					hn := baseURL.Hostname()
-					if hn == "localhost" || hn == "127.0.0.1" {
-						baseURL.Scheme = "http"
-					}
-				}
-
-				// If using a loopback base and it appears unreachable, prefer kubectl proxy on 127.0.0.1:8001 when open.
-				if !baseFromEnv {
-					hn := baseURL.Hostname()
-					if hn == "localhost" || hn == "127.0.0.1" {
-						// quick probe current base
-						probeAddr := baseURL.Host
-						if !strings.Contains(probeAddr, ":") {
-							if baseURL.Scheme == "https" {
-								probeAddr = net.JoinHostPort(baseURL.Host, "443")
-							} else {
-								probeAddr = net.JoinHostPort(baseURL.Host, "80")
-							}
-						}
-						c, err := net.DialTimeout("tcp", probeAddr, 250*time.Millisecond)
-						if err != nil {
-							// try kubectl proxy default
-							if c2, err2 := net.DialTimeout("tcp", "127.0.0.1:8001", 250*time.Millisecond); err2 == nil {
-								_ = c2.Close()
-								baseURL.Scheme = "http"
-								baseURL.Host = "127.0.0.1:8001"
-							}
-						} else {
-							_ = c.Close()
-						}
-					}
 				}
 				req.URL.Scheme = baseURL.Scheme
 				req.URL.Host = baseURL.Host
 				req.Host = req.URL.Host
-				basePrefix := strings.TrimSuffix(baseURL.Path, "/")
-
-				// Extract service name (Workspace ID) and port from inputs
+				// Extract service ID and port
 				sid := strings.TrimSpace(req.Header.Get("X-Guild-Server-ID"))
 				_, portStr, err := net.SplitHostPort(hostport)
 				if err != nil || portStr == "" {
-					// best-effort parse if hostport is not in host:port form
 					parts := strings.Split(hostport, ":")
 					if len(parts) > 1 {
 						portStr = parts[len(parts)-1]
@@ -1266,8 +1232,7 @@ func main() {
 						portStr = "80"
 					}
 				}
-
-				// Pre-resolve ClusterIP:port for direct fallback when PF fails
+				// Pre-resolve ClusterIP:port for fallback if PF fails
 				fallbackHost := ""
 				fallbackScheme := "http"
 				if sid != "" {
@@ -1280,21 +1245,11 @@ func main() {
 						}
 					}
 				}
-
-				// Choose proxy style: service by default; pod only if explicitly requested by header or HOSTAPP_PREFER_POD_PROXY/USE_PORT_FORWARD
+				// Prefer pod proxy when header provided
 				preferPod := strings.TrimSpace(req.Header.Get("X-Guild-Prefer-Pod")) != ""
-				if !preferPod {
-					if v := strings.TrimSpace(os.Getenv("HOSTAPP_PREFER_POD_PROXY")); v == "1" || strings.EqualFold(v, "true") {
-						preferPod = true
-					}
-				}
-				usePF := false
-				if v := strings.TrimSpace(os.Getenv("HOSTAPP_USE_PORT_FORWARD")); v == "1" || strings.EqualFold(v, "true") {
-					usePF = true
-					preferPod = true
-				}
+				usePF := strings.TrimSpace(req.Header.Get("X-Guild-Use-PortForward")) != ""
 				if preferPod && sid != "" {
-					// Discover any running pod (even if not Ready) behind the service named by sid
+					// Discover pod behind service
 					ns := defaultNS
 					podName := ""
 					if svc, err := kcli.K.CoreV1().Services(ns).Get(context.Background(), sid, metav1.GetOptions{}); err == nil && svc != nil && len(svc.Spec.Selector) > 0 {
@@ -1304,7 +1259,6 @@ func main() {
 						}
 						selector := strings.Join(selParts, ",")
 						if pods, err := kcli.K.CoreV1().Pods(ns).List(context.Background(), metav1.ListOptions{LabelSelector: selector}); err == nil && len(pods.Items) > 0 {
-							// prefer Ready pod, else take first Running, else any
 							pick := -1
 							for i, pod := range pods.Items {
 								if pod.Status.Phase == corev1.PodRunning {
@@ -1335,17 +1289,8 @@ func main() {
 							podName = pods.Items[pick].Name
 						}
 					}
-					if podName == "" {
-						if sidHdr := req.Header.Get("X-Guild-Server-ID"); sidHdr != "" {
-							selector := fmt.Sprintf("guildnet.io/id=%s", sidHdr)
-							if pods, err := kcli.K.CoreV1().Pods(ns).List(context.Background(), metav1.ListOptions{LabelSelector: selector}); err == nil && len(pods.Items) > 0 {
-								podName = pods.Items[0].Name
-							}
-						}
-					}
 					if podName != "" {
 						if usePF && pfMgr != nil {
-							// Use local port-forward to the pod first
 							pnum := 80
 							if n, err := fmt.Sscanf(portStr, "%d", &pnum); n == 0 || err != nil {
 								pnum = 8080
@@ -1356,20 +1301,16 @@ func main() {
 								req.URL.Scheme = "http"
 								req.URL.Host = fmt.Sprintf("127.0.0.1:%d", lp)
 								req.Host = req.URL.Host
-								// Provide a fallback target for the transport if PF fails mid-flight (use ClusterIP if available)
 								if fallbackHost != "" {
 									req.Header.Set("X-Guild-Fallback-Hostport", fallbackHost)
 									req.Header.Set("X-Guild-Fallback-Scheme", fallbackScheme)
 								}
-								// Clear X-Guild-Server-ID so API proxy layer doesn't try to rewrite
 								req.Header.Del("X-Guild-Server-ID")
 								req.URL.Path = singleJoiningSlash("", subPath)
 								return
 							}
 							log.Printf("proxy: port-forward failed, falling back to pod proxy ns=%s pod=%s err=%v", defaultNS, podName, err)
-							// fallthrough to pods proxy if Ensure fails
 						}
-						// If PF was requested but failed, try direct service ClusterIP via tsnet/overlay before API pod proxy
 						if usePF && fallbackHost != "" {
 							log.Printf("proxy: PF unavailable; trying direct ClusterIP %s for sid=%s", fallbackHost, sid)
 							req.URL.Scheme = fallbackScheme
@@ -1378,27 +1319,23 @@ func main() {
 							req.URL.Path = singleJoiningSlash("", subPath)
 							return
 						}
-						// Build pods proxy path: /api/v1/namespaces/{ns}/pods/{scheme}:{pod}:{port}/proxy
 						proto := "http"
 						if strings.EqualFold(scheme, "https") {
 							proto = "https"
 						}
 						basePath := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s:%s:%s/proxy", defaultNS, proto, podName, portStr)
-						fullBase := singleJoiningSlash(basePrefix, basePath)
+						fullBase := singleJoiningSlash(strings.TrimSuffix(baseURL.Path, "/"), basePath)
 						req.URL.Path = singleJoiningSlash("", fullBase) + subPath
 						return
 					}
 				}
-				// Service proxy (respect scheme) with explicit scheme prefix to avoid ambiguity
+				// Service proxy
 				if strings.EqualFold(scheme, "https") {
 					req.URL.Path = "/api/v1/namespaces/" + defaultNS + "/services/https:" + sid + ":" + portStr + "/proxy"
 				} else {
-					// explicitly use http: prefix
 					req.URL.Path = "/api/v1/namespaces/" + defaultNS + "/services/http:" + sid + ":" + portStr + "/proxy"
 				}
 				req.URL.Path = singleJoiningSlash("", req.URL.Path) + subPath
-				// return is redundant at end of function literal; removing to avoid linter/compile complaint
-				// return
 			}
 			return rt, set, true
 		},
@@ -1422,18 +1359,15 @@ func main() {
 	mux.Handle("/proxy/", proxyHandler)
 
 	// Wrap with middleware (logging, request id, CORS)
-	corsOrigin := ""
-	{
+	corsOrigin := func() string {
 		var g settings.Global
 		_ = setMgr.GetGlobal(&g)
 		if strings.TrimSpace(g.FrontendOrigin) != "" {
-			corsOrigin = strings.TrimSpace(g.FrontendOrigin)
-		} else if v := os.Getenv("FRONTEND_ORIGIN"); v != "" {
-			corsOrigin = v
-		} else {
-			corsOrigin = "https://localhost:5173"
+			return strings.TrimSpace(g.FrontendOrigin)
 		}
-	}
+		// Default dev origin is the Host App on 8090
+		return "https://127.0.0.1:8090"
+	}()
 	handler := httpx.RequestID(httpx.Logging(httpx.CORS(corsOrigin)(mux)))
 
 	// Certs: prefer repo CA-signed ./certs/server.crt|server.key, then ./certs/dev.crt|dev.key; else use ~/.guildnet/state/certs
@@ -1455,31 +1389,21 @@ func main() {
 		}
 	}
 
-	// local server (TLS only) - also try an IPv6 localhost listener if applicable
+	// local server (TLS only)
+	listenAddr := "127.0.0.1:8090"
 	localSrv := &http.Server{
-		Addr:         cfg.ListenLocal,
+		Addr:         listenAddr,
 		Handler:      handler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 	var v6Srv *http.Server
-	// Pre-bind local listener and fall back if the preferred port is unavailable.
-	bindAddr := cfg.ListenLocal
+	// Pre-bind local listener and hard-fail if unavailable (no fallback)
+	bindAddr := listenAddr
 	lnLocal, err := net.Listen("tcp", bindAddr)
 	if err != nil {
-		candidates := []string{"127.0.0.1:9443", "127.0.0.1:8080", "127.0.0.1:8081", "127.0.0.1:8443"}
-		for _, a := range candidates {
-			if l, e := net.Listen("tcp", a); e == nil {
-				lnLocal = l
-				bindAddr = a
-				localSrv.Addr = bindAddr
-				break
-			}
-		}
-		if lnLocal == nil {
-			log.Fatalf("local listen failed: %v", err)
-		}
+		log.Fatalf("local listen failed on %s: %v", bindAddr, err)
 	}
 	// Also prepare an IPv6 loopback listener on the same port when using localhost/127.0.0.1
 	var lnLocalV6 net.Listener
@@ -1498,7 +1422,7 @@ func main() {
 		}
 	}
 
-	// tsnet listener server
+	// tsnet server remains on :443
 	var tsSrv *http.Server
 	var ln net.Listener
 	{

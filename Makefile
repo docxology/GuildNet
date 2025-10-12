@@ -2,7 +2,7 @@ BINARY := hostapp
 PKG := ./...
 
 # Defaults (override as needed)
-LISTEN_LOCAL ?= 127.0.0.1:8080
+LISTEN_LOCAL ?= 127.0.0.1:8090
 
 # User-scoped kubeconfig location (used by scripts and docs)
 GN_KUBECONFIG ?= $(HOME)/.guildnet/kubeconfig
@@ -99,11 +99,11 @@ clean: ## Remove build artifacts
 health: ## Check backend health endpoint
 	curl -k https://$(LISTEN_LOCAL)/healthz || true
 
-tls-check-backend: ## Show TLS info for backend :8080
-	echo | openssl s_client -connect 127.0.0.1:8080 -servername localhost -tls1_2 2>/dev/null | head -n 20
+tls-check-backend: ## Show TLS info for backend :8090
+	echo | openssl s_client -connect 127.0.0.1:8090 -servername localhost -tls1_2 2>/dev/null | head -n 20
 
 stop-all: ## Stop all managed workloads via admin API
-	@curl -sk -X POST https://127.0.0.1:8080/api/admin/stop-all || curl -sk -X POST https://127.0.0.1:8080/api/stop-all || true
+	@curl -sk -X POST https://127.0.0.1:8090/api/admin/stop-all || curl -sk -X POST https://127.0.0.1:8090/api/stop-all || true
 
 # ---------- CRD / Operator helpers ----------
 CRD_DIR ?= config/crd
@@ -222,3 +222,46 @@ diag-k8s: ## Show kube API status and nodes
 
 diag-db: ## Print DB service details
 	bash ./scripts/rethinkdb-setup.sh || true
+
+# ---------- Network & Proxy ----------
+router-ensure: ## Deploy Tailscale subnet router DaemonSet in cluster (requires TS_AUTHKEY)
+	bash ./scripts/deploy-tailscale-router.sh
+
+router-ensure-novalidate: ## Deploy Tailscale router without server-side schema validation (bootstrap when API unreachable)
+	TS_AUTHKEY=$${TS_AUTHKEY:-$${HEADSCALE_AUTHKEY:-}} kubectl apply --validate=false -f - <<'YAML'
+	apiVersion: apps/v1
+	kind: DaemonSet
+	metadata:
+	  name: tailscale-subnet-router
+	  namespace: kube-system
+	  labels: { app: tailscale-subnet-router }
+	spec:
+	  selector: { matchLabels: { app: tailscale-subnet-router } }
+	  template:
+	    metadata: { labels: { app: tailscale-subnet-router } }
+	    spec:
+	      hostNetwork: true
+	      dnsPolicy: ClusterFirstWithHostNet
+	      tolerations: [ { operator: Exists } ]
+	      containers:
+	      - name: tailscale
+	        image: tailscale/tailscale:stable
+	        securityContext: { capabilities: { add: [NET_ADMIN, NET_RAW] }, privileged: true }
+	        env:
+	        - { name: TS_AUTHKEY, value: "$${TS_AUTHKEY}" }
+	        - { name: TS_LOGIN_SERVER, value: "$${TS_LOGIN_SERVER:-https://login.tailscale.com}" }
+	        - { name: TS_ROUTES, value: "$${TS_ROUTES:-10.0.0.0/24,10.96.0.0/12,10.244.0.0/16}" }
+	        - { name: TS_HOSTNAME, value: "$${TS_HOSTNAME:-talos-subnet-router}" }
+	        volumeMounts: [ { name: state, mountPath: /var/lib/tailscale }, { name: tun, mountPath: /dev/net/tun } ]
+	        args: [ /bin/sh, -c, "set -e; /usr/sbin/tailscaled --state=/var/lib/tailscale/tailscaled.state & sleep 2; tailscale up --authkey=\"$${TS_AUTHKEY}\" --login-server=\"$${TS_LOGIN_SERVER:-https://login.tailscale.com}\" --advertise-routes=\"$${TS_ROUTES:-10.0.0.0/24,10.96.0.0/12,10.244.0.0/16}\" --hostname=\"$${TS_HOSTNAME:-talos-subnet-router}\" --accept-routes; tail -f /dev/null" ]
+	      volumes:
+	      - { name: state, emptyDir: {} }
+	      - { name: tun, hostPath: { path: /dev/net/tun, type: CharDevice } }
+	YAML
+
+set-cluster-proxy: ## Set per-cluster API proxy URL and force HTTP (usage: make set-cluster-proxy CLUSTER_ID=... PROXY=http://host:8001)
+	@[ -n "$(CLUSTER_ID)" ] || { echo "CLUSTER_ID required"; exit 2; }
+	@[ -n "$(PROXY)" ] || { echo "PROXY required (e.g., http://127.0.0.1:8001)"; exit 2; }
+	@curl -sk -X PUT https://$(LISTEN_LOCAL)/api/settings/cluster/$(CLUSTER_ID) \
+	  -H 'Content-Type: application/json' \
+	  -d '{"api_proxy_url":"'"$(PROXY)"'","api_proxy_force_http":true}'

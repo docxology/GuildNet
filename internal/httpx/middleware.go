@@ -162,7 +162,7 @@ func genID() string {
 	return hex.EncodeToString(b[:])
 }
 
-// CORS middleware allowing a specific frontend origin (e.g., https://localhost:5173).
+// CORS middleware allowing a specific frontend origin (e.g., https://127.0.0.1:8090 in dev).
 // Preflights (OPTIONS) are short-circuited with 204.
 func CORS(allowedOrigin string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {

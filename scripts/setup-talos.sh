@@ -18,4 +18,13 @@ bash "$ROOT/scripts/setup-talos-apply.sh"
 # 4) Wait for Kubernetes and fetch kubeconfig
 bash "$ROOT/scripts/setup-talos-wait-kube.sh"
 
+# 5) Ensure Tailscale subnet router is deployed (provides routes for other tailnet machines)
+TS_AUTHKEY=${TS_AUTHKEY:-${HEADSCALE_AUTHKEY:-}}
+if [ -n "$TS_AUTHKEY" ]; then
+  echo "Ensuring Tailscale subnet router DaemonSet..."
+  TS_AUTHKEY="$TS_AUTHKEY" bash "$ROOT/scripts/deploy-tailscale-router.sh" || true
+else
+  echo "SKIP: TS_AUTHKEY not set; tailscale subnet router not deployed."
+fi
+
 echo "Talos setup complete."

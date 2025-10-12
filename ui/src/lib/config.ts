@@ -1,6 +1,6 @@
 // API base can be overridden with VITE_API_BASE.
 // Example:
-//  VITE_API_BASE=https://localhost:8080
+//  VITE_API_BASE=https://127.0.0.1:8090
 
 const trimSlash = (s: string) => s.replace(/\/$/, '')
 

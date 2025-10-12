@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -418,27 +417,27 @@ func Router(deps Deps) *http.ServeMux {
 					st["code"] = "no_kubeconfig"
 				} else {
 					if cfg, err := kubeconfigFrom(kc); err == nil {
-						// Apply per-cluster overrides before probe
-						var cs settings.Cluster
-						_ = setMgr.GetCluster(id, &cs)
-						if strings.TrimSpace(cs.APIProxyURL) != "" {
-							cfg.Host = strings.TrimSpace(cs.APIProxyURL)
-							if strings.HasPrefix(strings.ToLower(cfg.Host), "http://") {
-								cfg.TLSClientConfig = rest.TLSClientConfig{}
-							}
-						}
-						if cs.APIProxyForceHTTP {
-							if u, err := url.Parse(cfg.Host); err == nil {
-								u.Scheme = "http"
-								cfg.Host = u.String()
-							}
-						}
+						// Apply per-cluster overrides and fallback to local proxy
+						applyClusterAPIProxy(cfg, setMgr, id)
 						if err := healthyCluster(cfg); err == nil {
 							st["status"] = "ok"
 						} else {
-							st["status"] = "error"
-							st["code"] = "cluster_unreachable"
-							st["error"] = err.Error()
+							// Auto-heal: on timeout, try enabling local proxy fallback then retry once
+							if isTimeoutErr(err) && ensureProxyFallbackOnTimeout(setMgr, id) {
+								applyClusterAPIProxy(cfg, setMgr, id)
+								if err2 := healthyCluster(cfg); err2 == nil {
+									st["status"] = "ok"
+									st["note"] = "proxy_fallback_enabled"
+								} else {
+									st["status"] = "error"
+									st["code"] = "cluster_unreachable"
+									st["error"] = err2.Error()
+								}
+							} else {
+								st["status"] = "error"
+								st["code"] = "cluster_unreachable"
+								st["error"] = err.Error()
+							}
 						}
 					} else {
 						st["status"] = "error"
@@ -737,45 +736,36 @@ func Router(deps Deps) *http.ServeMux {
 				return
 			}
 			if action == "health" {
+				// Check and report reachability of this cluster
 				kc, ok := readClusterKubeconfig(deps.DB, deps.Secrets, id)
 				if !ok {
-					// No kubeconfig available
-					// Log for server diagnostics
-					log.Printf("cluster %s health: no kubeconfig", id)
 					_ = json.NewEncoder(w).Encode(map[string]any{"status": "unknown", "code": "no_kubeconfig"})
 					return
 				}
 				cfg, err := kubeconfigFrom(kc)
 				if err != nil {
-					// Kubeconfig present but invalid YAML/parse error
-					log.Printf("cluster %s health: bad kubeconfig: %v", id, err)
-					_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "code": "bad_kubeconfig", "error": err.Error()})
+					_ = json.NewEncoder(w).Encode(map[string]any{"status": "unknown", "code": "bad_kubeconfig", "error": err.Error()})
 					return
 				}
-				// Apply per-cluster overrides (proxy URL, force http)
-				var cs settings.Cluster
-				_ = setMgr.GetCluster(id, &cs)
-				if strings.TrimSpace(cs.APIProxyURL) != "" {
-					cfg.Host = strings.TrimSpace(cs.APIProxyURL)
-					if strings.HasPrefix(strings.ToLower(cfg.Host), "http://") {
-						cfg.TLSClientConfig = rest.TLSClientConfig{}
-					}
-				}
-				if cs.APIProxyForceHTTP {
-					if u, err := url.Parse(cfg.Host); err == nil {
-						u.Scheme = "http"
-						cfg.Host = u.String()
-					}
-				}
+				// Apply per-cluster overrides and fallback to local proxy
+				applyClusterAPIProxy(cfg, setMgr, id)
 				if err := healthyCluster(cfg); err == nil {
 					_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
 					return
-				} else {
-					// Cluster reachable check failed; include reason and log
-					log.Printf("cluster %s health: unreachable: %v", id, err)
-					_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "code": "cluster_unreachable", "error": err.Error()})
-					return
 				}
+				// Auto-heal: on timeout, try enabling local proxy fallback then retry once
+				if ensureProxyFallbackOnTimeout(setMgr, id) {
+					applyClusterAPIProxy(cfg, setMgr, id)
+					if err2 := healthyCluster(cfg); err2 == nil {
+						_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "note": "proxy_fallback_enabled"})
+						return
+					} else {
+						_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "code": "cluster_unreachable", "error": err2.Error()})
+						return
+					}
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "code": "cluster_unreachable"})
+				return
 			}
 			if action == "kubeconfig" {
 				kc, ok := readClusterKubeconfig(deps.DB, deps.Secrets, id)
@@ -826,22 +816,8 @@ func Router(deps Deps) *http.ServeMux {
 			httpx.JSONError(w, http.StatusBadRequest, "invalid kubeconfig", "bad_kubeconfig", err.Error())
 			return
 		}
-		// Apply cluster-scoped overrides
-		var cs settings.Cluster
-		_ = setMgr.GetCluster(clusterID, &cs)
-		if strings.TrimSpace(cs.APIProxyURL) != "" {
-			cfg.Host = strings.TrimSpace(cs.APIProxyURL)
-			if strings.HasPrefix(strings.ToLower(cfg.Host), "http://") {
-				cfg.TLSClientConfig = rest.TLSClientConfig{}
-			}
-		}
-		if cs.APIProxyForceHTTP {
-			// force http scheme when host is loopback or override explicitly requested
-			if u, err := url.Parse(cfg.Host); err == nil {
-				u.Scheme = "http"
-				cfg.Host = u.String()
-			}
-		}
+		// Apply cluster-scoped overrides and fallback to local proxy
+		applyClusterAPIProxy(cfg, setMgr, clusterID)
 		// Build clients
 		cli, err := kubernetes.NewForConfig(cfg)
 		if err != nil {
@@ -853,6 +829,9 @@ func Router(deps Deps) *http.ServeMux {
 			httpx.JSONError(w, http.StatusInternalServerError, "dynamic client error", "dyn_client", err.Error())
 			return
 		}
+		// Fetch per-cluster settings to derive default namespace
+		var cs settings.Cluster
+		_ = setMgr.GetCluster(clusterID, &cs)
 		defaultNS := strings.TrimSpace(cs.Namespace)
 		if defaultNS == "" {
 			defaultNS = "default"
@@ -1278,4 +1257,79 @@ func headscaleHealth(endpoint string) (string, error) {
 		return "ok", nil
 	}
 	return "error", err
+}
+
+// isLocalKubeProxyAvailable returns true if a kubectl proxy is listening on 127.0.0.1:8001.
+func isLocalKubeProxyAvailable() bool {
+	c, err := net.DialTimeout("tcp", "127.0.0.1:8001", 500*time.Millisecond)
+	if err == nil {
+		_ = c.Close()
+		return true
+	}
+	return false
+}
+
+// isTimeoutErr returns true if err looks like a client timeout/connection timeout to the API server.
+func isTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	// net.Error with Timeout()
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "client.timeout exceeded") || strings.Contains(msg, "context deadline exceeded") || strings.Contains(msg, "i/o timeout") {
+		return true
+	}
+	return false
+}
+
+// ensureProxyFallbackOnTimeout will enable per-cluster local proxy fallback when a timeout is detected.
+// Returns true if it modified settings.
+func ensureProxyFallbackOnTimeout(setMgr settings.Manager, clusterID string) bool {
+	if !isLocalKubeProxyAvailable() {
+		return false
+	}
+	var cs settings.Cluster
+	_ = setMgr.GetCluster(clusterID, &cs)
+	if cs.DisableAPIProxy {
+		return false
+	}
+	host := strings.TrimSpace(cs.APIProxyURL)
+	if host == "" || !strings.EqualFold(host, "http://127.0.0.1:8001") {
+		cs.APIProxyURL = "http://127.0.0.1:8001"
+		if !cs.APIProxyForceHTTP {
+			cs.APIProxyForceHTTP = true
+		}
+		_ = setMgr.PutCluster(clusterID, cs)
+		return true
+	}
+	return false
+}
+
+// applyClusterAPIProxy applies per-cluster proxy overrides and a local proxy fallback.
+// If DisableAPIProxy is false and no explicit APIProxyURL is configured, a local
+// kubectl proxy at http://127.0.0.1:8001 will be used when available.
+func applyClusterAPIProxy(cfg *rest.Config, setMgr settings.Manager, clusterID string) {
+	var cs settings.Cluster
+	_ = setMgr.GetCluster(clusterID, &cs)
+	host := strings.TrimSpace(cs.APIProxyURL)
+	if host == "" && !cs.DisableAPIProxy {
+		if isLocalKubeProxyAvailable() {
+			host = "http://127.0.0.1:8001"
+		}
+	}
+	if host != "" {
+		cfg.Host = host
+		if strings.HasPrefix(strings.ToLower(host), "http://") {
+			cfg.TLSClientConfig = rest.TLSClientConfig{}
+		}
+	}
+	if cs.APIProxyForceHTTP {
+		if u, err := url.Parse(cfg.Host); err == nil {
+			u.Scheme = "http"
+			cfg.Host = u.String()
+		}
+	}
 }
