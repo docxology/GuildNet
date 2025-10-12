@@ -83,6 +83,13 @@
       "command": "make stop-all",
       "group": "test"
     },
+    {
+      "label": "Generate join config (guildnet.config)",
+      "type": "shell",
+      "command": "bash scripts/create_join_info.sh --kubeconfig \"${GN_KUBECONFIG:-$HOME/.guildnet/kubeconfig}\" --name \"${GN_CLUSTER_NAME:-}\" --hostapp-url \"${GN_HOSTAPP_URL:-}\" --include-ca \"${GN_INCLUDE_CA:-}\" --out \"${GN_JOIN_OUT:-guildnet.config}\"",
+      "group": "build",
+      "problemMatcher": []
+    },
 
     // Extras
     {

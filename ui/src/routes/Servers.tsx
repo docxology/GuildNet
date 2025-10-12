@@ -70,7 +70,7 @@ export default function Servers() {
         <td class="py-2 pr-4">
           <A
             class="inline-flex items-center justify-center gap-2 rounded-md px-3 py-2 text-sm font-medium border bg-neutral-50 dark:bg-neutral-800 hover:bg-neutral-100 dark:hover:bg-neutral-700"
-            href={`/servers/${encodeURIComponent(srv.id)}`}
+            href={`/c/${encodeURIComponent(clusterId())}/servers/${encodeURIComponent(srv.id)}`}
           >
             Inspect
           </A>

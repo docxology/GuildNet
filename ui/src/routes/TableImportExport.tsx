@@ -65,7 +65,7 @@ export default function TableImportExport() {
   const dryRun = async () => {
     const res = await fetch(
       apiUrl(
-        `/api/db/${encodeURIComponent(params.dbId || '')}/tables/${encodeURIComponent(
+        `/api/cluster/${encodeURIComponent(params.clusterId || '')}/db/${encodeURIComponent(params.dbId || '')}/tables/${encodeURIComponent(
           params.table || ''
         )}/import?dry_run=1`
       ),
@@ -89,7 +89,7 @@ export default function TableImportExport() {
   const runImport = async () => {
     const res = await fetch(
       apiUrl(
-        `/api/db/${encodeURIComponent(params.dbId || '')}/tables/${encodeURIComponent(
+        `/api/cluster/${encodeURIComponent(params.clusterId || '')}/db/${encodeURIComponent(params.dbId || '')}/tables/${encodeURIComponent(
           params.table || ''
         )}/import`
       ),
@@ -113,7 +113,7 @@ export default function TableImportExport() {
   const exportRows = () => {
     window.open(
       apiUrl(
-        `/api/db/${encodeURIComponent(params.dbId || '')}/tables/${encodeURIComponent(
+        `/api/cluster/${encodeURIComponent(params.clusterId || '')}/db/${encodeURIComponent(params.dbId || '')}/tables/${encodeURIComponent(
           params.table || ''
         )}/export?format=${format()}`
       ),

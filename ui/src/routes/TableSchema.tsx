@@ -14,13 +14,14 @@ type ColumnDef = {
 type TableMeta = { name: string; primary_key: string; schema: ColumnDef[] }
 
 async function fetchTable(
+  clusterId: string,
   dbId: string,
   table: string
 ): Promise<TableMeta | null> {
   try {
     const r = await fetch(
       apiUrl(
-        `/api/db/${encodeURIComponent(dbId)}/tables/${encodeURIComponent(table)}`
+        `/api/cluster/${encodeURIComponent(clusterId)}/db/${encodeURIComponent(dbId)}/tables/${encodeURIComponent(table)}`
       )
     )
     if (!r.ok) return null
@@ -33,8 +34,8 @@ async function fetchTable(
 export default function TableSchema() {
   const params = useParams()
   const [meta, { refetch }] = createResource(
-    () => [params.dbId as string, params.table as string],
-    ([d, t]) => fetchTable(d as string, t as string)
+    () => [params.clusterId as string, params.dbId as string, params.table as string] as [string, string, string],
+    ([c, d, t]) => fetchTable(c, d, t)
   )
   const [editing, setEditing] = createSignal<ColumnDef[]>([])
   const [pk, setPk] = createSignal('id')
@@ -68,7 +69,7 @@ export default function TableSchema() {
     try {
       const res = await fetch(
         apiUrl(
-          `/api/db/${encodeURIComponent(params.dbId!)}/tables/${encodeURIComponent(
+          `/api/cluster/${encodeURIComponent(params.clusterId!)}/db/${encodeURIComponent(params.dbId!)}/tables/${encodeURIComponent(
             params.table!
           )}`
         ),

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -18,7 +19,11 @@ import (
 	"github.com/your/module/internal/jobs"
 	"github.com/your/module/internal/localdb"
 	"github.com/your/module/internal/orch"
+	"github.com/your/module/internal/proxy"
 	"github.com/your/module/internal/secrets"
+
+	// Added for DB API delegation
+	"github.com/your/module/internal/db"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,6 +41,8 @@ type Deps struct {
 	Secrets *secrets.Manager
 	Runner  *jobs.Runner
 	Token   string // optional bearer token for mutating endpoints
+	// Optional shared DB manager for database API; if nil, handlers will lazy-connect
+	DBMgr *db.Manager
 }
 
 func (d Deps) ensure() Deps {
@@ -223,8 +230,9 @@ func Router(deps Deps) *http.ServeMux {
 			arrCL := make([]any, 0, len(cls))
 			for _, c := range cls {
 				id := fmt.Sprint(c["id"])
+				name := fmt.Sprint(c["name"]) // include name for UI
 				kc, ok := readClusterKubeconfig(deps.DB, deps.Secrets, id)
-				st := map[string]any{"id": id, "status": "unknown"}
+				st := map[string]any{"id": id, "name": name, "status": "unknown"}
 				if ok {
 					if cfg, err := kubeconfigFrom(kc); err == nil {
 						if healthyCluster(cfg) == nil {
@@ -482,13 +490,20 @@ func Router(deps Deps) *http.ServeMux {
 				}
 				_ = json.NewDecoder(r.Body).Decode(&body)
 				if strings.TrimSpace(body.Kubeconfig) == "" {
-					http.Error(w, "missing kubeconfig", http.StatusBadRequest)
+					httpx.JSONError(w, http.StatusBadRequest, "missing kubeconfig", "missing_kubeconfig")
+					return
+				}
+				// Validate kubeconfig before storing
+				if _, err := kubeconfigFrom(body.Kubeconfig); err != nil {
+					httpx.JSONError(w, http.StatusBadRequest, "invalid kubeconfig", "bad_kubeconfig", err.Error())
 					return
 				}
 				enc := body.Kubeconfig
+				encrypted := false
 				if deps.Secrets != nil {
 					if v, err := deps.Secrets.Encrypt(body.Kubeconfig); err == nil {
 						enc = v
+						encrypted = true
 					}
 				}
 				cred := map[string]any{
@@ -497,12 +512,13 @@ func Router(deps Deps) *http.ServeMux {
 					"scopeId":   id,
 					"kind":      "cluster.kubeconfig",
 					"value":     enc,
+					"encrypted": encrypted,
 					"rotatedAt": time.Now().UTC().Format(time.RFC3339),
 				}
 				if deps.DB != nil {
 					_ = deps.DB.Put("credentials", fmt.Sprintf("cl:%s:kubeconfig", id), cred)
 				}
-				// validate
+				// Mark cluster ready if reachable
 				if cfg, err := kubeconfigFrom(body.Kubeconfig); err == nil {
 					if healthyCluster(cfg) == nil {
 						var rec map[string]any
@@ -551,17 +567,13 @@ func Router(deps Deps) *http.ServeMux {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	})
 
-	// List clusters (registry for UI sidebar)
-	mux.HandleFunc("/api/clusters", func(w http.ResponseWriter, r *http.Request) {
+	// UI config for runtime overrides
+	mux.HandleFunc("/api/ui-config", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		var items []map[string]any
-		if deps.DB != nil {
-			_ = deps.DB.List("clusters", &items)
-		}
-		_ = json.NewEncoder(w).Encode(items)
+		_ = json.NewEncoder(w).Encode(map[string]any{})
 	})
 
 	// Per-cluster scoped APIs: /api/cluster/:id/servers, /workspaces, etc.
@@ -575,7 +587,7 @@ func Router(deps Deps) *http.ServeMux {
 		clusterID := parts[0]
 		// build clients for this cluster from stored kubeconfig
 		kc, ok := readClusterKubeconfig(deps.DB, deps.Secrets, clusterID)
-		if !ok {
+		if !ok || strings.TrimSpace(kc) == "" {
 			httpx.JSONError(w, http.StatusNotFound, "cluster kubeconfig not found", "no_kubeconfig")
 			return
 		}
@@ -595,6 +607,57 @@ func Router(deps Deps) *http.ServeMux {
 			return
 		}
 		defaultNS := "default"
+		// Proxy: /api/cluster/{id}/proxy/server/{name}/...
+		if len(parts) >= 3 && parts[1] == "proxy" && parts[2] == "server" {
+			if len(parts) < 4 {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			name := parts[3]
+			restPath := "/"
+			if len(parts) > 4 {
+				restPath = "/" + strings.Join(parts[4:], "/")
+			}
+			// Determine service port (first port as default)
+			port := 0
+			if svc, err := cli.CoreV1().Services(defaultNS).Get(r.Context(), name, metav1.GetOptions{}); err == nil {
+				if len(svc.Spec.Ports) > 0 {
+					port = int(svc.Spec.Ports[0].Port)
+				}
+			}
+			if port == 0 {
+				port = 80
+			}
+			// Build API transport to kube-apiserver
+			rt, err := rest.TransportFor(cfg)
+			if err != nil {
+				httpx.JSONError(w, http.StatusInternalServerError, "k8s transport error", "k8s_transport", err.Error())
+				return
+			}
+			apihost, _ := url.Parse(cfg.Host)
+			rp := proxy.NewReverseProxy(proxy.Options{
+				Timeout: 60 * time.Second,
+				ResolveServer: func(ctx context.Context, serverID string, subPath string) (string, string, string, error) {
+					p := "/api/v1/namespaces/" + defaultNS + "/services/" + name + ":" + fmt.Sprintf("%d", port) + "/proxy" + subPath
+					return "http", "", p, nil
+				},
+				APIProxy: func() (http.RoundTripper, func(req *http.Request, scheme, hostport, p string), bool) {
+					return rt, func(req *http.Request, scheme, hostport, pth string) {
+						req.URL.Scheme = apihost.Scheme
+						req.URL.Host = apihost.Host
+						req.Host = apihost.Host
+						req.URL.Path = pth
+					}, true
+				},
+			})
+			// Rewrite path to start at /proxy/server/{name}/...
+			r2 := r.Clone(r.Context())
+			r2.URL = new(url.URL)
+			*r2.URL = *r.URL
+			r2.URL.Path = "/proxy/server/" + url.PathEscape(name) + restPath
+			rp.ServeHTTP(w, r2)
+			return
+		}
 		if len(parts) == 2 && parts[1] == "servers" {
 			if r.Method != http.MethodGet {
 				w.WriteHeader(http.StatusMethodNotAllowed)
@@ -661,14 +724,45 @@ func Router(deps Deps) *http.ServeMux {
 		if len(parts) >= 2 && parts[1] == "workspaces" {
 			gvr := schema.GroupVersionResource{Group: "guildnet.io", Version: "v1alpha1", Resource: "workspaces"}
 			if len(parts) == 2 && r.Method == http.MethodPost {
+				// auth for mutating
+				if r.Method != http.MethodGet {
+					if deps.Token != "" || true { // enforce localhost-or-token via authOK equivalent
+						// simple check mimicking authOK: allow only localhost if no token
+						host, _, _ := net.SplitHostPort(r.RemoteAddr)
+						ip := net.ParseIP(host)
+						if strings.TrimSpace(deps.Token) != "" {
+							// require header token match
+							authz := r.Header.Get("Authorization")
+							if !strings.HasPrefix(strings.ToLower(authz), "bearer ") || strings.TrimSpace(authz[7:]) != strings.TrimSpace(deps.Token) {
+								http.Error(w, "unauthorized", http.StatusUnauthorized)
+								return
+							}
+						} else if !(ip != nil && (ip.IsLoopback() || host == "127.0.0.1" || host == "::1")) {
+							http.Error(w, "unauthorized", http.StatusUnauthorized)
+							return
+						}
+					}
+				}
 				var spec map[string]any
 				_ = json.NewDecoder(r.Body).Decode(&spec)
-				// expect { image, env?, ports? }
+				// expect { image, name?, env?, ports?, args?, resources?, labels? }
 				name := strings.TrimSpace(fmt.Sprint(spec["name"]))
 				if name == "" {
 					name = fmt.Sprintf("ws-%s", uuid.NewString()[:8])
 				}
-				obj := map[string]any{"apiVersion": "guildnet.io/v1alpha1", "kind": "Workspace", "metadata": map[string]any{"name": name}, "spec": map[string]any{"image": spec["image"], "env": spec["env"], "ports": spec["ports"]}}
+				obj := map[string]any{
+					"apiVersion": "guildnet.io/v1alpha1",
+					"kind":       "Workspace",
+					"metadata":   map[string]any{"name": name},
+					"spec": map[string]any{
+						"image":     spec["image"],
+						"env":       spec["env"],
+						"ports":     spec["ports"],
+						"args":      spec["args"],
+						"resources": spec["resources"],
+						"labels":    spec["labels"],
+					},
+				}
 				if _, err := dyn.Resource(gvr).Namespace(defaultNS).Create(r.Context(), &unstructured.Unstructured{Object: obj}, metav1.CreateOptions{}); err != nil {
 					httpx.JSONError(w, http.StatusInternalServerError, "workspace create failed", "create_failed", err.Error())
 					return
@@ -720,7 +814,68 @@ func Router(deps Deps) *http.ServeMux {
 				httpx.JSON(w, http.StatusOK, out)
 				return
 			}
+			if len(parts) == 5 && parts[3] == "logs" && parts[4] == "stream" && r.Method == http.MethodGet {
+				name := parts[2]
+				pods, err := cli.CoreV1().Pods(defaultNS).List(r.Context(), metav1.ListOptions{LabelSelector: fmt.Sprintf("guildnet.io/workspace=%s", name)})
+				if err != nil || len(pods.Items) == 0 {
+					http.Error(w, "no pods", http.StatusNotFound)
+					return
+				}
+				pod := pods.Items[0]
+				container := ""
+				if len(pod.Spec.Containers) > 0 {
+					container = pod.Spec.Containers[0].Name
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.Header().Set("Cache-Control", "no-cache")
+				w.Header().Set("Connection", "keep-alive")
+				flusher, ok := w.(http.Flusher)
+				if !ok {
+					http.Error(w, "stream unsupported", http.StatusInternalServerError)
+					return
+				}
+				ctx := r.Context()
+				stream, err := cli.CoreV1().Pods(defaultNS).GetLogs(pod.Name, &corev1.PodLogOptions{Container: container, Follow: true}).Stream(ctx)
+				if err != nil {
+					http.Error(w, "log stream error", http.StatusInternalServerError)
+					return
+				}
+				defer stream.Close()
+				scanner := bufio.NewScanner(stream)
+				for scanner.Scan() {
+					select {
+					case <-ctx.Done():
+						return
+					default:
+					}
+					line := scanner.Text()
+					msg := fmt.Sprintf("[%s] %s", pod.Name, strings.TrimSpace(line))
+					io.WriteString(w, "data: ")
+					b, _ := json.Marshal(map[string]string{"t": time.Now().UTC().Format(time.RFC3339), "msg": msg})
+					w.Write(b)
+					io.WriteString(w, "\n\n")
+					flusher.Flush()
+				}
+				return
+			}
 			if len(parts) == 3 && r.Method == http.MethodDelete {
+				// auth for mutating
+				if r.Method != http.MethodGet {
+					if deps.Token != "" || true {
+						host, _, _ := net.SplitHostPort(r.RemoteAddr)
+						ip := net.ParseIP(host)
+						if strings.TrimSpace(deps.Token) != "" {
+							authz := r.Header.Get("Authorization")
+							if !strings.HasPrefix(strings.ToLower(authz), "bearer ") || strings.TrimSpace(authz[7:]) != strings.TrimSpace(deps.Token) {
+								http.Error(w, "unauthorized", http.StatusUnauthorized)
+								return
+							}
+						} else if !(ip != nil && (ip.IsLoopback() || host == "127.0.0.1" || host == "::1")) {
+							http.Error(w, "unauthorized", http.StatusUnauthorized)
+							return
+						}
+					}
+				}
 				name := parts[2]
 				if err := dyn.Resource(gvr).Namespace(defaultNS).Delete(r.Context(), name, metav1.DeleteOptions{}); err != nil {
 					httpx.JSONError(w, http.StatusNotFound, "workspace not found", "not_found")
@@ -729,6 +884,58 @@ func Router(deps Deps) *http.ServeMux {
 				httpx.JSON(w, http.StatusOK, map[string]any{"deleted": name})
 				return
 			}
+		}
+		// Per-cluster Databases API routes: delegate to httpx.DBAPI with OrgID=clusterID
+		if len(parts) >= 2 && parts[1] == "db" {
+			api := &httpx.DBAPI{Manager: func() httpx.DBManager {
+				if deps.DBMgr != nil {
+					return deps.DBMgr
+				}
+				// nil -> lazy connect inside handler
+				return nil
+			}(), OrgID: clusterID, RBAC: httpx.NewRBACStore()}
+			mux2 := http.NewServeMux()
+			api.Register(mux2)
+			// Rewrite path to /api/db...
+			r2 := r.Clone(r.Context())
+			r2.URL = new(url.URL)
+			*r2.URL = *r.URL
+			if len(parts) == 2 { // /api/cluster/:id/db -> /api/db
+				r2.URL.Path = "/api/db"
+			} else {
+				r2.URL.Path = "/api/db/" + strings.Join(parts[2:], "/")
+			}
+			mux2.ServeHTTP(w, r2)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	// SSE: per-cluster DB changefeed: /sse/cluster/:id/db/...
+	mux.HandleFunc("/sse/cluster/", func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/sse/cluster/")
+		parts := strings.Split(strings.Trim(path, "/"), "/")
+		if len(parts) < 2 {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		clusterID := parts[0]
+		if len(parts) >= 2 && parts[1] == "db" {
+			api := &httpx.DBAPI{Manager: func() httpx.DBManager {
+				if deps.DBMgr != nil {
+					return deps.DBMgr
+				}
+				return nil
+			}(), OrgID: clusterID, RBAC: httpx.NewRBACStore()}
+			mux2 := http.NewServeMux()
+			api.Register(mux2)
+			// Rewrite to /sse/db/...
+			r2 := r.Clone(r.Context())
+			r2.URL = new(url.URL)
+			*r2.URL = *r.URL
+			r2.URL.Path = "/sse/db/" + strings.Join(parts[2:], "/")
+			mux2.ServeHTTP(w, r2)
+			return
 		}
 		w.WriteHeader(http.StatusNotFound)
 	})
@@ -764,12 +971,31 @@ func readClusterKubeconfig(db *localdb.DB, sec *secrets.Manager, id string) (str
 		return "", false
 	}
 	val := fmt.Sprint(cred["value"])
+	// If explicitly marked encrypted, require successful decryption and basic validation
+	if encFlag, ok := cred["encrypted"].(bool); ok && encFlag {
+		if sec == nil {
+			return "", false
+		}
+		if v, err := sec.Decrypt(val); err == nil {
+			if cfg, e2 := kubeconfigFrom(v); e2 == nil && cfg != nil {
+				return v, true
+			}
+		}
+		return "", false
+	}
+	// Legacy/unknown: try decrypt first, then fall back to plaintext; validate either way
 	if sec != nil {
 		if v, err := sec.Decrypt(val); err == nil {
-			return v, true
+			if cfg, e2 := kubeconfigFrom(v); e2 == nil && cfg != nil {
+				return v, true
+			}
 		}
 	}
-	return val, true
+	// Treat as plaintext and validate
+	if cfg, err := kubeconfigFrom(val); err == nil && cfg != nil {
+		return val, true
+	}
+	return "", false
 }
 
 func headscaleHealth(endpoint string) (string, error) {

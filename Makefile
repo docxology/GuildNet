@@ -77,10 +77,10 @@ run: build ## Build all (backend+UI) and run backend (serve)
 	bash ./scripts/run-hostapp.sh
 
 # ---------- DB / Health ----------
-db-health: ## Check database API and report availability
-	@echo "Checking backend health and DB API..."; \
+db-health: ## Check backend health summary
+	@echo "Checking backend health..."; \
 	(set -x; curl -sk https://$(LISTEN_LOCAL)/healthz); echo; \
-	(set -x; curl -sk https://$(LISTEN_LOCAL)/api/db) || true; echo
+	(set -x; curl -sk https://$(LISTEN_LOCAL)/api/health) || true; echo
 
 # ---------- Quality ----------
 test: ## Run Go tests (race)

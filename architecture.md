@@ -147,7 +147,7 @@ flowchart LR
   H -->|Local PF to Pod| L[127.0.0.1:port]
 ```
 
-Database operations
+Database operations (per cluster)
 
 ```mermaid
 sequenceDiagram
@@ -157,7 +157,7 @@ sequenceDiagram
   participant K as Kubernetes API
   participant R as RethinkDB Service
 
-  U->>B: GET /api/db
+  U->>B: GET /api/cluster/:id/db
   B->>K: Discover Service address (LB/NodePort/ClusterIP)
   alt direct dial works
     B->>R: TCP 28015
@@ -181,15 +181,14 @@ Core
 - POST `/api/admin/stop-all` — delete all managed workloads
 - Reverse proxy: `/proxy?to=host:port&path=/...`, `/proxy/{to}/{rest}`, `/proxy/server/{id}/{rest}`
 
-Database
+Database (per-cluster)
 
-- GET `/api/db/health` — {status, addr, error?}
-- GET `/api/db` — list databases (per org)
-- POST `/api/db` — create database {id, name?, description?}
-- GET `/api/db/:dbId` — database info
-- DELETE `/api/db/:dbId` — drop database
-- Table/rows endpoints under `/api/db/:dbId/tables/...` including import, query, insert, update, delete
-- GET `/sse/db/:dbId/tables/:table/changes` — changefeed (MVP)
+- GET `/api/cluster/{clusterId}/db` — list databases for the cluster
+- POST `/api/cluster/{clusterId}/db` — create database {id, name?, description?}
+- GET `/api/cluster/{clusterId}/db/:dbId` — database info
+- DELETE `/api/cluster/{clusterId}/db/:dbId` — drop database
+- Table/rows endpoints under `/api/cluster/{clusterId}/db/:dbId/tables/...` including import, query, insert, update, delete
+- GET `/sse/cluster/{clusterId}/db/:dbId/tables/:table/changes` — changefeed (MVP)
 
 ### Security and Headers
 

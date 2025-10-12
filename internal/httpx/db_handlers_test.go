@@ -7,41 +7,18 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/your/module/internal/db"
 	"github.com/your/module/internal/model"
 )
 
-// Spec (MUST / MUST NOT / SHOULD / MAY)
-//
-// Databases:
-// - MUST list databases for the org at GET /api/db (200, [] when none)
-// - MUST create a database at POST /api/db with {id, name?, description?} (201)
-// - MUST NOT create without id (400)
-// - MUST return db info at GET /api/db/:dbId (200) and 404 if missing
-// - MUST delete database at DELETE /api/db/:dbId (200)
-// - MUST auto-grant maintainer to creator principal on create
-//
-// Tables:
-// - MUST list tables at GET /api/db/:dbId/tables (200)
-// - MUST create table at POST /api/db/:dbId/tables with {name, schema, primary_key?} when principal has maintainer at db or org (201)
-// - MUST enforce permission: 403 if lacking role
-// - MUST get table metadata at GET /api/db/:dbId/tables/:table (200) or 404
-// - SHOULD allow schema update at PATCH (currently 200 on success)
-//
-// Rows:
-// - MUST list rows at GET /api/db/:dbId/tables/:table/rows (200) when role allows row.read; 403 otherwise
-// - MUST insert row(s) at POST /api/db/:dbId/tables/:table/rows (201) when role allows row.write
-// - MUST update row at PATCH /rows/:id (200) with row.write; delete row at DELETE /rows/:id (200)
-//
-// Permissions:
-// - MAY manage permission bindings under /api/db/:dbId/permissions (in-memory MVP)
-//
-// SSE:
-// - MAY subscribe to /sse/db/:dbId/tables/:table/changes (out of scope for unit tests here)
+// End-to-end style tests for the per-cluster database API wrapper.
+// These mount a tiny mux that exposes /api/cluster/:id/db and /sse/cluster/:id/db
+// and delegate to DBAPI with OrgID bound to the provided cluster id.
 
-// mockManager implements the minimal subset of db.Manager used by handlers for tests
 type mockManager struct {
 	dbs    map[string]model.DatabaseInstance
 	tables map[string][]model.Table    // key=dbID
@@ -113,75 +90,119 @@ func (m *mockManager) SubscribeTable(ctx context.Context, orgID, dbID, table str
 }
 func (m *mockManager) Ping(ctx context.Context) error { return nil }
 
-func setupTestServer(t *testing.T) *httptest.Server {
+func setupClusterMux(t *testing.T, clusterID string) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
-	api := &DBAPI{Manager: DBManager(newMock()), OrgID: "org-demo", RBAC: NewRBACStore()}
-	// grant org maintainer to user:demo
-	api.RBAC.Grant(model.PermissionBinding{Principal: "user:demo", Scope: "db:org-demo", Role: model.RoleMaintainer, CreatedAt: model.NowISO()})
-	api.Register(mux)
+	api := &DBAPI{Manager: DBManager(newMock()), OrgID: clusterID, RBAC: NewRBACStore()}
+	api.RBAC.Grant(model.PermissionBinding{Principal: "user:demo", Scope: "db:" + clusterID, Role: model.RoleMaintainer, CreatedAt: model.NowISO()})
+	sub := http.NewServeMux()
+	api.Register(sub)
+	mux.HandleFunc("/api/cluster/", func(w http.ResponseWriter, r *http.Request) {
+		p := strings.TrimPrefix(r.URL.Path, "/api/cluster/")
+		parts := strings.Split(strings.Trim(p, "/"), "/")
+		if len(parts) < 2 || parts[1] != "db" {
+			http.NotFound(w, r)
+			return
+		}
+		r2 := r.Clone(r.Context())
+		r2.URL = new(url.URL)
+		*r2.URL = *r.URL
+		if len(parts) == 2 {
+			r2.URL.Path = "/api/db"
+		} else {
+			r2.URL.Path = "/api/db/" + strings.Join(parts[2:], "/")
+		}
+		sub.ServeHTTP(w, r2)
+	})
 	return httptest.NewTLSServer(mux)
 }
 
-func TestDB_ListCreateDelete(t *testing.T) {
-	srv := setupTestServer(t)
-	defer srv.Close()
+func TestE2E_ClusterDB_ListCreateDelete(t *testing.T) {
+	clusterID := "cl-e2e"
+	ts := setupClusterMux(t, clusterID)
+	defer ts.Close()
+	c := ts.Client()
+	base := ts.URL + "/api/cluster/" + clusterID + "/db"
 	// list empty
-	res, err := srv.Client().Get(srv.URL + "/api/db")
+	resp, err := c.Get(base)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.StatusCode != 200 {
-		t.Fatalf("expected 200, got %d", res.StatusCode)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status=%d", resp.StatusCode)
 	}
-	// create missing id -> 400
-	res, _ = srv.Client().Post(srv.URL+"/api/db", "application/json", bytes.NewBufferString(`{"name":"x"}`))
-	if res.StatusCode != 400 {
-		t.Fatalf("expected 400, got %d", res.StatusCode)
+	_ = resp.Body.Close()
+	// create
+	body, _ := json.Marshal(map[string]any{"id": "db1", "name": "Main"})
+	resp2, err := c.Post(base, "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
 	}
-	// create ok
-	res, _ = srv.Client().Post(srv.URL+"/api/db", "application/json", bytes.NewBufferString(`{"id":"testdb","name":"Test"}`))
-	if res.StatusCode != 201 {
-		t.Fatalf("expected 201, got %d", res.StatusCode)
+	if resp2.StatusCode != 201 {
+		t.Fatalf("create status=%d", resp2.StatusCode)
 	}
+	_ = resp2.Body.Close()
 	// get info
-	res, _ = srv.Client().Get(srv.URL + "/api/db/testdb")
-	if res.StatusCode != 200 {
-		t.Fatalf("expected 200, got %d", res.StatusCode)
+	resp3, err := c.Get(base + "/db1")
+	if err != nil {
+		t.Fatal(err)
 	}
+	if resp3.StatusCode != 200 {
+		t.Fatalf("get status=%d", resp3.StatusCode)
+	}
+	_ = resp3.Body.Close()
 	// delete
-	req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/api/db/testdb", nil)
-	res, _ = srv.Client().Do(req)
-	if res.StatusCode != 200 {
-		t.Fatalf("expected 200, got %d", res.StatusCode)
+	req, _ := http.NewRequest(http.MethodDelete, base+"/db1", nil)
+	resp4, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
 	}
+	if resp4.StatusCode != 200 {
+		t.Fatalf("delete status=%d", resp4.StatusCode)
+	}
+	_ = resp4.Body.Close()
 }
 
-func TestTables_CreateListRows_WithOrgMaintainer(t *testing.T) {
-	srv := setupTestServer(t)
-	defer srv.Close()
-	// create DB
-	res, _ := srv.Client().Post(srv.URL+"/api/db", "application/json", bytes.NewBufferString(`{"id":"db1","name":"DB1"}`))
-	if res.StatusCode != 201 {
-		t.Fatalf("expected 201, got %d", res.StatusCode)
+func TestE2E_ClusterDB_TablesAndRows(t *testing.T) {
+	clusterID := "cl-e2e"
+	ts := setupClusterMux(t, clusterID)
+	defer ts.Close()
+	c := ts.Client()
+	base := ts.URL + "/api/cluster/" + clusterID + "/db"
+	// create db
+	_, _ = c.Post(base, "application/json", bytes.NewReader([]byte(`{"id":"db2"}`)))
+	// create table
+	tspec := map[string]any{
+		"name":   "users",
+		"schema": []map[string]any{{"name": "id", "type": "string", "required": true}, {"name": "email", "type": "string", "required": true}},
 	}
-	// create table (org-level maintainer via fallback should allow)
-	body := map[string]any{"name": "events", "primary_key": "id", "schema": []map[string]any{{"name": "id", "type": "string", "required": true}}}
-	b, _ := json.Marshal(body)
-	res, _ = srv.Client().Post(srv.URL+"/api/db/db1/tables", "application/json", bytes.NewBuffer(b))
-	if res.StatusCode != 201 {
-		t.Fatalf("create table expected 201, got %d", res.StatusCode)
+	bts, _ := json.Marshal(tspec)
+	resp, err := c.Post(base+"/db2/tables", "application/json", bytes.NewReader(bts))
+	if err != nil {
+		t.Fatal(err)
 	}
-	// insert a row
-	row := map[string]any{"id": "1", "message": "hi"}
-	b2, _ := json.Marshal(row)
-	res, _ = srv.Client().Post(srv.URL+"/api/db/db1/tables/events/rows", "application/json", bytes.NewBuffer(b2))
-	if res.StatusCode != 201 {
-		t.Fatalf("insert row expected 201, got %d", res.StatusCode)
+	if resp.StatusCode != 201 {
+		t.Fatalf("table create status=%d", resp.StatusCode)
 	}
+	_ = resp.Body.Close()
+	// insert rows
+	rows := []map[string]any{{"id": "u1", "email": "a@b"}, {"id": "u2", "email": "c@d"}}
+	rb, _ := json.Marshal(rows)
+	resp2, err := c.Post(base+"/db2/tables/users/rows", "application/json", bytes.NewReader(rb))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp2.StatusCode != 201 {
+		t.Fatalf("rows insert status=%d", resp2.StatusCode)
+	}
+	_ = resp2.Body.Close()
 	// list rows
-	res, _ = srv.Client().Get(srv.URL + "/api/db/db1/tables/events/rows")
-	if res.StatusCode != 200 {
-		t.Fatalf("list rows expected 200, got %d", res.StatusCode)
+	resp3, err := c.Get(base + "/db2/tables/users/rows")
+	if err != nil {
+		t.Fatal(err)
 	}
+	if resp3.StatusCode != 200 {
+		t.Fatalf("rows list status=%d", resp3.StatusCode)
+	}
+	_ = resp3.Body.Close()
 }

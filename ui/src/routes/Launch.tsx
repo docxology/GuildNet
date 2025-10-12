@@ -155,11 +155,14 @@ export default function Launch() {
         image: spec.image,
         name: spec.name,
         env: Object.entries(spec.env || {}).map(([name, value]) => ({ name, value })),
-        ports: (spec.expose || []).map((p: any) => ({ name: p.name, containerPort: p.port }))
+        ports: (spec.expose || []).map((p: any) => ({ name: p.name, containerPort: p.port })),
+        args: spec.args,
+        resources: spec.resources,
+        labels: Object.entries(spec.labels || {}).map(([name, value]) => ({ name, value }))
       })
       if (res) {
         pushToast({ type: 'success', message: `Workspace ${res.id} creating` })
-        navigate(`/c/${encodeURIComponent(clusterId())}/servers`)
+        navigate(`/c/${encodeURIComponent(clusterId())}/servers/${encodeURIComponent(res.id)}`)
       }
     } catch (e) {
       pushToast({ type: 'error', message: (e as Error).message })

@@ -311,17 +311,21 @@ func main() {
 	} else {
 		dbMgr = mgr
 	}
-	// Always register database API endpoints; handlers will degrade gracefully when dbMgr is nil.
-	httpx.InitAndRegisterDB(mux, dbMgr)
+	// Do not register legacy global /api/db endpoints; per-cluster routes are mounted below.
 
 	// New orchestration API wired with dependencies (single router instance mounted on multiple paths)
-	deps := api.Deps{DB: ldb, Secrets: sec, Runner: nil}
+	deps := api.Deps{DB: ldb, Secrets: sec, Runner: nil, DBMgr: dbMgr}
 	apiMux := api.Router(deps)
 	mux.Handle("/api/deploy/", apiMux)
 	mux.Handle("/api/jobs", apiMux)
 	mux.Handle("/api/jobs/", apiMux)
 	mux.Handle("/api/jobs-logs/", apiMux)
 	mux.Handle("/ws/jobs", apiMux)
+	// Mount additional API groups served by router
+	mux.Handle("/api/cluster/", apiMux)
+	mux.Handle("/sse/cluster/", apiMux)
+	// Ensure core health endpoint is reachable
+	mux.Handle("/api/health", apiMux)
 
 	// health check
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {

@@ -10,7 +10,7 @@ spec:
           readinessProbe:
             httpGet:
               scheme: HTTPS
-              path: /api/db/health
+              path: /api/health
               port: 8080
             initialDelaySeconds: 5
             periodSeconds: 10

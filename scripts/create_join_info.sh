@@ -5,6 +5,7 @@ set -euo pipefail
 # This captures everything needed to add a cluster via the UI wizard:
 # - Cluster: name label and kubeconfig YAML (required)
 # - Optional UI base URL (vite_api_base) and an extra CA PEM to trust it
+# - Optional hostapp.url and hostapp.ca_pem for CLI join compatibility
 # - Optional notes for the operator/UI
 #
 # Backwards-compatible optional fields retained for Tailscale/Headscale hints:
@@ -48,11 +49,11 @@ usage() {
 Usage: scripts/create_join_info.sh [options]
 
 Options:
-  --kubeconfig PATH     Kubeconfig file to embed (default: \$KUBECONFIG or ~/.kube/config)
+  --kubeconfig PATH     Kubeconfig file to embed (default: $KUBECONFIG or ~/.kube/config)
   --name LABEL          Optional display name/cluster label shown in UI
   --notes TEXT          Optional free-form note/instructions
-  --hostapp-url URL     Optional Host App base URL for UI/API (sets ui.vite_api_base)
-  --include-ca PATH     Include PEM-encoded CA/cert at PATH (for ui.ca_pem)
+  --hostapp-url URL     Optional Host App base URL for UI/API (sets ui.vite_api_base and hostapp.url)
+  --include-ca PATH     Include PEM-encoded CA/cert at PATH (for ui.ca_pem and hostapp.ca_pem)
   --login-server URL    (optional) Tailscale/Headscale login server URL (hint)
   --auth-key KEY        (optional) Pre-auth key (sensitive, hint)
   --hostname NAME       (optional) Suggested tsnet hostname (hint)
@@ -108,6 +109,12 @@ if [ -n "$HOSTAPP_URL" ]; then UI_FIELDS+=("\"vite_api_base\": $(jq -Rn --arg v 
 if [ -n "$CA_PEM" ]; then UI_FIELDS+=("\"ca_pem\": $(jq -Rs . <<<\"$CA_PEM\")"); fi
 UI_JSON_CONTENT="$(IFS=, ; echo "${UI_FIELDS[*]}")"
 
+# Build dynamic hostapp fields (CLI/join.sh compatibility)
+HOSTAPP_FIELDS=()
+if [ -n "$HOSTAPP_URL" ]; then HOSTAPP_FIELDS+=("\"url\": $(jq -Rn --arg v \"$HOSTAPP_URL\" '$v')"); fi
+if [ -n "$CA_PEM" ]; then HOSTAPP_FIELDS+=("\"ca_pem\": $(jq -Rs . <<<\"$CA_PEM\")"); fi
+HOSTAPP_JSON_CONTENT="$(IFS=, ; echo "${HOSTAPP_FIELDS[*]}")"
+
 # Metadata
 NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 HOSTNAME_LOCAL="$(hostname 2>/dev/null || echo unknown)"
@@ -120,6 +127,7 @@ cat >"$TMP_JSON" <<JSON
   "created_at": "$NOW_ISO",
   "creator": {"host": "$HOSTNAME_LOCAL", "user": "$CREATOR_USER"},
   "ui": { $UI_JSON_CONTENT },
+  "hostapp": { $HOSTAPP_JSON_CONTENT },
   "cluster": {
     "name": $(jq -Rn --arg v "$NAME_LABEL" '$v // empty'),
     "kubeconfig": $KC_JSON,
