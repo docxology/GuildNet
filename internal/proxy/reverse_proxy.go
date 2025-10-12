@@ -189,21 +189,10 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				req.Header.Set("X-Forwarded-Proto", "http")
 			}
 			// add forwarded prefix for upstreams (code-server) to generate correct links
-			if strings.HasPrefix(r.URL.Path, "/proxy/") {
-				// compute proxy base prefix up to and including the server id segment
-				prefix := r.URL.Path
-				if i := strings.Index(prefix, "/proxy/server/"); i >= 0 {
-					// /proxy/server/{id}/...
-					parts := strings.SplitN(strings.TrimPrefix(prefix[i:], "/proxy/server/"), "/", 2)
-					if len(parts) > 0 && parts[0] != "" {
-						req.Header.Set("X-Forwarded-Prefix", "/proxy/server/"+parts[0])
-					}
-				} else if i := strings.Index(prefix, "/proxy/"); i >= 0 {
-					// legacy /proxy/{to}/...
-					parts := strings.SplitN(strings.TrimPrefix(prefix[i:], "/proxy/"), "/", 2)
-					if len(parts) > 0 && parts[0] != "" {
-						req.Header.Set("X-Forwarded-Prefix", "/proxy/"+parts[0])
-					}
+			// Honor existing X-Forwarded-Prefix if provided by an upstream router (e.g., cluster-scoped prefix)
+			if req.Header.Get("X-Forwarded-Prefix") == "" {
+				if base := basePrefixFromPath(r.URL.Path); base != "" {
+					req.Header.Set("X-Forwarded-Prefix", base)
 				}
 			}
 			if setAPIDirector != nil {
@@ -239,18 +228,12 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Rewrite response headers for iframe/subpath compatibility (Location, Set-Cookie, CSP)
 	rp.ModifyResponse = func(resp *http.Response) error {
-		// Determine baseHref from incoming path
-		base := "/proxy"
-		pth := r.URL.Path
-		if strings.HasPrefix(pth, "/proxy/server/") {
-			parts := strings.SplitN(strings.TrimPrefix(pth, "/proxy/server/"), "/", 2)
-			if len(parts) > 0 && parts[0] != "" {
-				base = "/proxy/server/" + parts[0]
-			}
-		} else if strings.HasPrefix(pth, "/proxy/") {
-			parts := strings.SplitN(strings.TrimPrefix(pth, "/proxy/"), "/", 2)
-			if len(parts) > 0 && parts[0] != "" {
-				base = "/proxy/" + parts[0]
+		// Determine baseHref from incoming path or forwarded prefix
+		base := resp.Request.Header.Get("X-Forwarded-Prefix")
+		if base == "" {
+			base = basePrefixFromPath(r.URL.Path)
+			if base == "" {
+				base = "/proxy"
 			}
 		}
 		// COOP/COEP safe for embedding
@@ -264,6 +247,20 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			resp.Header.Set("Content-Security-Policy", relaxFrameAncestors(csp))
 		} else {
 			resp.Header.Set("Content-Security-Policy", "frame-ancestors *")
+		}
+		// Ensure service worker can scope itself under the proxy base
+		// Use only the path component of base
+		basePath := base
+		if u, err := url.Parse(base); err == nil && u != nil && u.Path != "" {
+			basePath = u.Path
+		}
+		if basePath == "" {
+			basePath = "/"
+		}
+		resp.Header.Set("Service-Worker-Allowed", basePath)
+		// Be conservative with referrers in embedded IDE
+		if resp.Header.Get("Referrer-Policy") == "" {
+			resp.Header.Set("Referrer-Policy", "no-referrer")
 		}
 		if loc := resp.Header.Get("Location"); loc != "" {
 			resp.Header.Set("Location", rewriteLocation(loc, base))
@@ -293,6 +290,34 @@ func singleJoiningSlash(a, b string) string {
 		return a + "/" + b
 	}
 	return a + b
+}
+
+// basePrefixFromPath finds the proxy base prefix (including any outer prefix) for a request path.
+// Examples:
+// - /proxy/server/foo/bar -> /proxy/server/foo
+// - /api/cluster/abc/proxy/server/foo/bar -> /api/cluster/abc/proxy/server/foo
+// - /proxy/foo/bar -> /proxy/foo
+func basePrefixFromPath(pth string) string {
+	if pth == "" {
+		return ""
+	}
+	// Prefer server form
+	if i := strings.Index(pth, "/proxy/server/"); i >= 0 {
+		rem := strings.TrimPrefix(pth[i:], "/proxy/server/")
+		seg := strings.SplitN(rem, "/", 2)
+		if len(seg) > 0 && seg[0] != "" {
+			return pth[:i] + "/proxy/server/" + seg[0]
+		}
+	}
+	// Fallback legacy form
+	if i := strings.Index(pth, "/proxy/"); i >= 0 {
+		rem := strings.TrimPrefix(pth[i:], "/proxy/")
+		seg := strings.SplitN(rem, "/", 2)
+		if len(seg) > 0 && seg[0] != "" {
+			return pth[:i] + "/proxy/" + seg[0]
+		}
+	}
+	return ""
 }
 
 //

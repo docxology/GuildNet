@@ -174,26 +174,43 @@ export default function ServerDetail() {
   const [wsLogs, setWsLogs] = createSignal<Array<{ t: string; msg: string }>>([])
   let sse: WSManager | undefined
   let logBuf = ringBuffer<{ t: string; msg: string }>(2000)
-  const startLogs = () => {
-    if (!isClusterScoped()) return
-    sse?.close()
+
+  // Only open SSE when cluster-scoped and Logs tab is active; ensure single connection
+  createEffect(() => {
     const cid = clusterId()
     const name = serverId()
-    if (!cid || !name) return
+    const wantOpen = isClusterScoped() && tab() === 'logs' && !!cid && !!name
+
+    // Close any existing stream if not wanted
+    if (!wantOpen) {
+      sse?.close()
+      sse = undefined
+      return
+    }
+
+    // Start a fresh stream for current cid/name
+    sse?.close()
+    logBuf = ringBuffer<{ t: string; msg: string }>(2000)
+    setWsLogs([])
+
     const url = apiUrl(`/api/cluster/${encodeURIComponent(cid)}/workspaces/${encodeURIComponent(name)}/logs/stream`)
     sse = new WSManager(url)
-    const off1 = sse.on('state', () => {})
-    const off2 = sse.on('message', (obj: any) => {
+    const offState = sse.on('state', () => {})
+    const offMsg = sse.on('message', (obj: any) => {
       if (obj && obj.t && obj.msg) {
         logBuf.push({ t: obj.t, msg: obj.msg })
         setWsLogs([...logBuf.get()])
       }
     })
     sse.open()
-    onCleanup(() => { off1(); off2(); sse?.close() })
-  }
-  onMount(startLogs)
-  createEffect(startLogs)
+
+    onCleanup(() => {
+      offState()
+      offMsg()
+      sse?.close()
+      sse = undefined
+    })
+  })
 
   const [tab, setTab] = createSignal<'info' | 'debug' | 'error' | 'ide' | 'logs'>(isClusterScoped() ? 'logs' : 'info')
 

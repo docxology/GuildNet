@@ -662,15 +662,18 @@ func Router(deps Deps) *http.ServeMux {
 			rp := proxy.NewReverseProxy(proxy.Options{
 				Timeout: 60 * time.Second,
 				ResolveServer: func(ctx context.Context, serverID string, subPath string) (string, string, string, error) {
-					p := "/api/v1/namespaces/" + defaultNS + "/services/" + name + ":" + fmt.Sprintf("%d", port) + "/proxy" + subPath
+					// Explicitly include http: scheme segment for kube API service proxy
+					p := "/api/v1/namespaces/" + defaultNS + "/services/http:" + name + ":" + fmt.Sprintf("%d", port) + "/proxy" + subPath
 					return "http", "", p, nil
 				},
 				APIProxy: func() (http.RoundTripper, func(req *http.Request, scheme, hostport, p string), bool) {
 					return rt, func(req *http.Request, scheme, hostport, pth string) {
+						// Honor any base path present on the API host (env override or kubeconfig)
+						basePath := strings.TrimSuffix(apihost.Path, "/")
 						req.URL.Scheme = apihost.Scheme
 						req.URL.Host = apihost.Host
 						req.Host = apihost.Host
-						req.URL.Path = pth
+						req.URL.Path = basePath + pth
 					}, true
 				},
 			})
@@ -679,6 +682,11 @@ func Router(deps Deps) *http.ServeMux {
 			r2.URL = new(url.URL)
 			*r2.URL = *r.URL
 			r2.URL.Path = "/proxy/server/" + url.PathEscape(name) + restPath
+			// Preserve outer prefix for iframe-safe rewriting (Location, cookies)
+			if r2.Header == nil {
+				r2.Header = make(http.Header)
+			}
+			r2.Header.Set("X-Forwarded-Prefix", "/api/cluster/"+clusterID+"/proxy/server/"+name)
 			rp.ServeHTTP(w, r2)
 			return
 		}
