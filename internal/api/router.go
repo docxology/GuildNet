@@ -26,6 +26,8 @@ import (
 
 	// Added for DB API delegation
 	"github.com/your/module/internal/db"
+	// New settings
+	"github.com/your/module/internal/settings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -45,6 +47,8 @@ type Deps struct {
 	Token   string // optional bearer token for mutating endpoints
 	// Optional shared DB manager for database API; if nil, handlers will lazy-connect
 	DBMgr *db.Manager
+	// Optional callback to trigger host restart/reload when certain settings change
+	OnSettingsChanged func(kind string)
 }
 
 func (d Deps) ensure() Deps {
@@ -63,12 +67,12 @@ func Router(deps Deps) *http.ServeMux {
 	deps = deps.ensure()
 	mux := http.NewServeMux()
 
+	// Authorization helper for mutating endpoints
 	authOK := func(w http.ResponseWriter, r *http.Request) bool {
 		// Allow all GETs; guard mutating methods
 		if r.Method == http.MethodGet {
 			return true
 		}
-		// Allow CORS preflight
 		if r.Method == http.MethodOptions {
 			return true
 		}
@@ -93,6 +97,89 @@ func Router(deps Deps) *http.ServeMux {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return false
 	}
+
+	// Settings manager
+	setMgr := settings.Manager{DB: deps.DB}
+
+	// Bootstrap endpoint: accept a subset of guildnet.config and persist.
+	mux.HandleFunc("/api/bootstrap", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			Tailscale *settings.Tailscale `json:"tailscale"`
+			Cluster   *struct {
+				Kubeconfig string `json:"kubeconfig"`
+			} `json:"cluster"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Tailscale != nil {
+			_ = setMgr.PutTailscale(*body.Tailscale)
+		}
+		// If kubeconfig provided, create a cluster record with generated ID
+		if body.Cluster != nil && strings.TrimSpace(body.Cluster.Kubeconfig) != "" && deps.DB != nil {
+			id := uuid.NewString()
+			rec := map[string]any{"id": id, "name": id, "state": "imported"}
+			_ = deps.DB.Put("clusters", id, rec)
+			_ = deps.DB.Put("credentials", fmt.Sprintf("cl:%s:kubeconfig", id), map[string]any{"value": body.Cluster.Kubeconfig})
+			_ = json.NewEncoder(w).Encode(map[string]any{"clusterId": id})
+			return
+		}
+		httpx.JSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
+
+	// Settings CRUD (tailscale, database)
+	mux.HandleFunc("/api/settings/tailscale", func(w http.ResponseWriter, r *http.Request) {
+		if deps.DB == nil {
+			httpx.JSON(w, http.StatusServiceUnavailable, map[string]string{"error": "unavailable"})
+			return
+		}
+		if r.Method == http.MethodGet {
+			var ts settings.Tailscale
+			_ = setMgr.GetTailscale(&ts)
+			_ = json.NewEncoder(w).Encode(ts)
+			return
+		}
+		if r.Method == http.MethodPut {
+			var ts settings.Tailscale
+			_ = json.NewDecoder(r.Body).Decode(&ts)
+			_ = setMgr.PutTailscale(ts)
+			if deps.OnSettingsChanged != nil {
+				deps.OnSettingsChanged("tailscale")
+			}
+			httpx.JSON(w, http.StatusOK, map[string]any{"ok": true})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	})
+	mux.HandleFunc("/api/settings/database", func(w http.ResponseWriter, r *http.Request) {
+		if deps.DB == nil {
+			httpx.JSON(w, http.StatusServiceUnavailable, map[string]string{"error": "unavailable"})
+			return
+		}
+		if r.Method == http.MethodGet {
+			var d settings.Database
+			_ = setMgr.GetDatabase(&d)
+			_ = json.NewEncoder(w).Encode(d)
+			return
+		}
+		if r.Method == http.MethodPut {
+			var d settings.Database
+			_ = json.NewDecoder(r.Body).Decode(&d)
+			_ = setMgr.PutDatabase(d)
+			if deps.OnSettingsChanged != nil {
+				deps.OnSettingsChanged("database")
+			}
+			// Reconnect shared DB manager if present
+			if deps.DBMgr != nil {
+				// no live reconnect here; hostapp will handle reload
+			}
+			httpx.JSON(w, http.StatusOK, map[string]any{"ok": true})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	})
 
 	// Jobs: list and detail
 	mux.HandleFunc("/api/jobs", func(w http.ResponseWriter, r *http.Request) {

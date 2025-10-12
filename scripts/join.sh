@@ -38,7 +38,7 @@ if [ -z "$HOSTAPP_CA_PEM" ] || [ "$HOSTAPP_CA_PEM" = "null" ]; then
 fi
 TS_LOGIN="$(JQ '.tailscale.login_server // empty')"
 TS_KEY="$(JQ '.tailscale.preauth_key // empty')"
-TS_HOSTNAME="$(JQ '.tailscale.hostname_suggest // empty')"
+TS_HOSTNAME="$(JQ '.tailscale.hostname // empty')"
 NAME_LABEL="$(JQ '.name // empty')"
 
 if [ -z "$HOSTAPP_URL" ]; then echo "ERROR: hostapp.url missing in config" >&2; exit 1; fi
@@ -46,7 +46,7 @@ if [ -z "$HOSTAPP_URL" ]; then echo "ERROR: hostapp.url missing in config" >&2; 
 echo "Join target: $HOSTAPP_URL" >&2
 if [ -n "$NAME_LABEL" ]; then echo "Name: $NAME_LABEL" >&2; fi
 if [ -n "$TS_LOGIN" ]; then echo "Login server: $TS_LOGIN" >&2; fi
-if [ -n "$TS_HOSTNAME" ]; then echo "Hostname suggest: $TS_HOSTNAME" >&2; fi
+if [ -n "$TS_HOSTNAME" ]; then echo "Hostname: $TS_HOSTNAME" >&2; fi
 
 # Prepare curl CA option
 TMP_CA=""

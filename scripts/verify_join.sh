@@ -29,7 +29,7 @@ HOSTAPP_URL=""
 INCLUDE_CA=""
 LOGIN_SERVER=""
 AUTH_KEY=""
-HOSTNAME_SUGGEST=""
+HOSTNAME=""
 NAME_LABEL=""
 
 while [ $# -gt 0 ]; do
@@ -38,7 +38,7 @@ while [ $# -gt 0 ]; do
     --include-ca) INCLUDE_CA="${2:-}"; shift 2 ;;
     --login-server) LOGIN_SERVER="${2:-}"; shift 2 ;;
     --auth-key) AUTH_KEY="${2:-}"; shift 2 ;;
-    --hostname) HOSTNAME_SUGGEST="${2:-}"; shift 2 ;;
+    --hostname) HOSTNAME="${2:-}"; shift 2 ;;
     --name) NAME_LABEL="${2:-}"; shift 2 ;;
     --help|-h) usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage; exit 2 ;;
@@ -68,7 +68,7 @@ CMD=("$SCRIPT_DIR/create_join_info.sh" --hostapp-url "$HOSTAPP_URL" --out "$JOIN
 [ -n "$INCLUDE_CA" ] && CMD+=(--include-ca "$INCLUDE_CA")
 [ -n "$LOGIN_SERVER" ] && CMD+=(--login-server "$LOGIN_SERVER")
 [ -n "$AUTH_KEY" ] && CMD+=(--auth-key "$AUTH_KEY")
-[ -n "$HOSTNAME_SUGGEST" ] && CMD+=(--hostname "$HOSTNAME_SUGGEST")
+[ -n "$HOSTNAME" ] && CMD+=(--hostname "$HOSTNAME")
 [ -n "$NAME_LABEL" ] && CMD+=(--name "$NAME_LABEL")
 
 "${CMD[@]}"

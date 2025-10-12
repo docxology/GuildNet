@@ -14,7 +14,6 @@ import (
 	"io"
 	"log"
 	"math/big"
-	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -37,6 +36,7 @@ import (
 	"github.com/your/module/internal/metrics"
 	"github.com/your/module/internal/model"
 	"github.com/your/module/internal/proxy"
+	"github.com/your/module/internal/settings"
 
 	//"github.com/your/module/internal/store"
 	"github.com/your/module/internal/store"
@@ -270,13 +270,18 @@ func main() {
 	sec, _ := secrets.New(masterKey)
 	_ = sec
 
-	// Start tsnet (mandatory)
-	s, err := ts.StartServer(ctx, ts.Options{
-		StateDir: config.StateDir(),
-		Hostname: cfg.Hostname,
-		LoginURL: cfg.LoginServer,
-		AuthKey:  cfg.AuthKey,
-	})
+	// Read runtime settings
+	setMgr := settings.Manager{DB: ldb}
+	var tsSet settings.Tailscale
+	_ = setMgr.GetTailscale(&tsSet)
+	if strings.TrimSpace(tsSet.LoginServer) == "" {
+		// Fallback to config.json on first run to seed settings
+		tsSet = settings.Tailscale{LoginServer: cfg.LoginServer, PreauthKey: cfg.AuthKey, Hostname: cfg.Hostname}
+		_ = setMgr.PutTailscale(tsSet)
+	}
+
+	// Start tsnet from settings
+	s, err := ts.StartServer(ctx, ts.Options{StateDir: config.StateDir(), Hostname: tsSet.Hostname, LoginURL: tsSet.LoginServer, AuthKey: tsSet.PreauthKey})
 	if err != nil {
 		log.Fatalf("tsnet start: %v", err)
 	}
@@ -300,21 +305,29 @@ func main() {
 		}
 	}()
 
-	// Ensure JS files are served with a broadly-compatible MIME type for module scripts
-	// Some embedded browsers are strict about application/javascript
-	_ = mime.AddExtensionType(".js", "application/javascript")
-
-	// Initialize RethinkDB (best-effort; feature is optional if DB not reachable)
+	// Initialize RethinkDB from settings if present
 	var dbMgr *db.Manager
-	if mgr, derr := db.Connect(ctx); derr != nil {
-		log.Printf("rethinkdb connect failed (databases feature disabled): %v", derr)
+	var dbSet settings.Database
+	_ = setMgr.GetDatabase(&dbSet)
+	if strings.TrimSpace(dbSet.Addr) != "" {
+		if mgr, derr := db.ConnectWithOptions(ctx, dbSet.Addr, dbSet.User, dbSet.Pass); derr != nil {
+			log.Printf("rethinkdb connect failed (settings): %v", derr)
+		} else {
+			dbMgr = mgr
+		}
 	} else {
-		dbMgr = mgr
+		if mgr, derr := db.Connect(ctx); derr != nil {
+			log.Printf("rethinkdb connect failed (databases feature disabled): %v", derr)
+		} else {
+			dbMgr = mgr
+		}
 	}
-	// Do not register legacy global /api/db endpoints; per-cluster routes are mounted below.
 
-	// New orchestration API wired with dependencies (single router instance mounted on multiple paths)
-	deps := api.Deps{DB: ldb, Secrets: sec, Runner: nil, DBMgr: dbMgr}
+	// New orchestration API wired with dependencies and settings change hook
+	deps := api.Deps{DB: ldb, Secrets: sec, Runner: nil, DBMgr: dbMgr, OnSettingsChanged: func(kind string) {
+		log.Printf("settings updated: %s; restarting to apply", kind)
+		stop() // trigger graceful shutdown; external supervisor restarts process
+	}}
 	apiMux := api.Router(deps)
 	mux.Handle("/api/deploy/", apiMux)
 	mux.Handle("/api/jobs", apiMux)

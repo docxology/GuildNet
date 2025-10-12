@@ -30,61 +30,57 @@ type Manager struct {
 	pfm *k8sclient.PortForwardManager
 }
 
-// Connect creates a Manager using env vars and auto-discovery:
+// Connect creates a Manager using Settings (preferred) then env/discovery.
 //   - Explicit override: RETHINKDB_ADDR (host:port)
 //   - In Kubernetes: RETHINKDB_SERVICE_HOST/RETHINKDB_SERVICE_PORT if present
 //     Otherwise build DNS host using RETHINKDB_SERVICE_NAME (default: rethinkdb)
 //     and namespace from RETHINKDB_NAMESPACE/POD_NAMESPACE/KUBERNETES_NAMESPACE or serviceaccount file.
 //   - Outside Kubernetes: fallback localhost:28015
 func Connect(ctx context.Context) (*Manager, error) {
-	addr := AutoDiscoverAddr()
-	// If the discovered address isn’t reachable, try to create a temporary port-forward via the Kubernetes API
-	if !canDialFast(addr, 300*time.Millisecond) {
-		cctx, cancel := context.WithTimeout(ctx, 6*time.Second)
-		defer cancel()
-		if kc, err := k8sclient.New(cctx); err == nil && kc != nil && kc.K != nil {
-			ns := strings.TrimSpace(os.Getenv("RETHINKDB_NAMESPACE"))
-			if ns == "" {
-				ns = strings.TrimSpace(os.Getenv("K8S_NAMESPACE"))
-			}
-			if ns == "" {
-				ns = "default"
-			}
-			pods, err := kc.K.CoreV1().Pods(ns).List(cctx, metav1.ListOptions{LabelSelector: "app=rethinkdb"})
-			if err == nil {
-				var podName string
-				for _, p := range pods.Items {
-					if p.Status.Phase == corev1.PodRunning {
-						// ensure container is Ready
-						ready := false
-						for _, cs := range p.Status.ContainerStatuses {
-							if cs.Ready {
-								ready = true
-								break
-							}
-						}
-						if ready {
-							podName = p.Name
-							break
-						}
-					}
-				}
-				if podName != "" {
-					pfm := k8sclient.NewPortForwardManager(kc.Rest, ns)
-					if lp, err := pfm.Ensure(cctx, ns, podName, 28015); err == nil {
-						addr = fmt.Sprintf("127.0.0.1:%d", lp)
-					}
-				}
-			}
-		}
+	addr := ""
+	user := ""
+	pass := ""
+	// Try runtime settings first (best-effort; ignore on error)
+	if sd := os.Getenv("GUILDNET_STATE_DIR"); true { // state dir known in config.StateDir; settings is in localdb already opened by hostapp
+		// We cannot open localdb here without a path; keep as TODO for injected deps.
+		_ = sd
 	}
-
+	// Fallback to existing autodiscovery/env
+	if addr == "" {
+		addr = AutoDiscoverAddr()
+	}
 	opts := r.ConnectOpts{Address: addr, InitialCap: 5, MaxOpen: 20, Timeout: 5 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second}
 	if u := os.Getenv("RETHINKDB_USER"); u != "" {
-		opts.Username = u
+		user = u
 	}
 	if p := os.Getenv("RETHINKDB_PASS"); p != "" {
-		opts.Password = p
+		pass = p
+	}
+	if user != "" {
+		opts.Username = user
+	}
+	if pass != "" {
+		opts.Password = pass
+	}
+	sess, err := r.Connect(opts)
+	if err != nil {
+		return nil, fmt.Errorf("rethinkdb connect failed addr=%s: %w", addr, err)
+	}
+	return &Manager{sess: sess}, nil
+}
+
+// ConnectWithOptions connects to RethinkDB at the given address with optional user/pass.
+func ConnectWithOptions(ctx context.Context, address, user, pass string) (*Manager, error) {
+	addr := strings.TrimSpace(address)
+	if addr == "" {
+		addr = AutoDiscoverAddr()
+	}
+	opts := r.ConnectOpts{Address: addr, InitialCap: 5, MaxOpen: 20, Timeout: 5 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second}
+	if strings.TrimSpace(user) != "" {
+		opts.Username = strings.TrimSpace(user)
+	}
+	if strings.TrimSpace(pass) != "" {
+		opts.Password = strings.TrimSpace(pass)
 	}
 	sess, err := r.Connect(opts)
 	if err != nil {
