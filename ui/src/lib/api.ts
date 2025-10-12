@@ -196,3 +196,154 @@ export async function listImages(signal?: AbortSignal): Promise<DeployImage[]> {
     return []
   }
 }
+
+export type ClusterRecord = { id: string; name?: string; state?: string }
+
+export async function listClusters(): Promise<ClusterRecord[]> {
+  try {
+    const res = await fetch(apiUrl('/api/clusters'))
+    if (!res.ok) return []
+    return (await res.json()) as ClusterRecord[]
+  } catch {
+    return []
+  }
+}
+
+export async function getClusterRecord(id: string): Promise<ClusterRecord | null> {
+  try {
+    const res = await fetch(apiUrl(`/api/deploy/clusters/${encodeURIComponent(id)}`))
+    if (!res.ok) return null
+    return (await res.json()) as ClusterRecord
+  } catch { return null }
+}
+
+export async function listClusterServers(clusterId: string): Promise<Server[]> {
+  try {
+    const res = await fetch(apiUrl(`/api/cluster/${encodeURIComponent(clusterId)}/servers`))
+    if (!res.ok) return []
+    return (await res.json()) as Server[]
+  } catch {
+    return []
+  }
+}
+
+export async function createClusterWorkspace(
+  clusterId: string,
+  payload: any
+): Promise<{ id: string; status: string } | null> {
+  try {
+    const res = await fetch(
+      apiUrl(`/api/cluster/${encodeURIComponent(clusterId)}/workspaces`),
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }
+    )
+    if (!res.ok) return null
+    return (await res.json()) as { id: string; status: string }
+  } catch {
+    return null
+  }
+}
+
+export async function clusterHealth(
+  clusterId: string
+): Promise<'ok' | 'error' | 'unknown'> {
+  try {
+    const res = await fetch(
+      apiUrl(`/api/deploy/clusters/${encodeURIComponent(clusterId)}?action=health`),
+      { method: 'POST' }
+    )
+    if (!res.ok) return 'unknown'
+    const data = await res.json()
+    return (data?.status as any) || 'unknown'
+  } catch {
+    return 'unknown'
+  }
+}
+
+export async function createClusterRecord(
+  name?: string
+): Promise<{ id: string } | null> {
+  try {
+    const res = await fetch(apiUrl('/api/deploy/clusters'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name })
+    })
+    if (!res.ok) return null
+    return (await res.json()) as { id: string }
+  } catch {
+    return null
+  }
+}
+
+export async function attachClusterKubeconfig(
+  id: string,
+  kubeconfig: string
+): Promise<boolean> {
+  try {
+    const res = await fetch(
+      apiUrl(`/api/deploy/clusters/${encodeURIComponent(id)}?action=attach-kubeconfig`),
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kubeconfig })
+      }
+    )
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+export async function getClusterKubeconfig(id: string): Promise<string | null> {
+  try {
+    const res = await fetch(
+      apiUrl(`/api/deploy/clusters/${encodeURIComponent(id)}?action=kubeconfig`),
+      { method: 'POST' }
+    )
+    if (!res.ok) return null
+    return await res.text()
+  } catch {
+    return null
+  }
+}
+
+export async function deleteClusterRecord(id: string): Promise<boolean> {
+  try {
+    const res = await fetch(apiUrl(`/api/deploy/clusters/${encodeURIComponent(id)}`), {
+      method: 'DELETE'
+    })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+export async function postClusterAction<T = any>(
+  id: string,
+  action: string,
+  body?: any
+): Promise<T | null> {
+  try {
+    const url = apiUrl(
+      `/api/deploy/clusters/${encodeURIComponent(id)}?action=${encodeURIComponent(action)}`
+    )
+    const init: RequestInit = { method: 'POST' }
+    if (body !== undefined) {
+      init.headers = { 'Content-Type': 'application/json' }
+      init.body = JSON.stringify(body)
+    }
+    const res = await fetch(url, init)
+    if (!res.ok) return null
+    try {
+      return (await res.json()) as T
+    } catch {
+      return null
+    }
+  } catch {
+    return null
+  }
+}

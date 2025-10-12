@@ -11,19 +11,22 @@ import Table from '../components/Table'
 import StatusPill from '../components/StatusPill'
 import Card from '../components/Card'
 import Input from '../components/Input'
-import { A } from '@solidjs/router'
-import { listServers } from '../lib/api'
+import { A, useParams } from '@solidjs/router'
+import { listClusterServers } from '../lib/api'
 import { timeAgo } from '../lib/format'
 import type { Server } from '../lib/types'
 
 const intervals = [5000, 10000, 30000, 0] as const
 
 export default function Servers() {
+  const params = useParams()
+  const clusterId = () => params.clusterId || ''
   const [search, setSearch] = createSignal('')
   const [status, setStatus] = createSignal<string>('')
   const [period, setPeriod] = createSignal<(typeof intervals)[number]>(10000)
-  const [servers, { refetch }] = createResource<Server[]>(async () =>
-    listServers()
+  const [servers, { refetch }] = createResource<Server[], string>(
+    clusterId,
+    async (cid: string) => listClusterServers(cid)
   )
 
   let timer: number | undefined

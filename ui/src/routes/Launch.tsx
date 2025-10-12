@@ -2,10 +2,10 @@ import { createEffect, createSignal, For, Show } from 'solid-js'
 import { z } from 'zod'
 import Card from '../components/Card'
 import Input from '../components/Input'
-import { getImageDefaults, listImages, postJob } from '../lib/api'
+import { getImageDefaults, listImages, createClusterWorkspace } from '../lib/api'
 import { K8S_DNS_SUFFIX, K8S_NS } from '../lib/config'
 import { pushToast } from '../components/Toaster'
-import { useNavigate } from '@solidjs/router'
+import { useNavigate, useParams } from '@solidjs/router'
 
 const schema = z.object({
   image: z
@@ -34,6 +34,8 @@ export default function Launch() {
     env?: Record<string, string>
   }
   const navigate = useNavigate()
+  const params = useParams()
+  const clusterId = () => params.clusterId || ''
   const [image, setImage] = createSignal('')
   const [presets, setPresets] = createSignal<
     Array<{ label: string; value: string; description?: string }>
@@ -149,10 +151,16 @@ export default function Launch() {
     }
     setBusy(true)
     try {
-      const res = await postJob(spec)
-      pushToast({ type: 'success', message: `Job accepted (${res.id})` })
-      // Optimistic navigate to servers; actual ID may be server/job
-      navigate(`/servers/${encodeURIComponent(res.id)}`)
+      const res = await createClusterWorkspace(clusterId(), {
+        image: spec.image,
+        name: spec.name,
+        env: Object.entries(spec.env || {}).map(([name, value]) => ({ name, value })),
+        ports: (spec.expose || []).map((p: any) => ({ name: p.name, containerPort: p.port }))
+      })
+      if (res) {
+        pushToast({ type: 'success', message: `Workspace ${res.id} creating` })
+        navigate(`/c/${encodeURIComponent(clusterId())}/servers`)
+      }
     } catch (e) {
       pushToast({ type: 'error', message: (e as Error).message })
     } finally {

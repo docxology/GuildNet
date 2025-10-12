@@ -14,12 +14,17 @@ import (
 	"github.com/google/uuid"
 	"nhooyr.io/websocket"
 
+	"github.com/your/module/internal/httpx"
 	"github.com/your/module/internal/jobs"
 	"github.com/your/module/internal/localdb"
 	"github.com/your/module/internal/orch"
 	"github.com/your/module/internal/secrets"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -544,6 +549,188 @@ func Router(deps Deps) *http.ServeMux {
 			return
 		}
 		w.WriteHeader(http.StatusMethodNotAllowed)
+	})
+
+	// List clusters (registry for UI sidebar)
+	mux.HandleFunc("/api/clusters", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var items []map[string]any
+		if deps.DB != nil {
+			_ = deps.DB.List("clusters", &items)
+		}
+		_ = json.NewEncoder(w).Encode(items)
+	})
+
+	// Per-cluster scoped APIs: /api/cluster/:id/servers, /workspaces, etc.
+	mux.HandleFunc("/api/cluster/", func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/api/cluster/")
+		parts := strings.Split(strings.Trim(path, "/"), "/")
+		if len(parts) == 0 || parts[0] == "" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		clusterID := parts[0]
+		// build clients for this cluster from stored kubeconfig
+		kc, ok := readClusterKubeconfig(deps.DB, deps.Secrets, clusterID)
+		if !ok {
+			httpx.JSONError(w, http.StatusNotFound, "cluster kubeconfig not found", "no_kubeconfig")
+			return
+		}
+		cfg, err := kubeconfigFrom(kc)
+		if err != nil {
+			httpx.JSONError(w, http.StatusBadRequest, "invalid kubeconfig", "bad_kubeconfig", err.Error())
+			return
+		}
+		cli, err := kubernetes.NewForConfig(cfg)
+		if err != nil {
+			httpx.JSONError(w, http.StatusInternalServerError, "k8s client error", "k8s_client", err.Error())
+			return
+		}
+		dyn, err := dynamic.NewForConfig(cfg)
+		if err != nil {
+			httpx.JSONError(w, http.StatusInternalServerError, "dynamic client error", "dyn_client", err.Error())
+			return
+		}
+		defaultNS := "default"
+		if len(parts) == 2 && parts[1] == "servers" {
+			if r.Method != http.MethodGet {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			gvr := schema.GroupVersionResource{Group: "guildnet.io", Version: "v1alpha1", Resource: "workspaces"}
+			lst, err := dyn.Resource(gvr).Namespace(defaultNS).List(r.Context(), metav1.ListOptions{})
+			if err != nil {
+				httpx.JSON(w, http.StatusOK, []any{})
+				return
+			}
+			// map to Server model (local, keep fields minimal)
+			type Port struct {
+				Name string `json:"name,omitempty"`
+				Port int    `json:"port"`
+			}
+			type Server struct {
+				ID     string `json:"id"`
+				Name   string `json:"name"`
+				Image  string `json:"image"`
+				Status string `json:"status"`
+				Ports  []Port `json:"ports"`
+			}
+			out := []Server{}
+			for _, item := range lst.Items {
+				obj := item.Object
+				meta := obj["metadata"].(map[string]any)
+				spec := obj["spec"].(map[string]any)
+				status, _ := obj["status"].(map[string]any)
+				name := fmt.Sprint(meta["name"])
+				image := fmt.Sprint(spec["image"])
+				phase, _ := status["phase"].(string)
+				readyReplicas := 0
+				if rr, ok := status["readyReplicas"].(int64); ok {
+					readyReplicas = int(rr)
+				}
+				st := "pending"
+				if phase == "Running" && readyReplicas > 0 {
+					st = "running"
+				} else if phase == "Failed" {
+					st = "failed"
+				}
+				ports := []Port{}
+				if raw, ok := spec["ports"].([]any); ok {
+					for _, rp := range raw {
+						if pm, ok := rp.(map[string]any); ok {
+							pnum := 0
+							if pv, ok := pm["containerPort"].(int64); ok {
+								pnum = int(pv)
+							} else if pvf, ok := pm["containerPort"].(float64); ok {
+								pnum = int(pvf)
+							}
+							if pnum > 0 {
+								ports = append(ports, Port{Name: strings.TrimSpace(fmt.Sprint(pm["name"])), Port: pnum})
+							}
+						}
+					}
+				}
+				out = append(out, Server{ID: name, Name: name, Image: image, Status: st, Ports: ports})
+			}
+			httpx.JSON(w, http.StatusOK, out)
+			return
+		}
+		if len(parts) >= 2 && parts[1] == "workspaces" {
+			gvr := schema.GroupVersionResource{Group: "guildnet.io", Version: "v1alpha1", Resource: "workspaces"}
+			if len(parts) == 2 && r.Method == http.MethodPost {
+				var spec map[string]any
+				_ = json.NewDecoder(r.Body).Decode(&spec)
+				// expect { image, env?, ports? }
+				name := strings.TrimSpace(fmt.Sprint(spec["name"]))
+				if name == "" {
+					name = fmt.Sprintf("ws-%s", uuid.NewString()[:8])
+				}
+				obj := map[string]any{"apiVersion": "guildnet.io/v1alpha1", "kind": "Workspace", "metadata": map[string]any{"name": name}, "spec": map[string]any{"image": spec["image"], "env": spec["env"], "ports": spec["ports"]}}
+				if _, err := dyn.Resource(gvr).Namespace(defaultNS).Create(r.Context(), &unstructured.Unstructured{Object: obj}, metav1.CreateOptions{}); err != nil {
+					httpx.JSONError(w, http.StatusInternalServerError, "workspace create failed", "create_failed", err.Error())
+					return
+				}
+				httpx.JSON(w, http.StatusAccepted, map[string]any{"id": name, "status": "pending"})
+				return
+			}
+			if len(parts) == 3 && r.Method == http.MethodGet {
+				name := parts[2]
+				ws, err := dyn.Resource(gvr).Namespace(defaultNS).Get(r.Context(), name, metav1.GetOptions{})
+				if err != nil {
+					httpx.JSONError(w, http.StatusNotFound, "workspace not found", "not_found")
+					return
+				}
+				httpx.JSON(w, http.StatusOK, ws.Object)
+				return
+			}
+			if len(parts) == 4 && parts[3] == "logs" && r.Method == http.MethodGet {
+				name := parts[2]
+				pods, err := cli.CoreV1().Pods(defaultNS).List(r.Context(), metav1.ListOptions{LabelSelector: fmt.Sprintf("guildnet.io/workspace=%s", name)})
+				if err != nil || len(pods.Items) == 0 {
+					httpx.JSONError(w, http.StatusNotFound, "no pods for workspace", "no_pods")
+					return
+				}
+				limit := 200
+				if v := r.URL.Query().Get("limit"); v != "" {
+					fmt.Sscanf(v, "%d", &limit)
+				}
+				out := []map[string]string{}
+				for _, p := range pods.Items {
+					container := ""
+					if len(p.Spec.Containers) > 0 {
+						container = p.Spec.Containers[0].Name
+					}
+					data, err := cli.CoreV1().Pods(defaultNS).GetLogs(p.Name, &corev1.PodLogOptions{Container: container}).Do(r.Context()).Raw()
+					if err != nil {
+						continue
+					}
+					lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+					for _, ln := range lines {
+						if ln != "" {
+							out = append(out, map[string]string{"t": time.Now().UTC().Format(time.RFC3339), "msg": fmt.Sprintf("[%s] %s", p.Name, ln)})
+						}
+					}
+				}
+				if len(out) > limit {
+					out = out[len(out)-limit:]
+				}
+				httpx.JSON(w, http.StatusOK, out)
+				return
+			}
+			if len(parts) == 3 && r.Method == http.MethodDelete {
+				name := parts[2]
+				if err := dyn.Resource(gvr).Namespace(defaultNS).Delete(r.Context(), name, metav1.DeleteOptions{}); err != nil {
+					httpx.JSONError(w, http.StatusNotFound, "workspace not found", "not_found")
+					return
+				}
+				httpx.JSON(w, http.StatusOK, map[string]any{"deleted": name})
+				return
+			}
+		}
+		w.WriteHeader(http.StatusNotFound)
 	})
 
 	return mux
