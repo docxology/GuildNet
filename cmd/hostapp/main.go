@@ -263,6 +263,8 @@ func main() {
 	defer ldb.Close()
 	// Ensure orchestration buckets
 	_ = ldb.EnsureBuckets("orgs", "headscales", "namespaces", "keys", "clusters", "nodes", "credentials", "jobs", "joblogs", "audit")
+	// Ensure settings buckets
+	_ = settings.EnsureBucket(ldb)
 	masterKey := strings.TrimSpace(os.Getenv("GUILDNET_MASTER_KEY"))
 	if masterKey == "" {
 		log.Printf("warning: GUILDNET_MASTER_KEY not set; secrets encryption disabled for dev")
@@ -1420,9 +1422,17 @@ func main() {
 	mux.Handle("/proxy/", proxyHandler)
 
 	// Wrap with middleware (logging, request id, CORS)
-	corsOrigin := os.Getenv("FRONTEND_ORIGIN")
-	if corsOrigin == "" {
-		corsOrigin = "https://localhost:5173"
+	corsOrigin := ""
+	{
+		var g settings.Global
+		_ = setMgr.GetGlobal(&g)
+		if strings.TrimSpace(g.FrontendOrigin) != "" {
+			corsOrigin = strings.TrimSpace(g.FrontendOrigin)
+		} else if v := os.Getenv("FRONTEND_ORIGIN"); v != "" {
+			corsOrigin = v
+		} else {
+			corsOrigin = "https://localhost:5173"
+		}
 	}
 	handler := httpx.RequestID(httpx.Logging(httpx.CORS(corsOrigin)(mux)))
 

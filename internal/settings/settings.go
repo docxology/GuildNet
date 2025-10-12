@@ -1,6 +1,7 @@
 package settings
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/your/module/internal/localdb"
@@ -20,16 +21,58 @@ type Database struct {
 	Pass string `json:"pass"`
 }
 
+// Global holds global runtime settings not tied to a specific cluster.
+// Example: default Org ID for new nodes, UI CORS origin overrides, etc.
+type Global struct {
+	OrgID          string `json:"org_id"`
+	FrontendOrigin string `json:"frontend_origin,omitempty"`
+}
+
+// Cluster holds per-cluster runtime settings that affect connectivity and proxying.
+// These should be set dynamically via the UI and stored in localdb so any node can join using a join file.
+type Cluster struct {
+	// Optional human label (not used as key)
+	Name string `json:"name,omitempty"`
+
+	// Kubernetes namespace to operate in (default "default")
+	Namespace string `json:"namespace,omitempty"`
+
+	// API proxy base URL to reach the cluster from this host. When set, overrides kubeconfig host.
+	APIProxyURL string `json:"api_proxy_url,omitempty"`
+	// Force HTTP even if kubeconfig suggests HTTPS (useful for kubectl proxy or local dev)
+	APIProxyForceHTTP bool `json:"api_proxy_force_http,omitempty"`
+	// Disable API proxy rewriting entirely for this cluster
+	DisableAPIProxy bool `json:"disable_api_proxy,omitempty"`
+
+	// Proxy style preferences for user workloads
+	PreferPodProxy bool `json:"prefer_pod_proxy,omitempty"`
+	UsePortForward bool `json:"use_port_forward,omitempty"`
+
+	// Ingress and domain knobs (optional; used when creating ingress resources)
+	IngressDomain      string `json:"ingress_domain,omitempty"`
+	IngressClassName   string `json:"ingress_class_name,omitempty"`
+	WorkspaceTLSSecret string `json:"workspace_tls_secret,omitempty"`
+	CertManagerIssuer  string `json:"cert_manager_issuer,omitempty"`
+	IngressAuthURL     string `json:"ingress_auth_url,omitempty"`
+	IngressAuthSignin  string `json:"ingress_auth_signin,omitempty"`
+	ImagePullSecret    string `json:"image_pull_secret,omitempty"`
+
+	// Optional org scope if multi-tenant DB is used per cluster scope
+	OrgID string `json:"org_id,omitempty"`
+}
+
 // Manager wraps localdb for typed settings.
 type Manager struct{ DB *localdb.DB }
 
 const (
-	bucket = "settings"
-	keyTS  = "tailscale"
-	keyDB  = "database"
+	bucket         = "settings"
+	bucketClusters = "cluster-settings"
+	keyTS          = "tailscale"
+	keyDB          = "database"
+	keyGlobal      = "global"
 )
 
-func EnsureBucket(db *localdb.DB) error { return db.EnsureBuckets(bucket) }
+func EnsureBucket(db *localdb.DB) error { return db.EnsureBuckets(bucket, bucketClusters) }
 
 func (m Manager) GetTailscale(out *Tailscale) error {
 	var tmp map[string]any
@@ -73,6 +116,78 @@ func (m Manager) PutDatabase(db Database) error {
 	return m.DB.Put(bucket, keyDB, rec)
 }
 
+// Global settings CRUD
+func (m Manager) GetGlobal(out *Global) error {
+	var tmp map[string]any
+	if err := m.DB.Get(bucket, keyGlobal, &tmp); err != nil {
+		*out = Global{}
+		return nil
+	}
+	out.OrgID = strings.TrimSpace(asString(tmp["org_id"]))
+	out.FrontendOrigin = strings.TrimSpace(asString(tmp["frontend_origin"]))
+	return nil
+}
+
+func (m Manager) PutGlobal(g Global) error {
+	rec := map[string]any{
+		"org_id":          strings.TrimSpace(g.OrgID),
+		"frontend_origin": strings.TrimSpace(g.FrontendOrigin),
+	}
+	return m.DB.Put(bucket, keyGlobal, rec)
+}
+
+// Per-cluster settings CRUD. Keys are cluster IDs.
+func (m Manager) GetCluster(clusterID string, out *Cluster) error {
+	if strings.TrimSpace(clusterID) == "" {
+		return fmt.Errorf("cluster id required")
+	}
+	var tmp map[string]any
+	if err := m.DB.Get(bucketClusters, clusterID, &tmp); err != nil {
+		*out = Cluster{}
+		return nil
+	}
+	out.Name = strings.TrimSpace(asString(tmp["name"]))
+	out.Namespace = strings.TrimSpace(asString(tmp["namespace"]))
+	out.APIProxyURL = strings.TrimSpace(asString(tmp["api_proxy_url"]))
+	out.APIProxyForceHTTP = asBool(tmp["api_proxy_force_http"])
+	out.DisableAPIProxy = asBool(tmp["disable_api_proxy"])
+	out.PreferPodProxy = asBool(tmp["prefer_pod_proxy"])
+	out.UsePortForward = asBool(tmp["use_port_forward"])
+	out.IngressDomain = strings.TrimSpace(asString(tmp["ingress_domain"]))
+	out.IngressClassName = strings.TrimSpace(asString(tmp["ingress_class_name"]))
+	out.WorkspaceTLSSecret = strings.TrimSpace(asString(tmp["workspace_tls_secret"]))
+	out.CertManagerIssuer = strings.TrimSpace(asString(tmp["cert_manager_issuer"]))
+	out.IngressAuthURL = strings.TrimSpace(asString(tmp["ingress_auth_url"]))
+	out.IngressAuthSignin = strings.TrimSpace(asString(tmp["ingress_auth_signin"]))
+	out.ImagePullSecret = strings.TrimSpace(asString(tmp["image_pull_secret"]))
+	out.OrgID = strings.TrimSpace(asString(tmp["org_id"]))
+	return nil
+}
+
+func (m Manager) PutCluster(clusterID string, cs Cluster) error {
+	if strings.TrimSpace(clusterID) == "" {
+		return fmt.Errorf("cluster id required")
+	}
+	rec := map[string]any{
+		"name":                 strings.TrimSpace(cs.Name),
+		"namespace":            strings.TrimSpace(cs.Namespace),
+		"api_proxy_url":        strings.TrimSpace(cs.APIProxyURL),
+		"api_proxy_force_http": cs.APIProxyForceHTTP,
+		"disable_api_proxy":    cs.DisableAPIProxy,
+		"prefer_pod_proxy":     cs.PreferPodProxy,
+		"use_port_forward":     cs.UsePortForward,
+		"ingress_domain":       strings.TrimSpace(cs.IngressDomain),
+		"ingress_class_name":   strings.TrimSpace(cs.IngressClassName),
+		"workspace_tls_secret": strings.TrimSpace(cs.WorkspaceTLSSecret),
+		"cert_manager_issuer":  strings.TrimSpace(cs.CertManagerIssuer),
+		"ingress_auth_url":     strings.TrimSpace(cs.IngressAuthURL),
+		"ingress_auth_signin":  strings.TrimSpace(cs.IngressAuthSignin),
+		"image_pull_secret":    strings.TrimSpace(cs.ImagePullSecret),
+		"org_id":               strings.TrimSpace(cs.OrgID),
+	}
+	return m.DB.Put(bucketClusters, clusterID, rec)
+}
+
 func asString(v any) string {
 	if v == nil {
 		return ""
@@ -82,5 +197,21 @@ func asString(v any) string {
 		return t
 	default:
 		return ""
+	}
+}
+
+func asBool(v any) bool {
+	if v == nil {
+		return false
+	}
+	switch t := v.(type) {
+	case bool:
+		return t
+	case string:
+		return strings.EqualFold(strings.TrimSpace(t), "true") || strings.TrimSpace(t) == "1"
+	case float64:
+		return t != 0
+	default:
+		return false
 	}
 }

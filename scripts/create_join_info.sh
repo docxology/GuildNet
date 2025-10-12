@@ -7,6 +7,7 @@ set -euo pipefail
 # - Optional UI base URL (vite_api_base) and an extra CA PEM to trust it
 # - Optional hostapp.url and hostapp.ca_pem for CLI join compatibility
 # - Optional notes for the operator/UI
+# - Optional per-cluster connectivity/proxy/ingress knobs
 #
 # Optional fields retained for Tailscale/Headscale hints:
 # - tailscale.login_server, tailscale.preauth_key, tailscale.hostname
@@ -17,14 +18,15 @@ set -euo pipefail
 #   scripts/create_join_info.sh \
 #     --kubeconfig ~/.kube/config \
 #     --name "Dev Cluster" \
+#     --namespace dev \
+#     --api-proxy-url http://127.0.0.1:8001 \
+#     --prefer-pod-proxy \
+#     --use-port-forward \
+#     --ingress-domain work.example.com \
+#     --ingress-class-name nginx \
+#     --workspace-tls-secret wildcard-tls \
+#     --cert-manager-issuer letsencrypt \
 #     --out guildnet.config
-#
-#   scripts/create_join_info.sh \
-#     --kubeconfig ~/.kube/config \
-#     --name "Prod EKS" \
-#     --hostapp-url https://guildnet.example.com \
-#     --include-ca certs/server.crt \
-#     --notes "Use SSO account"
 #
 # Notes:
 # - File is written with permissions 0600.
@@ -43,6 +45,21 @@ AUTH_KEY=""
 HOSTNAME=""
 NAME_LABEL=""
 NOTES=""
+# Per-cluster settings (optional)
+NAMESPACE=""
+API_PROXY_URL=""
+API_PROXY_FORCE_HTTP="0"
+DISABLE_API_PROXY="0"
+PREFER_POD_PROXY="0"
+USE_PORT_FORWARD="0"
+INGRESS_DOMAIN=""
+INGRESS_CLASS_NAME=""
+WORKSPACE_TLS_SECRET=""
+CERT_MANAGER_ISSUER=""
+INGRESS_AUTH_URL=""
+INGRESS_AUTH_SIGNIN=""
+IMAGE_PULL_SECRET=""
+ORG_ID=""
 
 usage() {
   cat <<USAGE
@@ -57,6 +74,20 @@ Options:
   --login-server URL    (optional) Tailscale/Headscale login server URL (hint)
   --auth-key KEY        (optional) Pre-auth key (sensitive, hint)
   --hostname NAME       (optional) tsnet hostname (hint)
+  --namespace NAME      (optional) Default Kubernetes namespace for GuildNet resources
+  --api-proxy-url URL   (optional) Override base URL for Kubernetes API (e.g., http://127.0.0.1:8001)
+  --api-proxy-force-http   (flag) Force HTTP scheme for API proxy
+  --disable-api-proxy      (flag) Disable API proxy usage for this cluster
+  --prefer-pod-proxy       (flag) Prefer pod proxy over service proxy for workload access
+  --use-port-forward       (flag) Try local kubectl port-forward before API proxy
+  --ingress-domain DOMAIN  (optional) Base domain for per-workspace ingress
+  --ingress-class-name CLS (optional) IngressClass name (e.g., nginx)
+  --workspace-tls-secret S (optional) TLS secret name for workspace hosts
+  --cert-manager-issuer I  (optional) cert-manager ClusterIssuer for TLS
+  --ingress-auth-url URL   (optional) NGINX auth-url annotation
+  --ingress-auth-signin U  (optional) NGINX auth-signin annotation
+  --image-pull-secret S    (optional) ImagePullSecret name for workloads
+  --org-id ID              (optional) Organization/tenant id associated to this cluster
   --out FILE            Output path (default: guildnet.config)
   --help                Show this help
 USAGE
@@ -72,6 +103,20 @@ while [ $# -gt 0 ]; do
     --hostname) HOSTNAME="${2:-}"; shift 2 ;;
     --name) NAME_LABEL="${2:-}"; shift 2 ;;
     --notes) NOTES="${2:-}"; shift 2 ;;
+    --namespace) NAMESPACE="${2:-}"; shift 2 ;;
+    --api-proxy-url) API_PROXY_URL="${2:-}"; shift 2 ;;
+    --api-proxy-force-http) API_PROXY_FORCE_HTTP="1"; shift 1 ;;
+    --disable-api-proxy) DISABLE_API_PROXY="1"; shift 1 ;;
+    --prefer-pod-proxy) PREFER_POD_PROXY="1"; shift 1 ;;
+    --use-port-forward) USE_PORT_FORWARD="1"; shift 1 ;;
+    --ingress-domain) INGRESS_DOMAIN="${2:-}"; shift 2 ;;
+    --ingress-class-name) INGRESS_CLASS_NAME="${2:-}"; shift 2 ;;
+    --workspace-tls-secret) WORKSPACE_TLS_SECRET="${2:-}"; shift 2 ;;
+    --cert-manager-issuer) CERT_MANAGER_ISSUER="${2:-}"; shift 2 ;;
+    --ingress-auth-url) INGRESS_AUTH_URL="${2:-}"; shift 2 ;;
+    --ingress-auth-signin) INGRESS_AUTH_SIGNIN="${2:-}"; shift 2 ;;
+    --image-pull-secret) IMAGE_PULL_SECRET="${2:-}"; shift 2 ;;
+    --org-id) ORG_ID="${2:-}"; shift 2 ;;
     --out) OUT_FILE="${2:-}"; shift 2 ;;
     --help|-h) usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage; exit 2 ;;
@@ -85,6 +130,16 @@ LOGIN_SERVER="$(strip_quotes "$LOGIN_SERVER")"
 HOSTNAME="$(strip_quotes "$HOSTNAME")"
 NAME_LABEL="$(strip_quotes "$NAME_LABEL")"
 NOTES="$(strip_quotes "$NOTES")"
+NAMESPACE="$(strip_quotes "$NAMESPACE")"
+API_PROXY_URL="$(strip_quotes "$API_PROXY_URL")"
+INGRESS_DOMAIN="$(strip_quotes "$INGRESS_DOMAIN")"
+INGRESS_CLASS_NAME="$(strip_quotes "$INGRESS_CLASS_NAME")"
+WORKSPACE_TLS_SECRET="$(strip_quotes "$WORKSPACE_TLS_SECRET")"
+CERT_MANAGER_ISSUER="$(strip_quotes "$CERT_MANAGER_ISSUER")"
+INGRESS_AUTH_URL="$(strip_quotes "$INGRESS_AUTH_URL")"
+INGRESS_AUTH_SIGNIN="$(strip_quotes "$INGRESS_AUTH_SIGNIN")"
+IMAGE_PULL_SECRET="$(strip_quotes "$IMAGE_PULL_SECRET")"
+ORG_ID="$(strip_quotes "$ORG_ID")"
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "ERROR: jq is required (for JSON encoding)" >&2
@@ -152,6 +207,20 @@ jq -n \
   --arg login "$LOGIN_SERVER" \
   --arg auth "$AUTH_KEY" \
   --arg tsname "$HOSTNAME" \
+  --arg ns "$NAMESPACE" \
+  --arg api_proxy "$API_PROXY_URL" \
+  --arg api_force "$API_PROXY_FORCE_HTTP" \
+  --arg disable_proxy "$DISABLE_API_PROXY" \
+  --arg prefer_pod "$PREFER_POD_PROXY" \
+  --arg use_pf "$USE_PORT_FORWARD" \
+  --arg dom "$INGRESS_DOMAIN" \
+  --arg iclass "$INGRESS_CLASS_NAME" \
+  --arg tlssec "$WORKSPACE_TLS_SECRET" \
+  --arg issuer "$CERT_MANAGER_ISSUER" \
+  --arg authurl "$INGRESS_AUTH_URL" \
+  --arg authsignin "$INGRESS_AUTH_SIGNIN" \
+  --arg imgsec "$IMAGE_PULL_SECRET" \
+  --arg org "$ORG_ID" \
   '{
      version: 2,
      created_at: $now,
@@ -162,11 +231,24 @@ jq -n \
      hostapp: ({} 
           | (if ($hostapp_url|length)>0 then . + {url: $hostapp_url} else . end)
           | (if ($ca_pem|length)>0 then . + {ca_pem: $ca_pem} else . end)),
-     cluster: {
-       name: ($name // ""),
-       kubeconfig: $kc,
-       notes: ($notes // "")
-     },
+     cluster: (
+       {} 
+       | . + { name: ($name // ""), kubeconfig: $kc, notes: ($notes // "") }
+       | (if ($ns|length)>0 then . + { namespace: $ns } else . end)
+       | (if ($api_proxy|length)>0 then . + { api_proxy_url: $api_proxy } else . end)
+       | (if ($api_force|length)>0 and ($api_force!="0") then . + { api_proxy_force_http: true } else . end)
+       | (if ($disable_proxy|length)>0 and ($disable_proxy!="0") then . + { disable_api_proxy: true } else . end)
+       | (if ($prefer_pod|length)>0 and ($prefer_pod!="0") then . + { prefer_pod_proxy: true } else . end)
+       | (if ($use_pf|length)>0 and ($use_pf!="0") then . + { use_port_forward: true } else . end)
+       | (if ($dom|length)>0 then . + { ingress_domain: $dom } else . end)
+       | (if ($iclass|length)>0 then . + { ingress_class_name: $iclass } else . end)
+       | (if ($tlssec|length)>0 then . + { workspace_tls_secret: $tlssec } else . end)
+       | (if ($issuer|length)>0 then . + { cert_manager_issuer: $issuer } else . end)
+       | (if ($authurl|length)>0 then . + { ingress_auth_url: $authurl } else . end)
+       | (if ($authsignin|length)>0 then . + { ingress_auth_signin: $authsignin } else . end)
+       | (if ($imgsec|length)>0 then . + { image_pull_secret: $imgsec } else . end)
+       | (if ($org|length)>0 then . + { org_id: $org } else . end)
+     ),
      tailscale: {
        login_server: ($login // ""),
        preauth_key: ($auth // ""),

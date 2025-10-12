@@ -3,6 +3,7 @@ package k8s
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -69,6 +70,37 @@ func New(ctx context.Context) (*Client, error) {
 			if err != nil {
 				return nil, err
 			}
+		}
+	}
+	cs, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{K: cs, Rest: cfg}, nil
+}
+
+// NewFromKubeconfig builds a client from a kubeconfig string, applying optional per-cluster overrides.
+func NewFromKubeconfig(ctx context.Context, kubeconfigYAML string, opts struct {
+	APIProxyURL string
+	ForceHTTP   bool
+}) (*Client, error) {
+	if strings.TrimSpace(kubeconfigYAML) == "" {
+		return nil, fmt.Errorf("empty kubeconfig")
+	}
+	cfg, err := clientcmd.RESTConfigFromKubeConfig([]byte(kubeconfigYAML))
+	if err != nil {
+		return nil, err
+	}
+	if v := strings.TrimSpace(opts.APIProxyURL); v != "" {
+		cfg.Host = v
+		if strings.HasPrefix(strings.ToLower(v), "http://") {
+			cfg.TLSClientConfig = rest.TLSClientConfig{}
+		}
+	}
+	if opts.ForceHTTP {
+		if u, err := url.Parse(cfg.Host); err == nil {
+			u.Scheme = "http"
+			cfg.Host = u.String()
 		}
 	}
 	cs, err := kubernetes.NewForConfig(cfg)

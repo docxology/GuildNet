@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
@@ -110,19 +109,57 @@ func Router(deps Deps) *http.ServeMux {
 		var body struct {
 			Tailscale *settings.Tailscale `json:"tailscale"`
 			Cluster   *struct {
-				Kubeconfig string `json:"kubeconfig"`
+				Kubeconfig         string `json:"kubeconfig"`
+				Name               string `json:"name,omitempty"`
+				Namespace          string `json:"namespace,omitempty"`
+				APIProxyURL        string `json:"api_proxy_url,omitempty"`
+				APIProxyForceHTTP  bool   `json:"api_proxy_force_http,omitempty"`
+				DisableAPIProxy    bool   `json:"disable_api_proxy,omitempty"`
+				PreferPodProxy     bool   `json:"prefer_pod_proxy,omitempty"`
+				UsePortForward     bool   `json:"use_port_forward,omitempty"`
+				IngressDomain      string `json:"ingress_domain,omitempty"`
+				IngressClassName   string `json:"ingress_class_name,omitempty"`
+				WorkspaceTLSSecret string `json:"workspace_tls_secret,omitempty"`
+				CertManagerIssuer  string `json:"cert_manager_issuer,omitempty"`
+				IngressAuthURL     string `json:"ingress_auth_url,omitempty"`
+				IngressAuthSignin  string `json:"ingress_auth_signin,omitempty"`
+				ImagePullSecret    string `json:"image_pull_secret,omitempty"`
+				OrgID              string `json:"org_id,omitempty"`
 			} `json:"cluster"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		if body.Tailscale != nil {
 			_ = setMgr.PutTailscale(*body.Tailscale)
 		}
-		// If kubeconfig provided, create a cluster record with generated ID
+		// If kubeconfig provided, create a cluster record with generated ID and persist optional settings
 		if body.Cluster != nil && strings.TrimSpace(body.Cluster.Kubeconfig) != "" && deps.DB != nil {
 			id := uuid.NewString()
-			rec := map[string]any{"id": id, "name": id, "state": "imported"}
+			name := body.Cluster.Name
+			if strings.TrimSpace(name) == "" {
+				name = id
+			}
+			rec := map[string]any{"id": id, "name": name, "state": "imported"}
 			_ = deps.DB.Put("clusters", id, rec)
 			_ = deps.DB.Put("credentials", fmt.Sprintf("cl:%s:kubeconfig", id), map[string]any{"value": body.Cluster.Kubeconfig})
+			// Persist per-cluster settings if provided
+			cs := settings.Cluster{
+				Name:               body.Cluster.Name,
+				Namespace:          body.Cluster.Namespace,
+				APIProxyURL:        body.Cluster.APIProxyURL,
+				APIProxyForceHTTP:  body.Cluster.APIProxyForceHTTP,
+				DisableAPIProxy:    body.Cluster.DisableAPIProxy,
+				PreferPodProxy:     body.Cluster.PreferPodProxy,
+				UsePortForward:     body.Cluster.UsePortForward,
+				IngressDomain:      body.Cluster.IngressDomain,
+				IngressClassName:   body.Cluster.IngressClassName,
+				WorkspaceTLSSecret: body.Cluster.WorkspaceTLSSecret,
+				CertManagerIssuer:  body.Cluster.CertManagerIssuer,
+				IngressAuthURL:     body.Cluster.IngressAuthURL,
+				IngressAuthSignin:  body.Cluster.IngressAuthSignin,
+				ImagePullSecret:    body.Cluster.ImagePullSecret,
+				OrgID:              body.Cluster.OrgID,
+			}
+			_ = setMgr.PutCluster(id, cs)
 			_ = json.NewEncoder(w).Encode(map[string]any{"clusterId": id})
 			return
 		}
@@ -174,6 +211,61 @@ func Router(deps Deps) *http.ServeMux {
 			// Reconnect shared DB manager if present
 			if deps.DBMgr != nil {
 				// no live reconnect here; hostapp will handle reload
+			}
+			httpx.JSON(w, http.StatusOK, map[string]any{"ok": true})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	})
+
+	// Global settings CRUD
+	mux.HandleFunc("/api/settings/global", func(w http.ResponseWriter, r *http.Request) {
+		if deps.DB == nil {
+			httpx.JSON(w, http.StatusServiceUnavailable, map[string]string{"error": "unavailable"})
+			return
+		}
+		if r.Method == http.MethodGet {
+			var g settings.Global
+			_ = setMgr.GetGlobal(&g)
+			_ = json.NewEncoder(w).Encode(g)
+			return
+		}
+		if r.Method == http.MethodPut {
+			var g settings.Global
+			_ = json.NewDecoder(r.Body).Decode(&g)
+			_ = setMgr.PutGlobal(g)
+			if deps.OnSettingsChanged != nil {
+				deps.OnSettingsChanged("global")
+			}
+			httpx.JSON(w, http.StatusOK, map[string]any{"ok": true})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	})
+
+	// Per-cluster settings CRUD
+	mux.HandleFunc("/api/settings/cluster/", func(w http.ResponseWriter, r *http.Request) {
+		if deps.DB == nil {
+			httpx.JSON(w, http.StatusServiceUnavailable, map[string]string{"error": "unavailable"})
+			return
+		}
+		id := strings.TrimPrefix(r.URL.Path, "/api/settings/cluster/")
+		if strings.TrimSpace(id) == "" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Method == http.MethodGet {
+			var cs settings.Cluster
+			_ = setMgr.GetCluster(id, &cs)
+			_ = json.NewEncoder(w).Encode(cs)
+			return
+		}
+		if r.Method == http.MethodPut {
+			var cs settings.Cluster
+			_ = json.NewDecoder(r.Body).Decode(&cs)
+			_ = setMgr.PutCluster(id, cs)
+			if deps.OnSettingsChanged != nil {
+				deps.OnSettingsChanged("cluster:" + id)
 			}
 			httpx.JSON(w, http.StatusOK, map[string]any{"ok": true})
 			return
@@ -326,7 +418,21 @@ func Router(deps Deps) *http.ServeMux {
 					st["code"] = "no_kubeconfig"
 				} else {
 					if cfg, err := kubeconfigFrom(kc); err == nil {
-						applyProxyOverride(cfg)
+						// Apply per-cluster overrides before probe
+						var cs settings.Cluster
+						_ = setMgr.GetCluster(id, &cs)
+						if strings.TrimSpace(cs.APIProxyURL) != "" {
+							cfg.Host = strings.TrimSpace(cs.APIProxyURL)
+							if strings.HasPrefix(strings.ToLower(cfg.Host), "http://") {
+								cfg.TLSClientConfig = rest.TLSClientConfig{}
+							}
+						}
+						if cs.APIProxyForceHTTP {
+							if u, err := url.Parse(cfg.Host); err == nil {
+								u.Scheme = "http"
+								cfg.Host = u.String()
+							}
+						}
 						if err := healthyCluster(cfg); err == nil {
 							st["status"] = "ok"
 						} else {
@@ -646,7 +752,21 @@ func Router(deps Deps) *http.ServeMux {
 					_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "code": "bad_kubeconfig", "error": err.Error()})
 					return
 				}
-				applyProxyOverride(cfg)
+				// Apply per-cluster overrides (proxy URL, force http)
+				var cs settings.Cluster
+				_ = setMgr.GetCluster(id, &cs)
+				if strings.TrimSpace(cs.APIProxyURL) != "" {
+					cfg.Host = strings.TrimSpace(cs.APIProxyURL)
+					if strings.HasPrefix(strings.ToLower(cfg.Host), "http://") {
+						cfg.TLSClientConfig = rest.TLSClientConfig{}
+					}
+				}
+				if cs.APIProxyForceHTTP {
+					if u, err := url.Parse(cfg.Host); err == nil {
+						u.Scheme = "http"
+						cfg.Host = u.String()
+					}
+				}
 				if err := healthyCluster(cfg); err == nil {
 					_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
 					return
@@ -706,7 +826,23 @@ func Router(deps Deps) *http.ServeMux {
 			httpx.JSONError(w, http.StatusBadRequest, "invalid kubeconfig", "bad_kubeconfig", err.Error())
 			return
 		}
-		applyProxyOverride(cfg)
+		// Apply cluster-scoped overrides
+		var cs settings.Cluster
+		_ = setMgr.GetCluster(clusterID, &cs)
+		if strings.TrimSpace(cs.APIProxyURL) != "" {
+			cfg.Host = strings.TrimSpace(cs.APIProxyURL)
+			if strings.HasPrefix(strings.ToLower(cfg.Host), "http://") {
+				cfg.TLSClientConfig = rest.TLSClientConfig{}
+			}
+		}
+		if cs.APIProxyForceHTTP {
+			// force http scheme when host is loopback or override explicitly requested
+			if u, err := url.Parse(cfg.Host); err == nil {
+				u.Scheme = "http"
+				cfg.Host = u.String()
+			}
+		}
+		// Build clients
 		cli, err := kubernetes.NewForConfig(cfg)
 		if err != nil {
 			httpx.JSONError(w, http.StatusInternalServerError, "k8s client error", "k8s_client", err.Error())
@@ -717,7 +853,10 @@ func Router(deps Deps) *http.ServeMux {
 			httpx.JSONError(w, http.StatusInternalServerError, "dynamic client error", "dyn_client", err.Error())
 			return
 		}
-		defaultNS := "default"
+		defaultNS := strings.TrimSpace(cs.Namespace)
+		if defaultNS == "" {
+			defaultNS = "default"
+		}
 		// Proxy: /api/cluster/{id}/proxy/server/{name}/...
 		if len(parts) >= 3 && parts[1] == "proxy" && parts[2] == "server" {
 			if len(parts) < 4 {
@@ -1139,17 +1278,4 @@ func headscaleHealth(endpoint string) (string, error) {
 		return "ok", nil
 	}
 	return "error", err
-}
-
-func applyProxyOverride(cfg *rest.Config) {
-	if cfg == nil {
-		return
-	}
-	if v := strings.TrimSpace(os.Getenv("HOSTAPP_API_PROXY_URL")); v != "" {
-		cfg.Host = v
-		// If using plain HTTP proxy, clear TLS to avoid confusion
-		if strings.HasPrefix(v, "http://") {
-			cfg.TLSClientConfig = rest.TLSClientConfig{}
-		}
-	}
 }
