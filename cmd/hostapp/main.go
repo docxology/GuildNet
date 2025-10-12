@@ -14,9 +14,9 @@ import (
 	"io"
 	"log"
 	"math/big"
+	"mime"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/signal"
@@ -31,12 +31,15 @@ import (
 	crlog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
+	"github.com/your/module/internal/db"
 	httpx "github.com/your/module/internal/httpx"
 	"github.com/your/module/internal/k8s"
+	"github.com/your/module/internal/metrics"
 	"github.com/your/module/internal/model"
 	"github.com/your/module/internal/proxy"
 
 	//"github.com/your/module/internal/store"
+	"github.com/your/module/internal/store"
 	"github.com/your/module/internal/ts"
 	"github.com/your/module/pkg/config"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -62,6 +65,9 @@ func startOperator(ctx context.Context, restCfg *rest.Config) error {
 	// configure controller-runtime logger (dev mode)
 	crlog.SetLogger(zap.New(zap.UseDevMode(true)))
 	opts := ctrl.Options{Scheme: scheme}
+	// Disable metrics and health probe servers to avoid port conflicts in embedded mode.
+	opts.Metrics.BindAddress = "0"
+	opts.HealthProbeBindAddress = "0"
 	mgr, err := ctrl.NewManager(restCfg, opts)
 	if err != nil {
 		return fmt.Errorf("manager create: %w", err)
@@ -194,7 +200,12 @@ func main() {
 	log.SetFlags(0)
 	cmd := "serve"
 	if len(os.Args) > 1 {
-		cmd = os.Args[1]
+		// Compatibility shim: support "--mode operator"
+		if os.Args[1] == "--mode" && len(os.Args) > 2 && os.Args[2] == "operator" {
+			cmd = "operator"
+		} else {
+			cmd = os.Args[1]
+		}
 	}
 
 	switch cmd {
@@ -204,10 +215,23 @@ func main() {
 		}
 		fmt.Println("config written to", config.ConfigPath())
 		return
+	case "operator":
+		// Run only the operator manager (no tsnet or HTTP server)
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		kcli, err := k8s.New(ctx)
+		if err != nil || kcli == nil || kcli.Rest == nil {
+			log.Fatalf("k8s config: %v", err)
+		}
+		if err := startOperator(ctx, kcli.Rest); err != nil {
+			log.Fatalf("operator start: %v", err)
+		}
+		<-ctx.Done()
+		return
 	case "serve":
 		// continue
 	default:
-		log.Fatalf("unknown command: %s (use 'init' or 'serve')", cmd)
+		log.Fatalf("unknown command: %s (use 'init', 'serve', or 'operator')", cmd)
 	}
 
 	cfg, err := config.Load()
@@ -240,11 +264,98 @@ func main() {
 
 	mux := http.NewServeMux()
 
+	// In-memory store (includes registry)
+	mem := store.New()
+	go func() {
+		// Periodically prune stale agents (e.g., >2 minutes)
+		t := time.NewTicker(120 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				mem.PruneAgents(2 * time.Minute)
+			}
+		}
+	}()
+
+	// Ensure JS files are served with a broadly-compatible MIME type for module scripts
+	// Some embedded browsers are strict about application/javascript
+	_ = mime.AddExtensionType(".js", "application/javascript")
+
+	// Initialize RethinkDB (best-effort; feature is optional if DB not reachable)
+	var dbMgr *db.Manager
+	if mgr, derr := db.Connect(ctx); derr != nil {
+		log.Printf("rethinkdb connect failed (databases feature disabled): %v", derr)
+	} else {
+		dbMgr = mgr
+	}
+	// Always register database API endpoints; handlers will degrade gracefully when dbMgr is nil.
+	httpx.InitAndRegisterDB(mux, dbMgr)
+
 	// health check
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
+	})
+
+	// Registry endpoints (minimal)
+	mux.HandleFunc("/api/v1/agents/register", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var rec model.AgentRecord
+		if err := json.NewDecoder(r.Body).Decode(&rec); err != nil {
+			httpx.JSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		if strings.TrimSpace(rec.ID) == "" || strings.TrimSpace(rec.IP) == "" {
+			httpx.JSON(w, http.StatusBadRequest, map[string]string{"error": "id and ip required"})
+			return
+		}
+		rec.LastSeen = model.NowISO()
+		mem.UpsertAgent(&rec)
+		httpx.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+
+	mux.HandleFunc("/api/v1/resolve", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		id := strings.TrimSpace(r.URL.Query().Get("id"))
+		org := strings.TrimSpace(r.URL.Query().Get("org"))
+		if id == "" {
+			httpx.JSON(w, http.StatusBadRequest, map[string]string{"error": "id required"})
+			return
+		}
+		if a, ok := mem.GetAgent(org, id); ok {
+			resp := model.ResolveResponse{IP: a.IP, Ports: a.Ports, ExpiresAt: time.Now().Add(60 * time.Second).UTC().Format(time.RFC3339)}
+			httpx.JSON(w, http.StatusOK, resp)
+			return
+		}
+		httpx.JSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+	})
+
+	mux.HandleFunc("/api/v1/agents", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		org := strings.TrimSpace(r.URL.Query().Get("org"))
+		list := mem.ListAgents(org)
+		httpx.JSON(w, http.StatusOK, list)
+	})
+
+	// lightweight in-memory metrics (JSON)
+	mux.HandleFunc("/api/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(struct {
+			Snapshot any `json:"snapshot"`
+		}{Snapshot: metrics.Export()})
 	})
 
 	// Kubernetes client (Talos cluster required; no local mode)
@@ -253,6 +364,8 @@ func main() {
 		log.Fatalf("k8s client: %v", err)
 	}
 	var dyn dynamic.Interface
+	// Optional: local port-forward manager for pods (fallback when API server service/pod proxy is unreliable)
+	var pfMgr *k8s.PortForwardManager
 	// Always use Workspace CRDs (legacy deployment path removed)
 	if kcli != nil && kcli.Rest != nil {
 		if d, derr := dynamic.NewForConfig(kcli.Rest); derr == nil {
@@ -260,16 +373,20 @@ func main() {
 		} else {
 			log.Printf("dynamic client init failed: %v", derr)
 		}
+		pfMgr = k8s.NewPortForwardManager(kcli.Rest, "default")
 	}
 	log.Printf("Workspace CRD mode active (legacy paths removed)")
 
 	// Start operator (controller-runtime) in-process so status of Workspaces is managed.
 	if kcli != nil && kcli.Rest != nil {
-		go func() {
-			if err := startOperator(ctx, kcli.Rest); err != nil {
-				log.Printf("operator start failed: %v", err)
-			}
-		}()
+		if strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_EMBED_OPERATOR")), "1") ||
+			strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_EMBED_OPERATOR")), "true") {
+			go func() {
+				if err := startOperator(ctx, kcli.Rest); err != nil {
+					log.Printf("operator start failed: %v", err)
+				}
+			}()
+		}
 	}
 
 	// Permission cache (prototype) – only used in CRD mode for admin/destructive actions.
@@ -292,42 +409,118 @@ func main() {
 		httpx.JSON(w, http.StatusOK, map[string]any{"name": cfg.Name})
 	})
 
-	// Same-origin dev UI: proxy Vite from :5173 at '/'.
-	// Keep API and proxy routes taking precedence by registering them before the catch-all.
-	// This simplifies cookies/CSP by using a single origin in dev.
-	{
-		uiOrigin := strings.TrimSpace(os.Getenv("UI_DEV_ORIGIN"))
-		if uiOrigin == "" {
-			uiOrigin = "https://localhost:5173"
+	// Register hostapp presence (type=gateway) to local in-memory registry
+	go func() {
+		info, _ := ts.Info(ctx, tsServer)
+		rec := &model.AgentRecord{
+			ID:       cfg.Hostname,
+			Org:      os.Getenv("ORG_ID"),
+			Hostname: cfg.Hostname,
+			IP:       "", // fill with tsnet IP if available
+			Ports:    map[string]int{"ui": 8080},
+			Version:  "hostapp",
 		}
-		u, err := url.Parse(uiOrigin)
-		if err == nil && u.Scheme != "" && u.Host != "" {
-			uiProxy := &httputil.ReverseProxy{
-				Director: func(req *http.Request) {
-					// Don't steal API or proxy routes
-					if strings.HasPrefix(req.URL.Path, "/api/") || strings.HasPrefix(req.URL.Path, "/proxy/") || req.URL.Path == "/healthz" {
-						return
-					}
-					req.URL.Scheme = u.Scheme
-					req.URL.Host = u.Host
-					req.Host = u.Host
-					// map path as-is to Vite
-				},
-				Transport: &http.Transport{
-					Proxy:               http.ProxyFromEnvironment,
-					TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
-					ForceAttemptHTTP2:   true,
-					DisableKeepAlives:   false,
-					MaxIdleConns:        100,
-					IdleConnTimeout:     90 * time.Second,
-					TLSHandshakeTimeout: 10 * time.Second,
-				},
+		if info != nil && info.IP != "" {
+			rec.IP = info.IP
+		}
+		if rec.IP == "" {
+			rec.IP = "100.64.0.1"
+		} // placeholder if info fails
+		rec.LastSeen = model.NowISO()
+		mem.UpsertAgent(rec)
+		// refresh periodically
+		tick := time.NewTicker(60 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				rec.LastSeen = model.NowISO()
+				mem.UpsertAgent(rec)
 			}
-			// Note: We do not special-case /api or /proxy here; net/http ServeMux will route
-			// those to longer, more specific patterns registered above. This handler only
-			// runs for paths that didn't match any earlier /api/* or /proxy/* handlers.
-			mux.HandleFunc("/", uiProxy.ServeHTTP)
-			log.Printf("dev UI proxied at / -> %s", uiOrigin)
+		}
+	}()
+
+	// Smoke: resolve and attempt a tsnet dial to given id:port
+	mux.HandleFunc("/api/v1/smoke-dial", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimSpace(r.URL.Query().Get("id"))
+		port := strings.TrimSpace(r.URL.Query().Get("port"))
+		if id == "" || port == "" {
+			httpx.JSON(w, http.StatusBadRequest, map[string]string{"error": "id and port required"})
+			return
+		}
+		if a, ok := mem.GetAgent("", id); ok {
+			addr := a.IP + ":" + port
+			ctxDial, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			c, err := ts.DialContext(ctxDial, tsServer, "tcp", addr)
+			if err != nil {
+				httpx.JSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+				return
+			}
+			_ = c.Close()
+			httpx.JSON(w, http.StatusOK, map[string]string{"ok": addr})
+			return
+		}
+		httpx.JSON(w, http.StatusNotFound, map[string]string{"error": "id not found"})
+	})
+
+	// UI handling: serve compiled UI from ui/dist with SPA fallback to index.html (no redirects)
+	{
+		dist := filepath.Join("ui", "dist")
+		indexPath := filepath.Join(dist, "index.html")
+		if fi, err := os.Stat(dist); err == nil && fi.IsDir() {
+			// Favicon: serve from dist if present, else 204 to avoid 404 noise
+			mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+				fav := filepath.Join(dist, "favicon.ico")
+				if fi, err := os.Stat(fav); err == nil && !fi.IsDir() {
+					http.ServeFile(w, r, fav)
+					return
+				}
+				w.WriteHeader(http.StatusNoContent)
+			})
+
+			mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				// Only handle UI paths here (API/proxy matched earlier)
+				// Normalize and prevent path traversal
+				path := r.URL.Path
+				if path == "" || path == "/" {
+					// Avoid caching HTML to ensure latest hashed asset URLs are used
+					w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+					http.ServeFile(w, r, indexPath)
+					return
+				}
+				// Clean the path and ensure it stays within dist
+				cleanPath := filepath.Clean(strings.TrimPrefix(path, "/"))
+				full := filepath.Join(dist, cleanPath)
+				// Security: ensure the full path is under dist
+				if !strings.HasPrefix(full, dist+string(os.PathSeparator)) && full != dist {
+					http.NotFound(w, r)
+					return
+				}
+				// If file exists and is not a directory, serve it
+				if fi, err := os.Stat(full); err == nil && !fi.IsDir() {
+					// Long cache for hashed assets
+					if strings.HasPrefix(cleanPath, "assets/") {
+						w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+					}
+					http.ServeFile(w, r, full)
+					return
+				}
+				// SPA fallback only for non-asset paths (no dot in last segment)
+				base := filepath.Base(cleanPath)
+				if !strings.Contains(base, ".") {
+					w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+					http.ServeFile(w, r, indexPath)
+					return
+				}
+				// Otherwise, not found (avoid redirect loops)
+				http.NotFound(w, r)
+			})
+			log.Printf("serving static UI from %s", dist)
+		} else {
+			log.Printf("ui/dist directory not found; UI will return 404 at root")
 		}
 	}
 
@@ -369,7 +562,7 @@ func main() {
 		httpx.JSON(w, http.StatusOK, resp)
 	})
 
-	// servers list (Workspace CRDs only; legacy Deployment path removed during cleanup)
+	// servers list (Workspace CRDs only; legacy Deployment path removed)
 	mux.HandleFunc("/api/servers", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -382,7 +575,8 @@ func main() {
 		gvr := schema.GroupVersionResource{Group: "guildnet.io", Version: "v1alpha1", Resource: "workspaces"}
 		lst, err := dyn.Resource(gvr).Namespace(defaultNS).List(r.Context(), metav1.ListOptions{})
 		if err != nil {
-			httpx.JSONError(w, http.StatusInternalServerError, "list workspaces failed", "list_failed", err.Error())
+			// Degrade gracefully: return empty list when CRDs are not installed yet or API is not ready
+			httpx.JSON(w, http.StatusOK, []any{})
 			return
 		}
 		var out []*model.Server
@@ -772,14 +966,22 @@ func main() {
 			fmt.Sscanf(v, "%d", &tail)
 		}
 
-		// Validate before switching to SSE
-		if id == "" {
+		// Validate target exists (CRD-aware)
+		if strings.TrimSpace(id) == "" {
 			httpx.JSONError(w, http.StatusBadRequest, "missing target", "missing_target")
 			return
 		}
-		if _, err := kcli.GetServer(r.Context(), defaultNS, id); err != nil {
-			httpx.JSONError(w, http.StatusNotFound, "unknown target", "not_found")
-			return
+		if dyn != nil {
+			gvr := schema.GroupVersionResource{Group: "guildnet.io", Version: "v1alpha1", Resource: "workspaces"}
+			if _, err := dyn.Resource(gvr).Namespace(defaultNS).Get(r.Context(), id, metav1.GetOptions{}); err != nil {
+				httpx.JSONError(w, http.StatusNotFound, "unknown target", "not_found")
+				return
+			}
+		} else {
+			if _, err := kcli.GetServer(r.Context(), defaultNS, id); err != nil {
+				httpx.JSONError(w, http.StatusNotFound, "unknown target", "not_found")
+				return
+			}
 		}
 
 		flusher, ok := w.(http.Flusher)
@@ -795,32 +997,74 @@ func main() {
 		log.Printf("sse/logs open: target=%s level=%s tail=%d from %s", id, level, tail, r.RemoteAddr)
 		enc := json.NewEncoder(w)
 
-		// send tail first (best effort) via k8s logs
-		if lines, err := kcli.GetLogs(r.Context(), defaultNS, id, level, tail); err != nil {
-			log.Printf("sse/logs tail error: target=%s level=%s err=%v", id, level, err)
-		} else {
-			for _, ln := range lines {
-				if _, err := w.Write([]byte("data: ")); err != nil {
-					log.Printf("sse/logs write error: %v", err)
-					return
-				}
-				if err := enc.Encode(ln); err != nil {
-					log.Printf("sse/logs encode error: %v", err)
-					return
-				}
-				if _, err := w.Write([]byte("\n")); err != nil {
-					log.Printf("sse/logs write error: %v", err)
-					return
-				}
-				flusher.Flush()
+		// send tail first (best effort) by reading pods matching the Workspace label
+		func() {
+			defer func() { recover() }() // keep SSE alive on tail errors
+			pods, err := kcli.K.CoreV1().Pods(defaultNS).List(r.Context(), metav1.ListOptions{LabelSelector: fmt.Sprintf("guildnet.io/workspace=%s", id)})
+			if err != nil || len(pods.Items) == 0 {
+				return
 			}
-		}
+			// Sort pods: ready first
+			readyPods := []corev1.Pod{}
+			unreadyPods := []corev1.Pod{}
+			for _, p := range pods.Items {
+				isReady := false
+				for _, c := range p.Status.Conditions {
+					if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
+						isReady = true
+						break
+					}
+				}
+				if isReady {
+					readyPods = append(readyPods, p)
+				} else {
+					unreadyPods = append(unreadyPods, p)
+				}
+			}
+			ordered := append(readyPods, unreadyPods...)
+			maxPods := 5
+			if len(ordered) < maxPods {
+				maxPods = len(ordered)
+			}
+			tailPer := int64(tail)
+			if maxPods > 1 {
+				tp := int64(tail / maxPods)
+				if tp >= 10 {
+					tailPer = tp
+				}
+			}
+			for i := 0; i < maxPods; i++ {
+				p := ordered[i]
+				container := ""
+				if len(p.Spec.Containers) > 0 {
+					container = p.Spec.Containers[0].Name
+				}
+				req := kcli.K.CoreV1().Pods(defaultNS).GetLogs(p.Name, &corev1.PodLogOptions{Container: container, TailLines: &tailPer})
+				data, err := req.Do(r.Context()).Raw()
+				if err != nil {
+					continue
+				}
+				for _, ln := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+					if ln == "" {
+						continue
+					}
+					if _, err := w.Write([]byte("data: ")); err != nil {
+						return
+					}
+					if err := enc.Encode(model.LogLine{T: model.NowISO(), LVL: level, MSG: fmt.Sprintf("[%s] %s", p.Name, ln)}); err != nil {
+						return
+					}
+					if _, err := w.Write([]byte("\n")); err != nil {
+						return
+					}
+					flusher.Flush()
+				}
+			}
+		}()
 
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
-		// For now, no live watch wired; send heartbeats and rely on polling logs endpoint in UI when needed.
-		ch := make(chan model.LogLine)
-		defer close(ch)
+		// For now, no live watch wired; send heartbeats periodically
 		heartbeat := time.NewTicker(20 * time.Second)
 		defer heartbeat.Stop()
 		for {
@@ -834,24 +1078,6 @@ func main() {
 					return
 				}
 				flusher.Flush()
-			case ln, ok := <-ch:
-				if !ok {
-					log.Printf("sse/logs close: target=%s level=%s from=%s reason=channel-closed", id, level, r.RemoteAddr)
-					return
-				}
-				if _, err := w.Write([]byte("data: ")); err != nil {
-					log.Printf("sse/logs write error: %v", err)
-					return
-				}
-				if err := enc.Encode(ln); err != nil {
-					log.Printf("sse/logs encode error: %v", err)
-					return
-				}
-				if _, err := w.Write([]byte("\n")); err != nil {
-					log.Printf("sse/logs write error: %v", err)
-					return
-				}
-				flusher.Flush()
 			}
 		}
 	})
@@ -859,7 +1085,7 @@ func main() {
 	// proxy handler (CRD-aware resolution)
 	proxyHandler := proxy.NewReverseProxy(proxy.Options{
 		MaxBody: 10 * 1024 * 1024,
-		Timeout: 10 * time.Second,
+		Timeout: 30 * time.Second,
 		Dial: func(ctx context.Context, network, address string) (any, error) {
 			// For loopback targets in local dev, bypass tsnet and dial OS loopback directly.
 			host, _, err := net.SplitHostPort(address)
@@ -902,12 +1128,11 @@ func main() {
 			return sch, fmt.Sprintf("%s:%d", host, port), subPath, nil
 		},
 		APIProxy: func() (http.RoundTripper, func(req *http.Request, scheme, hostport, subPath string), bool) {
-			// Allow disabling API proxy (pods proxy) to validate WS directly via tsnet/ClusterIP.
+			// Allow disabling API proxy fully
 			if strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_DISABLE_API_PROXY")), "1") ||
 				strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_DISABLE_API_PROXY")), "true") {
 				return nil, nil, false
 			}
-			// Build a transport using the k8s rest config to go through the API server proxy
 			cfg := kcli.Config()
 			if cfg == nil {
 				return nil, nil, false
@@ -917,63 +1142,122 @@ func main() {
 				return nil, nil, false
 			}
 			set := func(req *http.Request, scheme, hostport, subPath string) {
-				// Expect hostport either as ClusterIP:port or service DNS name + port
-				host, pstr, _ := net.SplitHostPort(hostport)
-				p := pstr
-				name := host
-				// Determine service name
-				if sid := req.Header.Get("X-Guild-Server-ID"); sid != "" {
-					ns := defaultNS
-					sname := dns1123Name(sid)
-					if svc, err := kcli.K.CoreV1().Services(ns).Get(context.Background(), sname, metav1.GetOptions{}); err == nil && svc != nil {
-						name = svc.Name
-					} else if list, err := kcli.K.CoreV1().Services(ns).List(context.Background(), metav1.ListOptions{LabelSelector: fmt.Sprintf("guildnet.io/id=%s", sid)}); err == nil && len(list.Items) > 0 {
-						name = list.Items[0].Name
-					} else {
-						name = sname
-					}
-				} else if strings.Contains(host, ".svc") {
-					parts := strings.Split(host, ".")
-					if len(parts) > 0 {
-						name = parts[0]
-					}
-				} else if ip := net.ParseIP(host); ip != nil {
-					ns := defaultNS
-					if svcList, err := kcli.K.CoreV1().Services(ns).List(context.Background(), metav1.ListOptions{}); err == nil {
-						for _, s := range svcList.Items {
-							if s.Spec.ClusterIP == host {
-								name = s.Name
-								break
-							}
+				// If we’re targeting a local PF set earlier (host is 127.0.0.1), do not rewrite to API proxy
+				hn := req.URL.Hostname()
+				if hn == "127.0.0.1" || strings.EqualFold(hn, "localhost") {
+					return
+				}
+				// Determine base URL: env override > kube config
+				baseURL, baseFromEnv := func() (*url.URL, bool) {
+					if v := strings.TrimSpace(os.Getenv("HOSTAPP_API_PROXY_URL")); v != "" {
+						if u, err := url.Parse(v); err == nil {
+							return u, true
 						}
 					}
-				}
-				// Base API server URL
-				baseURL, _ := url.Parse(cfg.Host)
-				if baseURL == nil {
-					baseURL = &url.URL{Scheme: "https"}
-				}
+					if u, err := url.Parse(cfg.Host); err == nil && u != nil {
+						return u, false
+					}
+					return &url.URL{Scheme: "https"}, false
+				}()
 				if baseURL.Scheme == "" {
 					baseURL.Scheme = "https"
+				}
+				// Only force HTTP when:
+				// - explicitly requested via HOSTAPP_API_PROXY_FORCE_HTTP, or
+				// - kubeconfig host is loopback (localhost/127.0.0.1) and not overridden by env
+				if strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_API_PROXY_FORCE_HTTP")), "1") ||
+					strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_API_PROXY_FORCE_HTTP")), "true") {
+					baseURL.Scheme = "http"
+				} else if !baseFromEnv {
+					hn := baseURL.Hostname()
+					if hn == "localhost" || hn == "127.0.0.1" {
+						baseURL.Scheme = "http"
+					}
+				}
+
+				// If using a loopback base and it appears unreachable, prefer kubectl proxy on 127.0.0.1:8001 when open.
+				if !baseFromEnv {
+					hn := baseURL.Hostname()
+					if hn == "localhost" || hn == "127.0.0.1" {
+						// quick probe current base
+						probeAddr := baseURL.Host
+						if !strings.Contains(probeAddr, ":") {
+							if baseURL.Scheme == "https" {
+								probeAddr = net.JoinHostPort(baseURL.Host, "443")
+							} else {
+								probeAddr = net.JoinHostPort(baseURL.Host, "80")
+							}
+						}
+						c, err := net.DialTimeout("tcp", probeAddr, 250*time.Millisecond)
+						if err != nil {
+							// try kubectl proxy default
+							if c2, err2 := net.DialTimeout("tcp", "127.0.0.1:8001", 250*time.Millisecond); err2 == nil {
+								_ = c2.Close()
+								baseURL.Scheme = "http"
+								baseURL.Host = "127.0.0.1:8001"
+							}
+						} else {
+							_ = c.Close()
+						}
+					}
 				}
 				req.URL.Scheme = baseURL.Scheme
 				req.URL.Host = baseURL.Host
 				req.Host = req.URL.Host
 				basePrefix := strings.TrimSuffix(baseURL.Path, "/")
 
-				// Prefer pod proxy if requested via header
-				if strings.TrimSpace(req.Header.Get("X-Guild-Prefer-Pod")) != "" {
+				// Extract service name (Workspace ID) and port from inputs
+				sid := strings.TrimSpace(req.Header.Get("X-Guild-Server-ID"))
+				_, portStr, err := net.SplitHostPort(hostport)
+				if err != nil || portStr == "" {
+					// best-effort parse if hostport is not in host:port form
+					parts := strings.Split(hostport, ":")
+					if len(parts) > 1 {
+						portStr = parts[len(parts)-1]
+					} else {
+						portStr = "80"
+					}
+				}
+
+				// Pre-resolve ClusterIP:port for direct fallback when PF fails
+				fallbackHost := ""
+				fallbackScheme := "http"
+				if sid != "" {
+					if ip, pnum, isHTTPS, rerr := kcli.ResolveServiceAddress(context.Background(), defaultNS, sid); rerr == nil {
+						fallbackHost = fmt.Sprintf("%s:%d", ip, pnum)
+						if isHTTPS {
+							fallbackScheme = "https"
+						} else {
+							fallbackScheme = "http"
+						}
+					}
+				}
+
+				// Choose proxy style: service by default; pod only if explicitly requested by header or HOSTAPP_PREFER_POD_PROXY/USE_PORT_FORWARD
+				preferPod := strings.TrimSpace(req.Header.Get("X-Guild-Prefer-Pod")) != ""
+				if !preferPod {
+					if v := strings.TrimSpace(os.Getenv("HOSTAPP_PREFER_POD_PROXY")); v == "1" || strings.EqualFold(v, "true") {
+						preferPod = true
+					}
+				}
+				usePF := false
+				if v := strings.TrimSpace(os.Getenv("HOSTAPP_USE_PORT_FORWARD")); v == "1" || strings.EqualFold(v, "true") {
+					usePF = true
+					preferPod = true
+				}
+				if preferPod && sid != "" {
+					// Discover any running pod (even if not Ready) behind the service named by sid
 					ns := defaultNS
 					podName := ""
-					// Discover pods via Service selector first
-					if svc, err := kcli.K.CoreV1().Services(ns).Get(context.Background(), name, metav1.GetOptions{}); err == nil && svc != nil && len(svc.Spec.Selector) > 0 {
+					if svc, err := kcli.K.CoreV1().Services(ns).Get(context.Background(), sid, metav1.GetOptions{}); err == nil && svc != nil && len(svc.Spec.Selector) > 0 {
 						var selParts []string
 						for k, v := range svc.Spec.Selector {
 							selParts = append(selParts, fmt.Sprintf("%s=%s", k, v))
 						}
 						selector := strings.Join(selParts, ",")
 						if pods, err := kcli.K.CoreV1().Pods(ns).List(context.Background(), metav1.ListOptions{LabelSelector: selector}); err == nil && len(pods.Items) > 0 {
-							pick := 0
+							// prefer Ready pod, else take first Running, else any
+							pick := -1
 							for i, pod := range pods.Items {
 								if pod.Status.Phase == corev1.PodRunning {
 									ready := false
@@ -989,72 +1273,84 @@ func main() {
 									}
 								}
 							}
-							podName = pods.Items[pick].Name
-						}
-					}
-					// Fallback: guildnet.io/id label
-					if podName == "" {
-						if sid := req.Header.Get("X-Guild-Server-ID"); sid != "" {
-							selector := fmt.Sprintf("guildnet.io/id=%s", sid)
-							if pods, err := kcli.K.CoreV1().Pods(ns).List(context.Background(), metav1.ListOptions{LabelSelector: selector}); err == nil && len(pods.Items) > 0 {
-								pick := 0
+							if pick == -1 {
 								for i, pod := range pods.Items {
 									if pod.Status.Phase == corev1.PodRunning {
-										ready := false
-										for _, c := range pod.Status.Conditions {
-											if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
-												ready = true
-												break
-											}
-										}
-										if ready {
-											pick = i
-											break
-										}
-									}
-								}
-								podName = pods.Items[pick].Name
-							}
-						}
-					}
-					// Fallback: legacy app=name
-					if podName == "" {
-						if pods, err := kcli.K.CoreV1().Pods(ns).List(context.Background(), metav1.ListOptions{LabelSelector: fmt.Sprintf("app=%s", name)}); err == nil && len(pods.Items) > 0 {
-							pick := 0
-							for i, pod := range pods.Items {
-								if pod.Status.Phase == corev1.PodRunning {
-									ready := false
-									for _, c := range pod.Status.Conditions {
-										if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
-											ready = true
-											break
-										}
-									}
-									if ready {
 										pick = i
 										break
 									}
 								}
 							}
+							if pick == -1 {
+								pick = 0
+							}
 							podName = pods.Items[pick].Name
+						}
+					}
+					if podName == "" {
+						if sidHdr := req.Header.Get("X-Guild-Server-ID"); sidHdr != "" {
+							selector := fmt.Sprintf("guildnet.io/id=%s", sidHdr)
+							if pods, err := kcli.K.CoreV1().Pods(ns).List(context.Background(), metav1.ListOptions{LabelSelector: selector}); err == nil && len(pods.Items) > 0 {
+								podName = pods.Items[0].Name
+							}
 						}
 					}
 					if podName != "" {
-						podIdent := podName
-						if strings.EqualFold(scheme, "https") {
-							podIdent = "https:" + podIdent
+						if usePF && pfMgr != nil {
+							// Use local port-forward to the pod first
+							pnum := 80
+							if n, err := fmt.Sscanf(portStr, "%d", &pnum); n == 0 || err != nil {
+								pnum = 8080
+							}
+							log.Printf("proxy: attempting port-forward ns=%s pod=%s port=%d sid=%s", defaultNS, podName, pnum, sid)
+							if lp, err := pfMgr.Ensure(context.Background(), defaultNS, podName, pnum); err == nil && lp > 0 {
+								log.Printf("proxy: using port-forward localPort=%d -> %s:%d", lp, podName, pnum)
+								req.URL.Scheme = "http"
+								req.URL.Host = fmt.Sprintf("127.0.0.1:%d", lp)
+								req.Host = req.URL.Host
+								// Provide a fallback target for the transport if PF fails mid-flight (use ClusterIP if available)
+								if fallbackHost != "" {
+									req.Header.Set("X-Guild-Fallback-Hostport", fallbackHost)
+									req.Header.Set("X-Guild-Fallback-Scheme", fallbackScheme)
+								}
+								// Clear X-Guild-Server-ID so API proxy layer doesn't try to rewrite
+								req.Header.Del("X-Guild-Server-ID")
+								req.URL.Path = singleJoiningSlash("", subPath)
+								return
+							}
+							log.Printf("proxy: port-forward failed, falling back to pod proxy ns=%s pod=%s err=%v", defaultNS, podName, err)
+							// fallthrough to pods proxy if Ensure fails
 						}
-						basePath := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s:%s/proxy", defaultNS, podIdent, p)
+						// If PF was requested but failed, try direct service ClusterIP via tsnet/overlay before API pod proxy
+						if usePF && fallbackHost != "" {
+							log.Printf("proxy: PF unavailable; trying direct ClusterIP %s for sid=%s", fallbackHost, sid)
+							req.URL.Scheme = fallbackScheme
+							req.URL.Host = fallbackHost
+							req.Host = fallbackHost
+							req.URL.Path = singleJoiningSlash("", subPath)
+							return
+						}
+						// Build pods proxy path: /api/v1/namespaces/{ns}/pods/{scheme}:{pod}:{port}/proxy
+						proto := "http"
+						if strings.EqualFold(scheme, "https") {
+							proto = "https"
+						}
+						basePath := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s:%s:%s/proxy", defaultNS, proto, podName, portStr)
 						fullBase := singleJoiningSlash(basePrefix, basePath)
 						req.URL.Path = singleJoiningSlash("", fullBase) + subPath
-						log.Printf("proxy director: pods-proxy ns=%s pod=%s port=%s sub=%s path=%s", defaultNS, podIdent, p, subPath, req.URL.Path)
 						return
 					}
 				}
-
-				// No service-proxy fallback: fail fast so caller can surface a clear error
-				req.URL.Path = "/api/v1/namespaces/" + defaultNS + "/pods/unknown:0/proxy" // unreachable, yields 404 fast
-				log.Printf("proxy director: no pod found for service=%s ns=%s; failing fast path=%s", name, defaultNS, req.URL.Path)
+				// Service proxy (respect scheme) with explicit scheme prefix to avoid ambiguity
+				if strings.EqualFold(scheme, "https") {
+					req.URL.Path = "/api/v1/namespaces/" + defaultNS + "/services/https:" + sid + ":" + portStr + "/proxy"
+				} else {
+					// explicitly use http: prefix
+					req.URL.Path = "/api/v1/namespaces/" + defaultNS + "/services/http:" + sid + ":" + portStr + "/proxy"
+				}
+				req.URL.Path = singleJoiningSlash("", req.URL.Path) + subPath
+				// return is redundant at end of function literal; removing to avoid linter/compile complaint
+				// return
 			}
 			return rt, set, true
 		},
@@ -1112,7 +1408,26 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 	var v6Srv *http.Server
-	if host, port, err := net.SplitHostPort(cfg.ListenLocal); err == nil {
+	// Pre-bind local listener and fall back if the preferred port is unavailable.
+	bindAddr := cfg.ListenLocal
+	lnLocal, err := net.Listen("tcp", bindAddr)
+	if err != nil {
+		candidates := []string{"127.0.0.1:9443", "127.0.0.1:8080", "127.0.0.1:8081", "127.0.0.1:8443"}
+		for _, a := range candidates {
+			if l, e := net.Listen("tcp", a); e == nil {
+				lnLocal = l
+				bindAddr = a
+				localSrv.Addr = bindAddr
+				break
+			}
+		}
+		if lnLocal == nil {
+			log.Fatalf("local listen failed: %v", err)
+		}
+	}
+	// Also prepare an IPv6 loopback listener on the same port when using localhost/127.0.0.1
+	var lnLocalV6 net.Listener
+	if host, port, err := net.SplitHostPort(bindAddr); err == nil {
 		if host == "127.0.0.1" || strings.EqualFold(host, "localhost") {
 			v6Srv = &http.Server{
 				Addr:         net.JoinHostPort("::1", port),
@@ -1120,6 +1435,9 @@ func main() {
 				ReadTimeout:  10 * time.Second,
 				WriteTimeout: 10 * time.Second,
 				IdleTimeout:  60 * time.Second,
+			}
+			if l6, e6 := net.Listen("tcp", v6Srv.Addr); e6 == nil {
+				lnLocalV6 = l6
 			}
 		}
 	}
@@ -1143,12 +1461,12 @@ func main() {
 	}
 
 	errCh := make(chan error, 3)
-	go func() { errCh <- localSrv.ListenAndServeTLS(certFile, keyFile) }()
-	if v6Srv != nil {
-		go func() { errCh <- v6Srv.ListenAndServeTLS(certFile, keyFile) }()
+	go func() { errCh <- localSrv.ServeTLS(lnLocal, certFile, keyFile) }()
+	if v6Srv != nil && lnLocalV6 != nil {
+		go func() { errCh <- v6Srv.ServeTLS(lnLocalV6, certFile, keyFile) }()
 	}
 	go func() { errCh <- tsSrv.ServeTLS(ln, certFile, keyFile) }()
-	log.Printf("serving TLS on local %s and tailscale listener :443", cfg.ListenLocal)
+	log.Printf("serving TLS on local %s and tailscale listener :443", bindAddr)
 
 	select {
 	case <-ctx.Done():

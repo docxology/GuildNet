@@ -20,7 +20,8 @@ if [ -f "$ROOT/.env" ]; then
   . "$ROOT/.env"
 fi
 
-CLUSTER_NAME=${CLUSTER_NAME:-guildnet}
+# Cluster name
+CLUSTER=${CLUSTER:-guildnet}
 NAMESPACE=${NAMESPACE:-default}
 
 # Support Headscale aliases
@@ -160,13 +161,8 @@ install_hint() {
 }
 
 main() {
-  if [[ -z "$TS_AUTHKEY" ]]; then
-    err "TS_AUTHKEY is required (Tailscale/Headscale pre-auth key)."
-    err "Hint: create $ROOT/.env with values, e.g.:"
-    err "  TS_LOGIN_SERVER=https://headscale.example.com"
-    err "  TS_AUTHKEY=tskey-..."
-    err "  TS_ROUTES=10.96.0.0/12,10.244.0.0/16"
-    exit 1
+  if [[ -z "${TS_AUTHKEY}" ]]; then
+    log "TS_AUTHKEY not provided; proceeding without Tailscale subnet router (cluster will still be created)."
   fi
 
   case "$(uname -s)" in
@@ -203,12 +199,12 @@ main() {
   fi
 
   # Reuse detection: choose highest numeric suffix (admin@CLUSTER-N)
-  if kubectl config get-contexts -o name 2>/dev/null | grep -q "admin@${CLUSTER_NAME}"; then
-    ctx=$(kubectl config get-contexts -o name | grep "admin@${CLUSTER_NAME}" | sort -V | tail -n 1)
+  if kubectl config get-contexts -o name 2>/dev/null | grep -q "admin@${CLUSTER}"; then
+    ctx=$(kubectl config get-contexts -o name | grep "admin@${CLUSTER}" | sort -V | tail -n 1)
     if [ -n "$ctx" ]; then
       kubectl config use-context "$ctx" >/dev/null 2>&1 || true
       if kubectl get nodes >/dev/null 2>&1; then
-        log "Cluster '$CLUSTER_NAME' appears up (context=$ctx); skipping create"
+  log "Cluster '$CLUSTER' appears up (context=$ctx); skipping create"
         reuse=1
       else
         log "Context $ctx found but cluster not responding; will attempt create"
@@ -217,36 +213,39 @@ main() {
   fi
   reuse=${reuse:-0}
   if [ $reuse -ne 1 ]; then
-    log "Creating Talos cluster: $CLUSTER_NAME (provisioner=${TALOS_PROVISIONER:-auto}, cidr=${TALOS_CIDR})"
+  log "Creating Talos cluster: $CLUSTER (provisioner=${TALOS_PROVISIONER:-auto}, cidr=${TALOS_CIDR})"
     set +e
-    talosctl cluster create --name "$CLUSTER_NAME" --workers 0 --wait ${TALOS_PROVISIONER:+--provisioner "$TALOS_PROVISIONER"} --cidr "$TALOS_CIDR"
+  talosctl cluster create --name "$CLUSTER" --workers 0 --wait ${TALOS_PROVISIONER:+--provisioner "$TALOS_PROVISIONER"} --cidr "$TALOS_CIDR"
     rc=$?
     set -e
     if [ $rc -ne 0 ]; then
       err "cluster create failed (rc=$rc). Destroying and retrying with alternate CIDR"
       set +e
-      talosctl cluster destroy --name "$CLUSTER_NAME" ${TALOS_PROVISIONER:+--provisioner "$TALOS_PROVISIONER"}
+  talosctl cluster destroy --name "$CLUSTER" ${TALOS_PROVISIONER:+--provisioner "$TALOS_PROVISIONER"}
       set -e
       ALT_CIDR=${ALT_CIDR:-10.66.0.0/24}
       log "Recreating cluster with alternate CIDR ${ALT_CIDR}"
-      talosctl cluster create --name "$CLUSTER_NAME" --workers 0 --wait ${TALOS_PROVISIONER:+--provisioner "$TALOS_PROVISIONER"} --cidr "$ALT_CIDR"
+  talosctl cluster create --name "$CLUSTER" --workers 0 --wait ${TALOS_PROVISIONER:+--provisioner "$TALOS_PROVISIONER"} --cidr "$ALT_CIDR"
     fi
   # After creation, capture newest context (version sort)
-  ctx=$(kubectl config get-contexts -o name | grep "admin@${CLUSTER_NAME}" | sort -V | tail -n 1 || true)
+  ctx=$(kubectl config get-contexts -o name | grep "admin@${CLUSTER}" | sort -V | tail -n 1 || true)
     if [ -n "$ctx" ]; then
       kubectl config use-context "$ctx" >/dev/null 2>&1 || true
       log "Selected kube context: $ctx"
     fi
     # Force export of KUBECONFIG path for subshells (best effort)
     if [ -z "${KUBECONFIG:-}" ]; then
-      if [ -f "$HOME/.kube/config" ]; then
-        export KUBECONFIG="$HOME/.kube/config"
-      fi
+      export KUBECONFIG="${GN_KUBECONFIG:-$HOME/.guildnet/kubeconfig}"
     fi
   fi
 
   log "Fetching kubeconfig"
-  talosctl kubeconfig --name "$CLUSTER_NAME" >/dev/null 2>&1 || true
+  talosctl kubeconfig --name "$CLUSTER" >/dev/null 2>&1 || true
+  # Move generated repo-local kubeconfig to user-scoped location
+  if [ -s "./kubeconfig" ]; then
+    mkdir -p "$(dirname "$KUBECONFIG")"
+    mv -f "./kubeconfig" "$KUBECONFIG" || true
+  fi
 
   log "Checking cluster health (kube API readiness)"
   total_wait=0; max_wait=300; interval=5
@@ -266,13 +265,14 @@ main() {
     fi
   done
 
-  # Reconcile (self-heal) subnet router DS each run
+  # Optionally reconcile subnet router DS if TS_AUTHKEY provided
   if ! kubectl get nodes >/dev/null 2>&1; then
-    err "kube API still unreachable; aborting before Tailscale DS apply"
+    err "kube API still unreachable; aborting"
     return 1
   fi
-  log "Reconciling Tailscale subnet router (routes=$TS_ROUTES, login=$TS_LOGIN_SERVER)"
-  kubectl -n kube-system apply -f - <<YAML
+  if [[ -n "${TS_AUTHKEY}" ]]; then
+    log "Reconciling Tailscale subnet router (routes=$TS_ROUTES, login=$TS_LOGIN_SERVER)"
+    kubectl -n kube-system apply -f - <<YAML
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -349,15 +349,26 @@ spec:
           path: /dev/net/tun
           type: CharDevice
 YAML
-
-  log "Waiting for Tailscale router to be ready (rollout status)"
-  kubectl -n kube-system rollout status ds/tailscale-subnet-router --timeout=240s || true
-  # Pod self-check
-  if ! kubectl -n kube-system get pods -l app=tailscale-subnet-router >/dev/null 2>&1; then
-    err "Tailscale subnet router pods not found; investigate manually (kubectl -n kube-system get pods)."
+    log "Waiting for Tailscale router to be ready (rollout status)"
+    kubectl -n kube-system rollout status ds/tailscale-subnet-router --timeout=240s || true
+    # Pod self-check
+    if ! kubectl -n kube-system get pods -l app=tailscale-subnet-router >/dev/null 2>&1; then
+      err "Tailscale subnet router pods not found; investigate manually (kubectl -n kube-system get pods)."
+    fi
+    log "Talos cluster ready; Tailscale DS applied (check logs for auth success)."
+  else
+    log "Skipping Tailscale subnet router deploy (TS_AUTHKEY not set)."
   fi
-  log "Talos cluster ready; Tailscale DS applied (check logs for auth success)."
-  log "Kubeconfig: \${KUBECONFIG:-\"~/.kube/config\"}; Namespace: $NAMESPACE; Cluster: $CLUSTER_NAME"
+  log "Kubeconfig: ${KUBECONFIG:-"$HOME/.guildnet/kubeconfig"}; Namespace: $NAMESPACE; Cluster: $CLUSTER"
+  # Ensure RethinkDB service is present and exposed for this local cluster
+  if kubectl get nodes >/dev/null 2>&1; then
+    if [ -x "$ROOT/scripts/rethinkdb-setup.sh" ]; then
+      log "Ensuring RethinkDB is deployed and reachable (local VM cluster)"
+      bash "$ROOT/scripts/rethinkdb-setup.sh" || log "WARNING: rethinkdb-setup encountered an issue"
+    else
+      log "WARNING: rethinkdb-setup.sh not found; skipping DB setup"
+    fi
+  fi
 }
 
 main "$@"

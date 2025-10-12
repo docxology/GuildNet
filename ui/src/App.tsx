@@ -11,6 +11,13 @@ import Toaster from './components/Toaster'
 const Servers = lazy(() => import('./routes/Servers'))
 const ServerDetail = lazy(() => import('./routes/ServerDetail'))
 const Launch = lazy(() => import('./routes/Launch'))
+const Databases = lazy(() => import('./routes/Databases'))
+const DatabaseDetail = lazy(() => import('./routes/DatabaseDetail'))
+const TableView = lazy(() => import('./routes/TableView'))
+const TableSchema = lazy(() => import('./routes/TableSchema'))
+const TableAudit = lazy(() => import('./routes/TableAudit'))
+const TablePermissions = lazy(() => import('./routes/TablePermissions'))
+const TableImportExport = lazy(() => import('./routes/TableImportExport'))
 
 function AppShell(props: RouteSectionProps) {
   const navigate = useNavigate()
@@ -64,6 +71,13 @@ function AppShell(props: RouteSectionProps) {
             >
               Launch
             </A>
+            <A
+              href="/databases"
+              activeClass="text-brand-600"
+              class="hover:underline"
+            >
+              Databases
+            </A>
           </nav>
           <div class="ml-auto">
             <input
@@ -89,6 +103,25 @@ export default function App() {
         <Route path="/" component={Servers} />
         <Route path="/servers/:id" component={ServerDetail} />
         <Route path="/launch" component={Launch} />
+        <Route path="/databases" component={Databases} />
+        <Route path="/databases/:dbId" component={DatabaseDetail} />
+        <Route path="/databases/:dbId/tables/:table" component={TableView} />
+        <Route
+          path="/databases/:dbId/tables/:table/schema"
+          component={TableSchema}
+        />
+        <Route
+          path="/databases/:dbId/tables/:table/audit"
+          component={TableAudit}
+        />
+        <Route
+          path="/databases/:dbId/tables/:table/permissions"
+          component={TablePermissions}
+        />
+        <Route
+          path="/databases/:dbId/tables/:table/import-export"
+          component={TableImportExport}
+        />
       </Route>
     </Router>
   )

@@ -91,38 +91,46 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if subPath == "" || !strings.HasPrefix(subPath, "/") || to == "" {
+	// When using server-aware form with API proxy available, skip strict host:port validation.
+	skipTargetValidation := serverIDForAPI != "" && p.opts.APIProxy != nil
+
+	if subPath == "" || !strings.HasPrefix(subPath, "/") || (to == "" && !skipTargetValidation) {
 		if p.opts.Logger != nil {
 			p.opts.Logger.Printf("proxy bad-request req_id=%s to=%q path=%q url=%s", reqID, to, subPath, r.URL.String())
 		}
 		http.Error(w, "missing or invalid to/path", http.StatusBadRequest)
 		return
 	}
-	// validate target
-	host, ps, err := net.SplitHostPort(to)
-	if err != nil {
-		if p.opts.Logger != nil {
-			p.opts.Logger.Printf("proxy invalid-to req_id=%s to=%q err=%v", reqID, to, err)
+	// validate target (unless skipping due to API proxy server mode)
+	if !skipTargetValidation {
+		host, ps, err := net.SplitHostPort(to)
+		if err != nil {
+			if p.opts.Logger != nil {
+				p.opts.Logger.Printf("proxy invalid-to req_id=%s to=%q err=%v", reqID, to, err)
+			}
+			http.Error(w, "invalid to", http.StatusBadRequest)
+			return
 		}
-		http.Error(w, "invalid to", http.StatusBadRequest)
-		return
-	}
-	_ = host
-	port, err := strconv.Atoi(ps)
-	if err != nil || port <= 0 || port > 65535 {
-		if p.opts.Logger != nil {
-			p.opts.Logger.Printf("proxy invalid-port req_id=%s to=%q err=%v", reqID, to, err)
+		_ = host
+		port, err := strconv.Atoi(ps)
+		if err != nil || port <= 0 || port > 65535 {
+			if p.opts.Logger != nil {
+				p.opts.Logger.Printf("proxy invalid-port req_id=%s to=%q err=%v", reqID, to, err)
+			}
+			http.Error(w, "invalid port", http.StatusBadRequest)
+			return
 		}
-		http.Error(w, "invalid port", http.StatusBadRequest)
-		return
-	}
-	// Allowlist removed: no special restriction on private addresses.
-
-	// Default scheme by port if not provided
-	if scheme == "" {
-		if port == 443 || port == 8443 {
-			scheme = "https"
-		} else {
+		// Default scheme by port if not provided
+		if scheme == "" {
+			if port == 443 || port == 8443 {
+				scheme = "https"
+			} else {
+				scheme = "http"
+			}
+		}
+	} else {
+		// server-aware with API proxy: default scheme if omitted
+		if scheme == "" {
 			scheme = "http"
 		}
 	}
@@ -136,41 +144,36 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	targetURL := &url.URL{Scheme: scheme, Host: to, Path: subPath}
 
-	// If using API server proxy and destination looks like a Service, route via API instead of direct dial.
-	// Simplified: always use ReverseProxy below; APIProxy will be used via Transport/Director when configured.
-
-	// custom transport using tsnet dialer
-	// Choose transport: use API server proxy when available for cluster destinations.
-	var transport http.RoundTripper
+	// Prepare transports: API proxy transport (if available) and standard transport for direct/pf
+	var apiRT http.RoundTripper
+	var setAPIDirector func(req *http.Request, scheme, hostport, subPath string)
 	if p.opts.APIProxy != nil {
-		if rt, setDirector, ok := p.opts.APIProxy(); ok {
-			transport = rt
-			// Build proxy URL through API server when using APIProxy.
-			// director below will set URL accordingly via setDirector.
-			_ = setDirector
+		if rt, set, ok := p.opts.APIProxy(); ok {
+			apiRT = rt
+			setAPIDirector = set
 		}
 	}
-	if transport == nil {
-		transport = &http.Transport{
-			Proxy: nil,
-			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-				c, err := p.opts.Dial(ctx, network, address)
-				if err != nil {
-					return nil, err
-				}
-				conn, ok := c.(net.Conn)
-				if !ok {
-					return nil, errors.New("dialer returned non-Conn")
-				}
-				return conn, nil
-			},
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: p.opts.Timeout,
-			// Disable HTTP/2 to avoid sporadic INTERNAL_ERROR on some upstreams
-			ForceAttemptHTTP2: false,
-			// Allow self-signed certs for in-cluster agents
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		}
+	stdRT := &http.Transport{
+		Proxy: nil,
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			c, err := p.opts.Dial(ctx, network, address)
+			if err != nil {
+				return nil, err
+			}
+			conn, ok := c.(net.Conn)
+			if !ok {
+				return nil, errors.New("dialer returned non-Conn")
+			}
+			return conn, nil
+		},
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: p.opts.Timeout,
+		ForceAttemptHTTP2:     false,
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+	}
+	transport := http.RoundTripper(stdRT)
+	if apiRT != nil {
+		transport = &dualTransport{std: stdRT, api: apiRT}
 	}
 
 	rp := &httputil.ReverseProxy{
@@ -185,23 +188,30 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			} else {
 				req.Header.Set("X-Forwarded-Proto", "http")
 			}
-			if p.opts.APIProxy != nil {
-				if rt, setDirector, ok := p.opts.APIProxy(); ok && rt != nil && setDirector != nil {
-					// Prefer pods proxy to avoid Service readiness/endpoint races
-					// and include the logical server ID for better pod/service discovery.
-					// These must be set BEFORE computing the API path so setDirector can read them.
-					req.Header.Set("X-Guild-Prefer-Pod", "1")
-					if serverIDForAPI != "" {
-						req.Header.Set("X-Guild-Server-ID", serverIDForAPI)
+			// add forwarded prefix for upstreams (code-server) to generate correct links
+			if strings.HasPrefix(r.URL.Path, "/proxy/") {
+				// compute proxy base prefix up to and including the server id segment
+				prefix := r.URL.Path
+				if i := strings.Index(prefix, "/proxy/server/"); i >= 0 {
+					// /proxy/server/{id}/...
+					parts := strings.SplitN(strings.TrimPrefix(prefix[i:], "/proxy/server/"), "/", 2)
+					if len(parts) > 0 && parts[0] != "" {
+						req.Header.Set("X-Forwarded-Prefix", "/proxy/server/"+parts[0])
 					}
-					// Let APIProxy set the URL to API server proxy path based on headers.
-					setDirector(req, targetURL.Scheme, targetURL.Host, targetURL.Path)
-				} else {
-					req.URL.Scheme = targetURL.Scheme
-					req.URL.Host = targetURL.Host
-					req.Host = targetURL.Host
-					req.URL.Path = singleJoiningSlash("", targetURL.Path)
+				} else if i := strings.Index(prefix, "/proxy/"); i >= 0 {
+					// legacy /proxy/{to}/...
+					parts := strings.SplitN(strings.TrimPrefix(prefix[i:], "/proxy/"), "/", 2)
+					if len(parts) > 0 && parts[0] != "" {
+						req.Header.Set("X-Forwarded-Prefix", "/proxy/"+parts[0])
+					}
 				}
+			}
+			if setAPIDirector != nil {
+				// Include the logical server ID for service/pod discovery by API proxy layer
+				if serverIDForAPI != "" {
+					req.Header.Set("X-Guild-Server-ID", serverIDForAPI)
+				}
+				setAPIDirector(req, targetURL.Scheme, targetURL.Host, targetURL.Path)
 			} else {
 				req.URL.Scheme = targetURL.Scheme
 				req.URL.Host = targetURL.Host
@@ -217,34 +227,6 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// Best-effort header sanitization; hop-by-hop headers will be stripped by ReverseProxy internally too.
 		},
 		Transport: transport,
-		ModifyResponse: func(resp *http.Response) error {
-			if p.opts.Logger != nil {
-				p.opts.Logger.Printf("proxy resp req_id=%s status=%d method=%s to=%s path=%s url=%s", reqID, resp.StatusCode, r.Method, to, subPath, r.URL.String())
-			}
-			// Only rewrite Location to stay under proxy base; avoid CSP/cookie changes.
-			if loc := resp.Header.Get("Location"); loc != "" && strings.HasPrefix(r.URL.Path, "/proxy/") {
-				baseHref := "/proxy/" + to + "/"
-				if serverIDForAPI != "" {
-					baseHref = "/proxy/server/" + url.PathEscape(serverIDForAPI) + "/"
-				}
-				resp.Header.Set("Location", rewriteLocation(loc, baseHref))
-			}
-			// Tweak Set-Cookie for iframe compatibility when proxied: drop Domain, ensure Secure+SameSite=None, and add Partitioned.
-			if strings.HasPrefix(r.URL.Path, "/proxy/") {
-				cookies := resp.Header.Values("Set-Cookie")
-				if len(cookies) > 0 {
-					resp.Header.Del("Set-Cookie")
-					baseHref := "/proxy/" + to + "/"
-					if serverIDForAPI != "" {
-						baseHref = "/proxy/server/" + url.PathEscape(serverIDForAPI) + "/"
-					}
-					for _, c := range cookies {
-						resp.Header.Add("Set-Cookie", rewriteSetCookieForIframe(c, baseHref))
-					}
-				}
-			}
-			return nil
-		},
 		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, err error) {
 			if p.opts.Logger != nil {
 				p.opts.Logger.Printf("proxy error req_id=%s method=%s url=%s to=%s path=%s err=%v", reqID, req.Method, req.URL.String(), to, subPath, err)
@@ -253,6 +235,47 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		},
 		FlushInterval: 100 * time.Millisecond,
 		BufferPool:    nil,
+	}
+
+	// Rewrite response headers for iframe/subpath compatibility (Location, Set-Cookie, CSP)
+	rp.ModifyResponse = func(resp *http.Response) error {
+		// Determine baseHref from incoming path
+		base := "/proxy"
+		pth := r.URL.Path
+		if strings.HasPrefix(pth, "/proxy/server/") {
+			parts := strings.SplitN(strings.TrimPrefix(pth, "/proxy/server/"), "/", 2)
+			if len(parts) > 0 && parts[0] != "" {
+				base = "/proxy/server/" + parts[0]
+			}
+		} else if strings.HasPrefix(pth, "/proxy/") {
+			parts := strings.SplitN(strings.TrimPrefix(pth, "/proxy/"), "/", 2)
+			if len(parts) > 0 && parts[0] != "" {
+				base = "/proxy/" + parts[0]
+			}
+		}
+		// COOP/COEP safe for embedding
+		resp.Header.Del("X-Frame-Options")
+		resp.Header.Set("Cross-Origin-Opener-Policy", "same-origin-allow-popups")
+		// Avoid requiring cross-origin isolation which can break iframe subresources
+		resp.Header.Del("Cross-Origin-Embedder-Policy")
+		resp.Header.Set("Cross-Origin-Resource-Policy", "cross-origin")
+		// Relax CSP for frame-ancestors; if none, add permissive
+		if csp := resp.Header.Get("Content-Security-Policy"); csp != "" {
+			resp.Header.Set("Content-Security-Policy", relaxFrameAncestors(csp))
+		} else {
+			resp.Header.Set("Content-Security-Policy", "frame-ancestors *")
+		}
+		if loc := resp.Header.Get("Location"); loc != "" {
+			resp.Header.Set("Location", rewriteLocation(loc, base))
+		}
+		// Cookie adjustments for code-server session on subpath
+		if cookies := resp.Header.Values("Set-Cookie"); len(cookies) > 0 {
+			resp.Header.Del("Set-Cookie")
+			for _, c := range cookies {
+				resp.Header.Add("Set-Cookie", rewriteSetCookieForIframe(c, base))
+			}
+		}
+		return nil
 	}
 
 	// Serve via context with timeout
@@ -329,22 +352,6 @@ func relaxFrameAncestors(csp string) string {
 	return strings.Join(out, "; ")
 }
 
-// ensureCookieIframeOK adds Secure and SameSite=None if they are missing.
-// We avoid adding Partitioned or overriding upstream's stricter settings.
-func ensureCookieIframeOK(header string) string {
-	if header == "" {
-		return header
-	}
-	lower := strings.ToLower(header)
-	if !strings.Contains(lower, " secure") && !strings.Contains(lower, ";secure") {
-		header += "; Secure"
-	}
-	if !strings.Contains(lower, "samesite=") {
-		header += "; SameSite=None"
-	}
-	return header
-}
-
 // rewriteSetCookieForIframe adjusts Set-Cookie for proxied iframe contexts:
 // - removes Domain attribute to scope to current host
 // - ensures Secure and SameSite=None
@@ -419,4 +426,16 @@ func rewriteSetCookieForIframe(h string, baseHref string) string {
 		out = append(out, "Path="+path)
 	}
 	return strings.Join(out, "; ")
+}
+
+// dualTransport chooses API transport for Kubernetes API server endpoints and std for direct/PF/ClusterIP.
+type dualTransport struct{ std, api http.RoundTripper }
+
+func (d *dualTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	p := req.URL.Path
+	// Use API transport only when talking to the kube-apiserver endpoints
+	if d.api != nil && (strings.HasPrefix(p, "/api/") || strings.HasPrefix(p, "/apis/")) {
+		return d.api.RoundTrip(req)
+	}
+	return d.std.RoundTrip(req)
 }

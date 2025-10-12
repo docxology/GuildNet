@@ -15,12 +15,12 @@ echo "Building image ${IMG_NAME} from images/agent..."
 docker buildx build --load -t "${IMG_NAME}" "${ROOT_DIR}/images/agent"
 
 if command -v kind >/dev/null 2>&1; then
-  CLUSTER_NAME=${KIND_CLUSTER:-kind}
-  if kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
-    echo "Loading image into kind cluster '${CLUSTER_NAME}'..."
-    kind load docker-image "${IMG_NAME}" --name "${CLUSTER_NAME}"
+  KIND_CLUSTER_NAME=${KIND_CLUSTER:-kind}
+  if kind get clusters 2>/dev/null | grep -q "^${KIND_CLUSTER_NAME}$"; then
+    echo "Loading image into kind cluster '${KIND_CLUSTER_NAME}'..."
+    kind load docker-image "${IMG_NAME}" --name "${KIND_CLUSTER_NAME}"
   else
-    echo "kind cluster '${CLUSTER_NAME}' not found; skipping kind load."
+    echo "kind cluster '${KIND_CLUSTER_NAME}' not found; skipping kind load."
   fi
 else
   echo "kind not installed; skipping kind load."

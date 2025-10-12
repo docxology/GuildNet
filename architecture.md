@@ -1,29 +1,26 @@
 ## GuildNet Architecture
 
-GuildNet runs ephemeral or semi-persistent Workspaces (container images) in a Kubernetes cluster, surfaced through a single HTTPS origin provided by the Host App (Go + embedded Tailscale/tsnet). The Host App creates a custom `Workspace` resource; an embedded controller reconciles each `Workspace` into a Deployment and Service. All browser interactions terminate at the Host App, which exposes an API and a reverse proxy for per‑Workspace UIs.
+GuildNet provides a single‑origin HTTPS Host App that manages Kubernetes Workspaces and a shared Database, exposing APIs, reverse proxying per‑Workspace UIs (e.g., IDEs), and offering optional tailnet access via Tailscale (tsnet). The Host App embeds a controller that reconciles a custom `Workspace` resource into Deployments and Services. All browser traffic terminates on the Host App for a consistent security boundary.
 
-### Component Overview Diagram
+### Component Overview
 
 ```mermaid
 flowchart LR
-  subgraph Browser[Browser / UI]
-    UI["React/Vite App\n(Single Origin HTTPS)"]
+  subgraph Browser[Browser]
+    UI["Web UI\n(React/Vite via single origin)"]
   end
 
   subgraph HostApp[Host App]
     direction TB
     API["API Layer\n(/api/*)"]
     RP["Reverse Proxy\n(/proxy/*)"]
-    SSE[SSE Logs]
+    SSE[SSE Streams]
     OP["Embedded Operator\n(controller-runtime)"]
-    TS[tsnet Listener\n:443]
+    DBAPI["Database API\n(RethinkDB)"]
+    TS["tsnet Listener\n:443 (tailnet)"]
   end
 
-  subgraph Tailscale[Tailscale / Headscale]
-    Tailnet[(Tailnet Network)]
-  end
-
-  subgraph K8s[Kubernetes Cluster]
+  subgraph K8s[Kubernetes]
     APIS[Kubernetes API Server]
     CRD[(Workspace CRD)]
     subgraph Recon[Reconciled Objects]
@@ -33,138 +30,94 @@ flowchart LR
     end
   end
 
-  subgraph WorkspaceObj[Workspace Objects]
-    WS1[Workspace: code-server-abc12]
-    WS2[Workspace: alpine-def34]
+  subgraph Data[Database]
+    RDB["RethinkDB Service\n(28015)"]
   end
 
   UI -->|"HTTPS (single origin)"| API
   UI -->|Iframe / IDE| RP
-  API -->|POST /api/jobs| OP
-  OP -->|Create CR| CRD
-  CRD -->|Watch/Reconcile| OP
-  OP -->|Apply| DEP
-  OP -->|Apply| SVC
+
+  API -->|Create Workspace| CRD
+  OP -->|Reconcile| DEP
+  OP -->|Reconcile| SVC
   DEP --> POD
-  POD -->|Ready status| OP
-  OP -->|Status update| CRD
-  API -->|"List/Detail (via Deployments/CRD planned)"| CRD
-  API -->|"Logs (pod)"| APIS
-  RP -->|"Pod Proxy (default)"| APIS
-  RP -->|Alt: Direct ClusterIP| SVC
-  TS --> Tailnet
-  UI -->|Remote device access over tailnet| TS
-  TS -->|Encrypted transport| HostApp
-  HostApp -->|"Outbound cluster API (client-go)"| APIS
-  APIS -->|Pod Exec/Logs/Proxy| RP
-  SVC --> POD
-  
-  classDef k8s fill:#0d9488,stroke:#064e3b,stroke-width:1px,color:#f0fdfa;
-  classDef net fill:#334155,stroke:#1e293b,stroke-width:1px,color:#f1f5f9;
-  classDef ws fill:#7e22ce,stroke:#581c87,stroke-width:1px,color:#fdf4ff;
+  POD -->|Ready| OP
+  OP -->|Status| CRD
+
+  API -->|Kubernetes client-go| APIS
+  RP -->|Pod Proxy| APIS
+  RP -->|Alt: Direct Service| SVC
+
+  DBAPI -->|Service discovery| APIS
+  DBAPI -->|RPC| RDB
+
+  TS --> HostApp
+  HostApp -->|Encrypted tailnet| TS
+
+  classDef k8s fill:#0d9488,stroke:#064e3b,stroke-width:1px,color:#f0fdfa
+  classDef db fill:#1d4ed8,stroke:#1e3a8a,stroke-width:1px,color:#eff6ff
+  classDef net fill:#334155,stroke:#1e293b,stroke-width:1px,color:#f8fafc
   class APIS,DEP,SVC,POD,CRD k8s
-  class Tailnet net
-  class WS1,WS2 ws
+  class RDB db
+  class TS net
 ```
 
-#### Diagram Notes
-* Pod proxy (API server path) is the primary access method; direct ClusterIP over tsnet is an optional fallback when routing permits.
-* The Operator runs inside the Host App process; no separate controller deployment.
-* Multiple `Workspace` resources are independently reconciled into their own Deployments and Services.
-* The single HTTPS origin ensures cookies, future auth headers, and iframe content share one security context.
-* Tailscale provides remote, secure access without requiring a public ingress.
+Key properties
 
+- Single HTTPS origin: UI, APIs, logs, and proxied IDEs share one origin for cookies and security headers.
+- Embedded Operator: a controller inside the Host App manages `Workspace` resources → Deployments and Services.
+- Flexible reachability: traffic to Pods can go through the Kubernetes API server’s pod proxy, a Service ClusterIP/LB, or a managed port‑forward when needed.
+- Database integration: a RethinkDB service is discovered from Kubernetes and exposed via Host App APIs for listing, creating databases, tables, and row operations.
 
-### Capabilities
-* Launch container images by creating a `Workspace` resource with minimal required fields (primarily `spec.image`).
-* Provide a single-origin HTTPS proxy for all Workspace traffic (including iframe-based IDEs) via the Host App.
-* Support multi-device access over a tailnet (Tailscale/Headscale) without built-in per‑user authentication.
-* Apply capability-style permission gating for destructive actions (e.g., stop-all).
-* Stabilize first-start behavior for slower images (e.g., code-server) via tuned readiness and liveness probes.
-* Allow multiple simultaneous instances of the same image through unique, auto‑suffixed names.
+### Connectivity & Discovery
 
-### Unimplemented Features
-* Authentication / per-user access control (rely on tailnet + Kubernetes RBAC).
-* CRD Conditions (only phase and counts are exposed).
-* Metrics, tracing, auditing.
-* External ingress automation and DNS beyond optional per‑workspace Ingress.
-* Persistent storage provisioning / volume claims.
-* Advanced policy (image and port constraints, concurrency limits, resource quotas per user).
-* Configurable probe timing and startup probes via API (static defaults in use).
-* Tightened CRD schema for `spec.env` (permissive; sanitation occurs in operator).
+Kubernetes client configuration (client‑go)
 
+- In‑cluster: automatic when Host App runs inside the cluster.
+- Out‑of‑cluster: reads kubeconfig (default `~/.guildnet/kubeconfig`).
+- Proxy‑aware: if `HOSTAPP_API_PROXY_URL` is set (e.g., http://127.0.0.1:8001 from `kubectl proxy`), client‑go uses that endpoint for discovery and all Kubernetes API calls.
+- NO_PROXY: recommended to include `localhost,127.0.0.1,10.0.0.0/8,.cluster.local` to avoid system proxies interfering with cluster traffic.
 
-### Components
+Workspace access (reverse proxy)
 
-- How to access the UI
-  - Local development: open `https://127.0.0.1:8080`. The Host App proxies the Vite dev server (which listens on `https://localhost:5173`) so the browser uses a single HTTPS origin.
-  - Tailnet: open `https://<hostapp-ts-fqdn>:443`. Ensure your server certificate includes your tailnet FQDN/IP to avoid warnings, or front the Host App with a trusted proxy.
+- Resolution order for `/proxy/server/{id}/...`:
+  1. Target the Workspace Service (ClusterIP/LB) by labels/id.
+  2. If the server declares `Env.AGENT_HOST`, use it (infers scheme by port: 8443 → https, else http).
+  3. Fallback `<dns1123(name)>.${namespace}.svc.cluster.local` with a well‑known port (prefers 8080, else 8443, else first).
+  4. When direct dialing is not viable, use the Kubernetes API server Pod Proxy.
+  5. As a last resort, open a local SPDY port‑forward against the Pod and route via 127.0.0.1:
+- Dual transports: the proxy uses a standard transport for direct/PF paths, and a Kubernetes API transport for pod‑proxy paths, with header rewrites tuned for iframe use (Location, Set‑Cookie, CSP, COOP/COEP).
 
-- Client UI (Vite + SolidJS)
-  - Launch form posts to the Host App; simple defaults, advanced options on demand.
-  - Servers list/detail with logs and an IDE tab (iframe via the proxy).
-  - API base configured via `VITE_API_BASE`; dev UI is also reverse-proxied by the Host App for same-origin dev.
+Database (RethinkDB) service discovery
 
-#### Host App (Go + tsnet)
-  - Local TLS listener (default `LISTEN_LOCAL=127.0.0.1:8080`) and a tsnet listener on `:443` inside the tailnet.
-  - CORS is restricted to a single origin via `FRONTEND_ORIGIN` (for dev use the Host App origin `https://127.0.0.1:8080`).
-  - Endpoints:
-    - `GET /healthz` — liveness
-    - `GET /api/ui-config` — minimal UI config (e.g., name)
-    - `GET /api/images` — list deployable images (server-sourced presets)
-    - `GET /api/image-defaults?image=<ref>` — suggested env/ports for known images
-    - `GET /api/servers` — list managed servers (from Kubernetes)
-    - `GET /api/servers/{id}` — server detail
-    - `GET /api/servers/{id}/logs?level=&limit=` — recent log lines
-    - `POST /api/jobs` — create/update a Deployment + Service from a JobSpec
-    - `POST /api/admin/stop-all` (also `/api/stop-all`) — delete all managed workloads
-    - `GET /sse/logs?target=&level=&tail=` — logs over Server-Sent Events (tail + heartbeats)
-    - `GET /api/proxy-debug` — echo helper for diagnosing proxy inputs
-    - Reverse proxy:
-      - `/proxy?to=host:port&path=/...` (query form)
-      - `/proxy/{to}/{rest}` (path form)
-      - `/proxy/server/{id}/{rest}` (server-aware form)
-  - Dev UI reverse-proxy: requests to `/` are forwarded to the Vite dev server (which listens on `https://localhost:5173`), while `/api/*`, `/proxy/*`, and `/healthz` are handled by the Host App. In practice, you should open `https://127.0.0.1:8080` in the browser; the Host App will proxy the UI for a single, secure origin.
+- Address precedence:
+  1. `RETHINKDB_ADDR` (host:port) explicit override.
+  2. If inside the cluster: `RETHINKDB_SERVICE_HOST`/`PORT` env vars, else `<service>.<namespace>.svc.cluster.local:28015`.
+  3. Outside the cluster via kubeconfig:
+     - Prefer Service LoadBalancer IP/hostname.
+     - Fallback to NodePort + a node IP (ExternalIP, else InternalIP).
+     - Fallback to Service ClusterIP if routed (e.g., via a tailnet subnet router).
+     - If all else fails, and a Ready Pod exists, establish a temporary SPDY port‑forward to the Pod’s 28015 and use 127.0.0.1:<localport>.
+- Robustness: short, bounded connection attempts; retries/backoff for `DBList`, `DBCreate`, and meta‑table creation to tolerate leader or startup timing.
 
-#### Tailscale (Headscale/Tailscale)
-  - The Host App authenticates via tsnet using configured login server and auth key.
-  - Provides tailnet transport; recommend a subnet router for reaching cluster CIDRs.
+### Control Plane and Reconciliation
 
-#### Kubernetes Cluster, Workspace CRD & Embedded Operator
-  - The Host App uses in-cluster config when running inside the cluster, or falls back to `KUBECONFIG` (client-go) when outside.
-  - Launch requests (`POST /api/jobs`) create a `Workspace` custom resource.
-  - An embedded controller-runtime manager watches `Workspace` objects and reconciles each into a Deployment and Service (and optional Ingress or LoadBalancer) following defaulting and hardening rules.
-  - Status (ready replicas, service DNS, proxy resolution) is written to `Workspace.status` and surfaced via server list/detail endpoints; additional direct Workspace endpoints can be added.
+- Custom Resource: `Workspace` with `spec.image`, optional env and ports.
+- Operator:
+  - Reconciles each `Workspace` to a Deployment and Service.
+  - Security: non‑root, seccomp `RuntimeDefault`, `allowPrivilegeEscalation=false`, drop `ALL` capabilities.
+  - Probes: readiness and liveness on `/` (first port), extended timings for slow starts; no StartupProbe.
+  - Ports: heuristics for known IDE images (e.g., code‑server → 8080); otherwise expose 8080 and 8443.
+  - Env: inject `PORT=8080` by default; set `PASSWORD` for code‑server if not provided.
+  - Scheduling: tolerations for control‑plane taints (single‑node dev clusters).
+  - Service: ClusterIP by default; LoadBalancer when `WORKSPACE_LB=true`; optional MetalLB address pool via `WORKSPACE_LB_POOL`.
+  - Optional Ingress: when `WORKSPACE_DOMAIN` is set and LB disabled; TLS via `CERT_MANAGER_ISSUER` if configured.
+  - Status: phase, ready replicas, service DNS, and a proxy target hint.
+  - Conflict handling: idempotent reconciliation; subsequent loops converge changes.
 
-#### Workspace Images
-  - Typically code-server behind Caddy, listening on HTTP 8080; other images are supported by configuration.
+### Request Flows
 
-
-### High-Level Data Flow
-Browser → Host App API → Workspace CR (Kubernetes API) → Operator Reconcile → Deployment + Service → Host App Reverse Proxy → Browser iframe.
-
-Notes
-- Browser ↔ Host App uses HTTPS on a single origin.
-- The Host App dials cluster services via tsnet; for cluster-internal access it can go direct (ClusterIP) or via the Kubernetes API server pod proxy.
-- The reverse proxy preserves method/body and handles WebSockets; cookies and redirects are adjusted for iframe use.
-
-Multi-device model
-- The Host App serves the UI locally on `https://127.0.0.1:8080` and on `:443` over the tailnet. Any device in the tailnet can open the URL and operate against the same Kubernetes cluster.
-- The Host App’s kubeconfig determines cluster access and permissions. There is no built‑in per-user authentication; tailnet boundaries and Kubernetes RBAC provide access control.
-
-Environment assumptions
-- A Kubernetes cluster is reachable (in-cluster config or `KUBECONFIG`).
-- A Tailscale/Headscale control plane is available for the Host App’s tsnet.
-- For private Service access by ClusterIP from outside the cluster, a Tailscale subnet router (advertising cluster CIDRs) is recommended.
-
-Kubernetes reachability modes
-- API server Pod Proxy (default) — the Host App uses client‑go to request `.../pods/<pod>:<port>/proxy` to reach the container. This works even when ClusterIP ranges are not routed to the Host machine.
-- Direct ClusterIP over tsnet — set `HOSTAPP_DISABLE_API_PROXY=true` to bypass the API proxy and dial the ClusterIP:port via tsnet. This requires a route (for example, a Tailscale subnet router advertising the cluster CIDRs). Useful to validate WebSockets and long‑lived connections end‑to‑end.
-
-
-### Workspace Launch Flow
-
-The launch UI deploys a container in the cluster (Deployment and Service) and makes it reachable through the Host App proxy.
+Workspace lifecycle
 
 ```mermaid
 sequenceDiagram
@@ -172,219 +125,119 @@ sequenceDiagram
   participant U as UI (Browser)
   participant B as Host App (API)
   participant K as Kubernetes API
-  participant P as Agent Pod
+  participant O as Operator (in-process)
 
   U->>B: POST /api/jobs { image, env, ... }
-  B-->>U: 202 Accepted { id }
-  Note over B: Create Workspace CR (metadata.name auto‑suffixed for uniqueness, labels guildnet.io/managed=true & guildnet.io/id)
-  B->>K: Create Workspace (CRD)
+  B-->>U: 202 { id }
+  B->>K: Create Workspace (CR)
   K-->>B: 201 Created
-  B->>K: (Operator) Reconcile → Create/Update Deployment & Service
-  K-->>B: 201/200 OK
-  K-->>P: Schedule and start Pod
-  P-->>B: Ready (liveness/readiness on "/" via HTTP)
-  B-->>U: Server transitions to running in list/detail
+  O->>K: Apply Deployment & Service
+  K-->>O: OK
+  K-->>B: Pod becomes Ready, Service endpoints populated
+  B-->>U: Server shows Running, IDE iframe available via /proxy
 ```
 
-### Operator Defaults & Hardening
-Applied during reconciliation of a `Workspace`:
-* Image: `spec.image` required (no implicit default).
-* Ports:
-  * If image resembles code-server (heuristic) expose only 8080.
-  * Otherwise expose 8080 (HTTP) and 8443 (HTTPS).
-  * Readiness/Liveness target `/` on first port (usually 8080).
-* Probes: Extended initial delay and period for slower first-start images to reduce churn. No StartupProbe is configured.
-* Environment:
-  * Blank / empty-name env entries are sanitized out (both API handler and operator layer).
-  * Inject `PORT=8080` if missing.
-  * Inject `PASSWORD` from `AGENT_DEFAULT_PASSWORD` (or `changeme`) if the image pattern suggests code-server and it's unset.
-* Security Context:
-  * Non-root user, drop ALL capabilities, `seccompProfile: RuntimeDefault`, `allowPrivilegeEscalation=false`.
-* Scheduling:
-  * Explicit toleration added for single-node (control-plane taint) dev clusters; reconciler overwrites to prevent drift accumulation.
-* Service:
-  * Mirrors container ports.
-  * Type ClusterIP by default; LoadBalancer if `WORKSPACE_LB` set (MetalLB assumed). Optional pool via `WORKSPACE_LB_POOL`.
-* Optional Ingress (when `WORKSPACE_DOMAIN` set and no LB):
-  * Uses `INGRESS_CLASS_NAME` (default `nginx`).
-  * If `CERT_MANAGER_ISSUER` present, requests a TLS cert (`workspace-<id>-tls`).
-  * Optional NGINX auth annotations via `INGRESS_AUTH_URL` & `INGRESS_AUTH_SIGNIN`.
-* Status:
-  * `status.phase` (e.g., Pending → Running), `status.readyReplicas`, `status.serviceDNS`, `status.proxyTarget` updated each reconcile.
-* Conflict Handling:
-  * Relies on the next reconcile after Deployment update conflicts.
+Proxy to Workspace
 
+```mermaid
+flowchart LR
+  B[Browser] -->|GET /proxy/server/:id/...| H[Host App]
+  H -->|Service ClusterIP/LB| S[(Service)]
+  H -->|Pod Proxy via APIS| A[Kubernetes API]
+  H -->|Local PF to Pod| L[127.0.0.1:port]
+```
 
-### Access Flow (Proxy → Workspace)
-
-The server detail page’s IDE tab loads an iframe whose src points at the Host App’s `/proxy`. The Host App resolves the upstream and streams the agent’s UI back to the browser.
+Database operations
 
 ```mermaid
 sequenceDiagram
   autonumber
-  participant U as UI (Browser)
-  participant B as Host App (Reverse Proxy)
-  participant T as tsnet (Tailnet dialer)
-  participant K as Kubernetes API (pod proxy)
-  participant S as Service/Pod upstream
-  participant P as Agent Pod
+  participant U as UI
+  participant B as Host App (DB API)
+  participant K as Kubernetes API
+  participant R as RethinkDB Service
 
-  U->>B: GET /proxy/server/{id}/ (HTTPS)
-  Note over B: Resolve upstream: Service ClusterIP/port -> env.AGENT_HOST -> name-based FQDN
-  alt API server pod proxy enabled
-    B->>K: Proxy to Pod via /api/v1/namespaces/{ns}/pods/{pod}:{port}/proxy
-    K->>P: Forward HTTP to container port (e.g., 8080)
-  else direct tsnet dial
-    B->>T: Dial ClusterIP:port (or host:port) over tailnet
-    T->>S: Route to Service/Pod
+  U->>B: GET /api/db
+  B->>K: Discover Service address (LB/NodePort/ClusterIP)
+  alt direct dial works
+    B->>R: TCP 28015
+  else PF fallback
+    B->>K: SPDY port-forward to Pod:28015
+    B->>R: TCP 127.0.0.1:<pf>
   end
-  P-->>B: HTTP responses & WS upgrades
-  B-->>U: Streams IDE content over the same HTTPS origin
+  R-->>B: DBList
+  B-->>U: Databases
 ```
 
-#### Browser Integration
-- The iframe src is the Host App’s HTTPS origin, avoiding mixed content.
-- The reverse proxy adjusts redirects (Location) and Set-Cookie for iframe scenarios (drops Domain, ensures `Secure` and `SameSite=None`, adds `Partitioned`, and normalizes Path).
+### API Surface (selected)
 
+Core
 
-### Proxy Resolution Order
+- GET `/healthz` — liveness
+- GET `/api/ui-config` — minimal UI config
+- GET `/api/images` — presets; GET `/api/image-defaults?image=<ref>`
+- GET `/api/servers` — list servers; GET `/api/servers/{id}`; logs via `GET /api/servers/{id}/logs` and `GET /sse/logs`
+- POST `/api/jobs` — create a Workspace
+- POST `/api/admin/stop-all` — delete all managed workloads
+- Reverse proxy: `/proxy?to=host:port&path=/...`, `/proxy/{to}/{rest}`, `/proxy/server/{id}/{rest}`
 
-- Resolution order for `/proxy/server/{id}/...`:
-  1) Try direct Service ClusterIP + port from Kubernetes by id/name or label `guildnet.io/id`.
-  2) If the server has `Env.AGENT_HOST`:
-     - If it includes `host:port`, infer scheme: 8443 → https, otherwise http.
-     - If it’s a bare host, pick a port from the known server ports: prefer 8080 then 8443, else first; infer scheme accordingly.
-  3) Fallback: derive host from server name as `<dns1123(name)>.default.svc.cluster.local`, choose port as above, and infer scheme.
-  4) If none of the above yields a target, an error is returned instructing to set `Env.AGENT_HOST` or ensure a Service/ports exist.
+Database
 
-- Explicit form `/proxy?to=host:port&path=/...` is also available.
+- GET `/api/db/health` — {status, addr, error?}
+- GET `/api/db` — list databases (per org)
+- POST `/api/db` — create database {id, name?, description?}
+- GET `/api/db/:dbId` — database info
+- DELETE `/api/db/:dbId` — drop database
+- Table/rows endpoints under `/api/db/:dbId/tables/...` including import, query, insert, update, delete
+- GET `/sse/db/:dbId/tables/:table/changes` — changefeed (MVP)
 
-* No allowlist: rely on tailnet + cluster RBAC.
+### Security and Headers
 
-Certificates and hostnames for multi-device access
-- The Host App serves HTTPS using, in order of preference:
-  1) `./certs/server.crt|server.key` (recommended for dev with your own CA)
-  2) `./certs/dev.crt|dev.key` (repo dev certs)
-  3) `~/.guildnet/state/certs/server.crt|server.key` (auto‑generated self‑signed)
-- For other devices in the tailnet to connect without warnings, include the Host App’s tailnet FQDN and/or Tailscale IP in the server cert SANs. Use `scripts/generate-server-cert.sh -H "localhost,127.0.0.1,::1,<ts-fqdn>,<ts-ip>" -f`.
-- Alternatively, terminate TLS in front of the Host App with a proxy that has a trusted certificate and forwards to the Host App locally.
+- TLS: HTTPS on `LISTEN_LOCAL` for local access; HTTPS on `:443` inside tailnet via tsnet.
+- Certificates: preferred order — `./certs/server.crt|server.key`, `./certs/dev.crt|dev.key`, or auto‑generated self‑signed under `~/.guildnet/state/certs/`.
+- CORS: allow a single origin `FRONTEND_ORIGIN` (use `https://127.0.0.1:8080` in local dev).
+- Reverse proxy hardening for iframes:
+  - Adjust `Location` for subpaths.
+  - Normalize `Set‑Cookie` (drop Domain, set `Secure`, `SameSite=None`, add `Partitioned`, fix Path).
+  - Set COOP/COEP/CSP headers to be iframe‑compatible while safe.
+- No built‑in auth: rely on tailnet + Kubernetes RBAC; add an external auth proxy for public exposure if needed.
 
+### Deployment & Developer Workflow
 
-### Workspace CRD Responsibilities (Operator Summary)
+- Prereqs: Kubernetes cluster reachable via kubeconfig or in‑cluster; MetalLB recommended for LoadBalancer Services; optional Tailscale subnet router for direct ClusterIP routing.
+- Make tasks: build, run, test, lint; helpers to deploy MetalLB, CRDs, and RethinkDB.
+- Startup (`scripts/run-hostapp.sh`):
+  - Exports `KUBECONFIG` (default `~/.guildnet/kubeconfig`).
+  - Starts `kubectl proxy` (localhost:8001) and exports `HOSTAPP_API_PROXY_URL` for client‑go.
+  - Exports database discovery hints: `RETHINKDB_SERVICE_NAME`, `RETHINKDB_NAMESPACE`.
+  - Enables embedded operator by default.
+  - Runs the Host App.
+- UI: open `https://127.0.0.1:8080` (the Host App proxies the dev UI for same‑origin UX).
 
-On creation/update of a `Workspace`:
-* Ensure Deployment + Service exist & match spec/defaulted fields.
-* Enforce security context & tolerations (idempotent overwrite each reconcile).
-* Normalize env (filter blanks, inject defaults) before applying Deployment.
-* Configure health probes with extended timing to minimize false negatives.
-* Record status fields reflecting live workload state (phase, ready replica count, service DNS, inferred proxy target).
-* Leave advanced features (conditions array, metrics, startupProbe, cleanup/TTL) for future iterations.
+### Environment Knobs (selected)
 
-Current limitations:
-* No `kubectl describe workspace <name>` condition reasons beyond coarse phase.
-* CRD schema allows `{}` in `spec.env` (operator filters but validation not enforced at schema level).
-* No native stop/TTL lifecycle on the custom resource itself (stop-all operates by label selection).
+- `LISTEN_LOCAL` — local HTTPS bind address.
+- `FRONTEND_ORIGIN` — allowed CORS origin.
+- `HOSTAPP_API_PROXY_URL` — base URL for Kubernetes API (e.g., `http://127.0.0.1:8001`).
+- `HOSTAPP_EMBED_OPERATOR` — run the embedded controller.
+- `HOSTAPP_DISABLE_API_PROXY` — force direct ClusterIP dial where available.
+- `HOSTAPP_USE_PORT_FORWARD` — enable port‑forward fallback for proxying.
+- `K8S_NAMESPACE` — default namespace for Workspaces.
+- `WORKSPACE_LB`, `WORKSPACE_LB_POOL`, `WORKSPACE_DOMAIN`, `INGRESS_CLASS_NAME`, `CERT_MANAGER_ISSUER` — exposure options.
+- `RETHINKDB_ADDR` — explicit RethinkDB address override.
+- `RETHINKDB_SERVICE_NAME`, `RETHINKDB_NAMESPACE` — database discovery hints.
+- `NO_PROXY` — avoid proxying cluster traffic.
 
-### Listing & Logs
-- `GET /api/servers` maps Deployments labeled `guildnet.io/managed=true` to `model.Server`.
-  - Status is `running` when `ReadyReplicas > 0`, else `pending`.
-  - Ports are taken from the corresponding Service when present.
-  - `URL` is set to `https://<id>.<WORKSPACE_DOMAIN>/` when a domain is configured; if the Service has a LoadBalancer IP/hostname, it becomes `http(s)://<lb-ip-or-host>:<port>/`.
-- `GET /api/servers/{id}/logs` returns recent log lines from the server’s first Pod.
-- `GET /sse/logs` streams a tail of logs first, then heartbeats every 20s (no live k8s watch yet).
-- `POST /api/admin/stop-all` deletes Deployments and Services labeled `guildnet.io/managed=true` in the namespace.
+### Operational Notes
 
-
-### Security & TLS
-
-- Host App listeners:
-  - Local HTTPS at `LISTEN_LOCAL` (default from config; can override via env)
-  - tsnet HTTPS on `:443` inside the tailnet
-- Certificates preference:
-  1) `./certs/server.crt|server.key` (repo CA-signed)
-  2) `./certs/dev.crt|dev.key`
-  3) `~/.guildnet/state/certs/server.crt|server.key` (auto-generated self-signed for dev)
-- CORS: only `FRONTEND_ORIGIN` is allowed (for local dev, set to `https://127.0.0.1:8080`).
-- API server proxy: when enabled (default), traffic to cluster Pods can traverse the Kubernetes API server via client-go with TLS; HTTP/2 is disabled on that path to avoid INTERNAL_ERROR on proxy endpoints.
-- Cookies/redirects are adjusted by the proxy for iframe usage, as noted above.
-
-### Multi-User Notes
-Access control relies on:
-  - Tailnet boundary (who can reach the Host App over Tailscale/Headscale)
-  - Kubernetes RBAC applied to the kubeconfig used by the Host App
-  - Optional per‑workspace Ingress authentication when exposing via `WORKSPACE_DOMAIN`
-If exposing outside the tailnet, add an authentication proxy in front (for example, an OIDC‑enabled reverse proxy) or run the Host App behind a private ingress.
-
-
-### Troubleshooting
-
-- Proxy 502 / upstream error
-  - Verify target resolution for `/proxy/server/{id}/...` (Service exists, ports populated, or `Env.AGENT_HOST` set).
-  - If using direct ClusterIP without a subnet router, ensure the Host App is inside the cluster or has a route (via tsnet + subnet router).
-  - Try `/api/proxy-debug` to confirm parameters reaching the proxy layer.
-
-- IDE iframe doesn’t load
-  - Confirm `/api/servers` shows the server `running`.
-  - Check `curl -k https://127.0.0.1:8080/healthz` locally.
-  - With API proxy enabled, ensure the Pod is Ready; the Host App prefers pod proxy.
-
-- Logs SSE appears idle
-  - On open, you’ll receive a tail dump; subsequent heartbeats are sent every 20s. Use the REST logs endpoint to refresh recent history.
-
-- CORS errors
-  - Ensure the UI origin matches `FRONTEND_ORIGIN`.
- - Remote tailnet device gets TLS warning
-   - Regenerate the server certificate to include your tailnet FQDN and/or IP in SANs, or front the Host App with a TLS‑terminating proxy with a trusted cert.
-
-
-### Ports
-
-- Host App: HTTPS on `LISTEN_LOCAL` (e.g., `127.0.0.1:8080`) and HTTPS via tsnet on `:443` inside the tailnet.
-- Agent (typical): HTTP on 8080; HTTPS 8443 optional depending on image/config.
-- Proxying: HTTP or HTTPS to upstream depending on resolved port or explicit `scheme`.
-
-### Multi-Device Access
-- Local dev: open `https://127.0.0.1:8080` in the browser. The Vite dev server runs on `https://localhost:5173` but is proxied at `/` by the Host App for same-origin access.
-- Tailnet: `https://<hostapp-ts-fqdn>:443` (same UI, single origin). Ensure the TLS cert includes the tailnet name/IP or use a trusted front proxy.
-
-
-### Multiple Workspaces & Name Generation
-
-* Each launch creates a distinct `Workspace` object; the operator reconciles them independently.
-* Names: A base name (derived from image or user input) is suffixed with a random 5‑hex token (`<base>-<aaaaa>`) to avoid collisions and permit multiple simultaneous instances of the same image.
-* The label `guildnet.io/id` mirrors the name for discovery; the UI lists these servers, and the IDE iframe targets `/proxy/server/{name}/...`.
-* On collision, the API handler retries with a new suffix up to a bounded attempt limit.
-
-
-### Environment Assumptions
-
-- The code supports any Kubernetes cluster (in-cluster or kubeconfig). If you use Talos, helper scripts in `scripts/` can provision a dev cluster and a Tailscale subnet router.
-- The Host App reads config via `pkg/config` (tsnet login server, auth key, hostname, listen address). A shared `.env` can be used by scripts to populate this config.
-
-
-### Useful Environment Variables
-
-- Service DNS fallback: `<dns1123(name)>.default.svc.cluster.local`
-- Default agent ports when unspecified: 8080 (http), optionally 8443 (https)
-- Example UI iframe src: `https://<hostapp>/proxy/server/{id}/`
-- Useful env flags:
-  - `LISTEN_LOCAL` — local HTTPS bind (e.g., `127.0.0.1:8080`)
-  - `FRONTEND_ORIGIN` — CORS allow origin (use `https://127.0.0.1:8080` for local dev)
-  - `UI_DEV_ORIGIN` — dev UI origin reverse-proxied at `/` (Vite runs on `https://localhost:5173` by default)
-  - `WORKSPACE_LB` — expose Services as LoadBalancer (`1`/`true`)
-  - `WORKSPACE_LB_POOL` — MetalLB address pool name
-  - `WORKSPACE_DOMAIN` — per-workspace Ingress base domain (when not using LB)
-  - `INGRESS_CLASS_NAME` — IngressClass for workspace ingresses (defaults to `nginx` if empty)
-  - `CERT_MANAGER_ISSUER` — cert-manager issuer for per-workspace TLS
-  - `K8S_IMAGE_PULL_SECRET` — imagePullSecret name for workloads
-  - `AGENT_DEFAULT_PASSWORD` — default agent password when not provided
-  - `HOSTAPP_DISABLE_API_PROXY` — disable Kubernetes API server proxy (force direct tsnet dial)
+- Logs and diagnostics: structured per‑request logs with request id; health endpoints for Host App and Database.
+- Port‑forwarding: implemented via client‑go SPDY to the API server; only used when direct Service/ClusterIP reachability is unavailable.
+- Resilience: transient DB errors are retried with backoff; reverse proxy is tolerant to redirects and cookies in iframe contexts; Kubernetes discovery works via kubeconfig or a local API proxy.
 
 ### Limitations
-* No built-in user authentication layer (tailnet boundary + Kubernetes RBAC only).
-* Logs SSE tail-only; no continuous live follow beyond heartbeats.
-* Environment and port enrichment are minimal; CRD schema is permissive for env objects.
-* No metrics, tracing, or structured Workspace Conditions.
-* No StartupProbe; long cold starts rely on tuned readiness and liveness delays.
-* No dedicated `/api/workspaces` endpoints (server list abstraction surfaces status indirectly).
-* Conflict retries rely on subsequent reconciliations without explicit backoff.
+
+- No built‑in user authentication; rely on tailnet and Kubernetes RBAC.
+- DB storage uses an ephemeral volume by default (emptyDir).
+- SSE streams are tail‑oriented with periodic heartbeats; no long‑lived watches for all resources.
+- No StartupProbe; longer cold starts rely on tuned readiness/liveness.
+- Workspace quotas/policies are not enforced beyond basic defaults.

@@ -65,3 +65,21 @@ type DeployImage struct {
 	Image       string `json:"image"`
 	Description string `json:"description,omitempty"`
 }
+
+// AgentRecord represents a gateway/agent presence in the overlay network.
+type AgentRecord struct {
+	ID           string         `json:"id"`
+	Org          string         `json:"org,omitempty"`
+	Hostname     string         `json:"hostname,omitempty"`
+	IP           string         `json:"ip"` // tailnet 100.x or reachable IP
+	Ports        map[string]int `json:"ports,omitempty"`
+	Capabilities []string       `json:"capabilities,omitempty"`
+	Version      string         `json:"version,omitempty"`
+	LastSeen     string         `json:"last_seen"`
+}
+
+type ResolveResponse struct {
+	IP        string         `json:"ip"`
+	Ports     map[string]int `json:"ports,omitempty"`
+	ExpiresAt string         `json:"expires_at,omitempty"`
+}

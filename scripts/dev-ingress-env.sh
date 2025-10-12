@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+[ -f "$ROOT/.env" ] && . "$ROOT/.env"
 # Default dev values for per-workspace ingress
 export WORKSPACE_DOMAIN=${WORKSPACE_DOMAIN:-workspaces.127.0.0.1.nip.io}
 export INGRESS_CLASS_NAME=${INGRESS_CLASS_NAME:-nginx}

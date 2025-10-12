@@ -28,117 +28,141 @@ GuildNet is a private self-hostable stack that puts human-in-the-loop with agent
 - **Radicle**: A decentralized git hosting solution for managing code repositories within the cluster.
 - **Knowledge Base**: A system for storing and managing knowledge, integrated with agent workflows.
 
-## Quickstart
+## Quickstart overview
 
-Prereqs: Go, Node.js, Docker (for agent builds), and access to Tailscale/Headscale. Ensure your Tailscale/Headscale settings are available to the host app (e.g., `~/.guildnet/config.json`). Optional helper: `scripts/sync-env-from-config.sh`.
+Choose your path:
 
-1. Setup (UI deps + local TLS certs)
+- Create everything on your machine:
+  1. Headscale → 2) Tailscale router → 3) Talos cluster → 4) Server
+- Join existing pieces (e.g., your team already runs Headscale/Talos):
+  - Connect your Tailscale to their Headscale, ensure routes to the cluster, acquire kubeconfig, then run the Server and open the UI.
 
-```sh
-make setup
-```
+When the Server is running:
 
-2. Run the backend (dev, tsnet + CORS)
+- Local UI: https://127.0.0.1:8080
+- Tailnet UI (from other devices): https://<ts-hostname-or-ip>:443
 
-```sh
-# Optional: override origin/listen address
-# ORIGIN=https://127.0.0.1:8080 LISTEN_LOCAL=127.0.0.1:8080 make dev-backend
-make dev-backend
-```
+Tip: `make help` lists the most useful targets.
 
-3. Run the UI (Vite)
+## 1) Headscale (create or use existing)
 
-```sh
-# Optional: override API base, defaults to https://localhost:8080
-# VITE_API_BASE=https://127.0.0.1:8080 make dev-ui
-make dev-ui
-```
+Create (Docker-based, local):
 
-4. Verify
+- Start Headscale and bind it to your LAN IP
+  - `make headscale-up`
+- Bootstrap a reusable pre-auth key and sync it into `.env`
+  - `make headscale-bootstrap`
+- (Optional) Adjust `.env` to use your LAN URL instead of 127.0.0.1
+  - `make env-sync-lan`
+- Inspect status
+  - `make headscale-status`
 
-```sh
-# Backend health (self-signed):
-curl -k https://127.0.0.1:8080/healthz
-# Open the UI:
-open https://127.0.0.1:8080
-```
+Use existing:
 
-Tip: `make help` lists all common targets (build, test, lint, CRD apply, utilities).
+- Obtain your Headscale URL and a pre-auth key from your admin.
+- Set `TS_LOGIN_SERVER` and `TS_AUTHKEY` in `.env` (or keep them handy for Tailscale join steps below).
 
-## Networking / Multi-Device
+Tear down:
 
-Run the Host App on any tailnet device; others reach it at `https://<ts-hostname-or-ip>:443`. Include that hostname/IP in the server certificate SANs (see cert generation script) or accept the self-signed cert in dev.
+- `make headscale-down`
 
-## Workspace Lifecycle
+## 2) Tailscale (router and clients)
 
-1. UI POST `/api/jobs` with image (and optional env/ports — enrichment in progress).
-2. Host App creates a Workspace CR (name derived from job) in the target namespace.
-3. Workspace controller reconciles to Deployment + Service.
-4. Status fields (phase, proxyTarget) updated when Pod and Service become Ready.
-5. UI lists Workspaces via `/api/servers` (CRD-backed) and proxy iframe loads `/proxy/server/{id}/`.
+Goal: connect machines to the Tailnet and ensure routes to the cluster subnets are available.
 
-Proxy resolution order:
-1. `status.proxyTarget` (scheme://host:port) if set.
-2. Fallback: Service ClusterIP + chosen port (prefers 8443/443 for HTTPS, then 8080, else first port).
+Create (on the machine that can reach the cluster networks):
 
-## Current API Surface
+- Install and bring up a subnet router that advertises the desired routes (from `.env` `TS_ROUTES`)
+  - `make router-install`
+  - `make router-up`
+  - `make router-status`
+- Approve advertised routes in Headscale (from the machine running Headscale)
+  - `make headscale-approve-routes`
 
-```
-GET  /healthz
-GET  /api/ui-config
-GET  /api/images
-GET  /api/image-defaults?image=<ref>
-GET  /api/servers
-GET  /api/servers/{id}
-GET  /api/servers/{id}/logs?level=&limit=
-POST /api/jobs
-POST /api/admin/stop-all   (also /api/stop-all)
-GET  /sse/logs?target=&level=&tail=
-GET  /api/proxy-debug
-/*  (UI dev proxy -> Vite) in dev
-/proxy[...] (reverse proxy variants)
-```
+Join existing (another device):
 
-Stop-all permission: Allowed if at least one Capability matches action `stopAll` and its selector matches the Workspace labels; if zero Capability objects exist, action is allowed (permissive prototype semantics).
+- Install Tailscale, then connect to the Headscale with the pre-auth key
+  - Login server: `TS_LOGIN_SERVER`
+  - Auth key: `TS_AUTHKEY`
+- After joining, you should see the Server’s tailnet address and any advertised routes. If you do not see the cluster subnets, ask the admin to run a subnet router and approve routes.
 
-## Capability Prototype
+Notes:
 
-- Capability CRD spec fields used: `actions[]`, `selector.matchLabels`.
-- Cache refresh interval: ~10s (config code sets 10s in Host App main).
-- Unsupported (ignored) fields: constraints, rate limits, images, ports.
+- You can also use `make setup-tailscale` to run the end-to-end router setup (enables IP forwarding, brings Tailscale up, attempts route approval).
+- Route examples commonly include cluster/service/pod CIDRs (e.g., `10.96.0.0/12`, `10.244.0.0/16`) plus any node CIDRs.
 
-## Certificate Strategy
+## 3) Talos (new cluster or use existing)
 
-Preference order:
-1. `./certs/server.crt|server.key`
-2. `./certs/dev.crt|dev.key`
-3. `~/.guildnet/state/certs/server.crt|server.key` (auto self-signed)
+Create a Talos dev cluster (scripts orchestrate config, apply, and waiting for API):
 
-Regenerate with SANs: `scripts/generate-server-cert.sh -H "localhost,127.0.0.1,<ts-hostname>,<ts-ip>" -f`.
+- `make setup-talos`
+- This writes your kubeconfig to `~/.guildnet/kubeconfig` and waits until the Kubernetes API is reachable.
 
-## Development Flags / Env
+Use existing Kubernetes:
 
-| Variable | Purpose |
-|----------|---------|
-| LISTEN_LOCAL | Local HTTPS bind address (e.g. 127.0.0.1:8080) |
-| FRONTEND_ORIGIN | CORS allowlist origin (default dev: https://127.0.0.1:8080) |
-| UI_DEV_ORIGIN | Vite dev origin (proxied at /) |
-| HOSTAPP_DISABLE_API_PROXY | Dial services directly (ClusterIP) instead of API pod proxy |
-| WORKSPACE_DOMAIN | (Future) Ingress domain base (currently unused in CRD prototype) |
+- Ensure you have a valid kubeconfig for the target cluster. Put it at `~/.guildnet/kubeconfig` (default used by Makefile/scripts) or export `KUBECONFIG` accordingly.
+- Ensure your Tailnet has routes to the cluster (via subnet router) if accessing from outside the cluster’s network.
 
-## Logs
+Add-ons (optional, but recommended for the full demo):
 
-- REST: `/api/servers/{id}/logs` returns last N lines (default 200).
-- SSE: `/sse/logs` streams recent lines then heartbeats every 20s.
+- Apply CRDs, install MetalLB, create imagePullSecret, and bring up the example DB
+  - `make deploy-k8s-addons`
 
-## Limitations / Known Gaps (Prototype)
+## 4) Server (Host App + UI)
 
-- No user authentication / multi-tenant isolation.
-// Workspace spec now includes image, env, and ports from `/api/jobs` requests.
-- Permission system is minimal; destructive actions only.
-- No metrics or structured tracing yet.
-- Logs tail only; no incremental follow streaming from Kubernetes watch.
-- Ingress / external exposure flows are placeholders for future design.
+One‑time local setup:
+
+- Install UI deps and generate local TLS certs
+  - `make setup`
+
+Run the Server locally:
+
+- `make run`
+- Open https://127.0.0.1:8080
+- From other Tailnet devices, open https://<ts-hostname-or-ip>:443
+
+What happens when running:
+
+- The Server exposes a single HTTPS origin with API + reverse proxy.
+- It can create and reconcile Workspace resources into Deployments/Services.
+- The UI can launch and open IDEs (e.g., code-server) via a proxy on the same origin.
+
+TLS note:
+
+- For other devices to connect without warnings, include your tailnet hostname/IP in the server cert SANs: `scripts/generate-server-cert.sh -H "localhost,127.0.0.1,<ts-fqdn>,<ts-ip>" -f`.
+
+## Join vs Create: putting it together
+
+- If your team already runs Headscale and a subnet router, and you have a kubeconfig:
+
+  1. Join Tailscale with the provided pre-auth key (Headscale URL + key).
+  2. Place your kubeconfig at `~/.guildnet/kubeconfig` (or set `KUBECONFIG`).
+  3. `make setup` then `make run`, and open the UI.
+
+- If you’re starting fresh on a single machine:
+  1. `make headscale-up && make headscale-bootstrap`
+  2. `make router-install && make router-up && make headscale-approve-routes`
+  3. `make setup-talos`
+  4. `make setup && make run`
+
+Either path ends with the same UI, where you can create workspaces and access them from any Tailnet device.
+
+## Troubleshooting (quick)
+
+- UI not reachable on another device:
+  - Ensure you joined the same Tailnet and the server’s tsnet listener is up (default :443).
+  - Ensure the certificate includes the tailnet hostname/IP or accept the self-signed cert for dev.
+- Cluster services not reachable:
+  - Verify a subnet router is advertising the cluster CIDRs and that routes are approved in Headscale.
+- Kubernetes access errors:
+  - Confirm `~/.guildnet/kubeconfig` points to the intended cluster and your RBAC permits operations.
+
+## Useful commands
+
+- `make help` – show available targets
+- `make verify-e2e` – end-to-end checks for router, Talos reachability, kube API, DB
+- `make clean` – remove build artifacts
+- `make stop-all` – delete managed workloads via the Server API
 
 ## Contributing / Extending
 

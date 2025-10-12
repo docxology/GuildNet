@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"math/rand"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/your/module/internal/model"
 )
@@ -22,6 +24,9 @@ type Store struct {
 	servers map[string]*model.Server
 	logs    map[string]*perServerLogs
 	subs    map[string]map[chan model.LogLine]struct{} // key: serverID|level
+
+	// registry: org/id -> AgentRecord
+	agents map[string]*model.AgentRecord
 }
 
 func New() *Store {
@@ -29,6 +34,7 @@ func New() *Store {
 		servers: map[string]*model.Server{},
 		logs:    map[string]*perServerLogs{},
 		subs:    map[string]map[chan model.LogLine]struct{}{},
+		agents:  map[string]*model.AgentRecord{},
 	}
 }
 
@@ -168,4 +174,50 @@ func (s *Store) SeedDemo() {
 		b, _ := json.Marshal(msg)
 		_, _ = s.AppendLog(srv.ID, lvl, string(b))
 	}
+}
+
+// Registry helpers
+func agentKey(org, id string) string { return org + "|" + id }
+
+func (s *Store) UpsertAgent(a *model.AgentRecord) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if a.LastSeen == "" {
+		a.LastSeen = model.NowISO()
+	}
+	k := agentKey(a.Org, a.ID)
+	s.agents[k] = a
+}
+
+func (s *Store) GetAgent(org, id string) (*model.AgentRecord, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	a, ok := s.agents[agentKey(org, id)]
+	return a, ok
+}
+
+func (s *Store) ListAgents(org string) []*model.AgentRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := []*model.AgentRecord{}
+	for k, v := range s.agents {
+		if org == "" || strings.HasPrefix(k, org+"|") {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func (s *Store) PruneAgents(olderThan time.Duration) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cutoff := time.Now().Add(-olderThan)
+	removed := 0
+	for k, v := range s.agents {
+		if t, err := time.Parse(time.RFC3339, v.LastSeen); err == nil && t.Before(cutoff) {
+			delete(s.agents, k)
+			removed++
+		}
+	}
+	return removed
 }
