@@ -261,6 +261,10 @@ func (a *DBAPI) handleDatabaseSubroutes(w http.ResponseWriter, r *http.Request) 
 
 // roleFor returns the role resolved by table->db->org fallback.
 func (a *DBAPI) roleFor(principal, tableID, dbID string) model.Role {
+	// Relaxed MVP: if no principal is provided, allow all actions (treat as admin).
+	if strings.TrimSpace(principal) == "" {
+		return model.RoleAdmin
+	}
 	role := a.RBAC.RoleFor(principal, tableID, dbID)
 	if role == "" {
 		role = a.RBAC.RoleFor(principal, "", a.OrgID)

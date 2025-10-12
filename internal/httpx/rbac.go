@@ -115,11 +115,11 @@ func MaskRow(role model.Role, schema []model.ColumnDef, row map[string]any) map[
 	return out
 }
 
-// PrincipalFromRequest is placeholder - in real system extract auth identity; for now returns user:demo.
+// PrincipalFromRequest is placeholder - in real system extract auth identity; for now returns empty unless X-Debug-Principal is set.
 func PrincipalFromRequest(rh string) string {
-	// future: parse auth headers; for now allow header override X-Debug-Principal for dev
+	// future: parse auth headers; for dev allow header override X-Debug-Principal
 	if strings.TrimSpace(rh) != "" {
 		return rh
 	}
-	return "user:demo"
+	return ""
 }

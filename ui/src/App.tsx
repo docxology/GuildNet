@@ -16,6 +16,13 @@ const ServerDetail = lazy(() => import('./routes/ServerDetail'))
 const Launch = lazy(() => import('./routes/Launch'))
 const Databases = lazy(() => import('./routes/Databases'))
 const Settings = lazy(() => import('./routes/Settings'))
+// Add missing database detail + table routes
+const DatabaseDetail = lazy(() => import('./routes/DatabaseDetail'))
+const TableView = lazy(() => import('./routes/TableView'))
+const TableSchema = lazy(() => import('./routes/TableSchema'))
+const TableAudit = lazy(() => import('./routes/TableAudit'))
+const TablePermissions = lazy(() => import('./routes/TablePermissions'))
+const TableImportExport = lazy(() => import('./routes/TableImportExport'))
 
 const Home = () => (
   <div class="p-6 text-sm text-neutral-600">
@@ -271,6 +278,13 @@ export default function App() {
         <Route path="/c/:clusterId/servers/:id" component={ServerDetail} />
         <Route path="/c/:clusterId/launch" component={Launch} />
         <Route path="/c/:clusterId/databases" component={Databases} />
+        {/* Database details and table routes */}
+        <Route path="/c/:clusterId/databases/:dbId" component={DatabaseDetail} />
+        <Route path="/c/:clusterId/databases/:dbId/tables/:table" component={TableView} />
+        <Route path="/c/:clusterId/databases/:dbId/tables/:table/schema" component={TableSchema} />
+        <Route path="/c/:clusterId/databases/:dbId/tables/:table/audit" component={TableAudit} />
+        <Route path="/c/:clusterId/databases/:dbId/tables/:table/permissions" component={TablePermissions} />
+        <Route path="/c/:clusterId/databases/:dbId/tables/:table/import-export" component={TableImportExport} />
         <Route path="/c/:clusterId/settings" component={Settings} />
         {/* Home when no cluster */}
         <Route path="/" component={Home} />
