@@ -6,6 +6,7 @@ type Row = Record<string, any>
 type PageResp = { items: Row[]; next_cursor?: string }
 
 interface GridProps {
+  clusterId: string
   dbId: string
   table: string
 }
@@ -48,7 +49,7 @@ export default function DataGrid(props: GridProps) {
       if (cursor) qs.set('cursor', cursor)
       const res = await fetch(
         apiUrl(
-          `/api/db/${encodeURIComponent(props.dbId)}/tables/${encodeURIComponent(props.table)}/rows?${qs.toString()}`
+          `/api/cluster/${encodeURIComponent(props.clusterId)}/db/${encodeURIComponent(props.dbId)}/tables/${encodeURIComponent(props.table)}/rows?${qs.toString()}`
         )
       )
       if (!res.ok) throw new Error(`${res.status}`)
@@ -67,7 +68,7 @@ export default function DataGrid(props: GridProps) {
     if (!live()) qs.set('pause', '1')
     if (lastToken) qs.set('cursor', lastToken)
     return apiUrl(
-      `/sse/db/${encodeURIComponent(props.dbId)}/tables/${encodeURIComponent(props.table)}/changes?${qs.toString()}`
+      `/sse/cluster/${encodeURIComponent(props.clusterId)}/db/${encodeURIComponent(props.dbId)}/tables/${encodeURIComponent(props.table)}/changes?${qs.toString()}`
     )
   }
 
@@ -232,7 +233,7 @@ export default function DataGrid(props: GridProps) {
     try {
       await fetch(
         apiUrl(
-          `/api/db/${encodeURIComponent(props.dbId)}/tables/${encodeURIComponent(props.table)}/rows/${encodeURIComponent(String(rowId))}`
+          `/api/cluster/${encodeURIComponent(props.clusterId)}/db/${encodeURIComponent(props.dbId)}/tables/${encodeURIComponent(props.table)}/rows/${encodeURIComponent(String(rowId))}`
         ),
         {
           method: 'PATCH',

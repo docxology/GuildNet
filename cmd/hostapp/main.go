@@ -32,7 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"github.com/your/module/internal/db"
-	httpx "github.com/your/module/internal/httpx"
+	"github.com/your/module/internal/httpx"
 	"github.com/your/module/internal/k8s"
 	"github.com/your/module/internal/metrics"
 	"github.com/your/module/internal/model"
@@ -55,6 +55,11 @@ import (
 	"github.com/your/module/internal/operator"
 	"github.com/your/module/internal/permission"
 	corev1 "k8s.io/api/core/v1"
+
+	// New imports
+	"github.com/your/module/internal/api"
+	"github.com/your/module/internal/localdb"
+	"github.com/your/module/internal/secrets"
 )
 
 // startOperator boots a controller-runtime manager that reconciles Workspace CRDs.
@@ -245,10 +250,25 @@ func main() {
 		log.Fatalf("invalid config: %v", err)
 	}
 
-	// Allowlist removed: no gating of /proxy by CIDR/host:port.
-
+	// Create cancellation context for the serve lifecycle
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Server-first runtime: open local DB and secrets manager
+	stateDir := config.StateDir()
+	ldb, err := localdb.Open(stateDir)
+	if err != nil {
+		log.Fatalf("open local db: %v", err)
+	}
+	defer ldb.Close()
+	// Ensure orchestration buckets
+	_ = ldb.EnsureBuckets("orgs", "headscales", "namespaces", "keys", "clusters", "nodes", "credentials", "jobs", "joblogs", "audit")
+	masterKey := strings.TrimSpace(os.Getenv("GUILDNET_MASTER_KEY"))
+	if masterKey == "" {
+		log.Printf("warning: GUILDNET_MASTER_KEY not set; secrets encryption disabled for dev")
+	}
+	sec, _ := secrets.New(masterKey)
+	_ = sec
 
 	// Start tsnet (mandatory)
 	s, err := ts.StartServer(ctx, ts.Options{
@@ -291,8 +311,21 @@ func main() {
 	} else {
 		dbMgr = mgr
 	}
-	// Always register database API endpoints; handlers will degrade gracefully when dbMgr is nil.
-	httpx.InitAndRegisterDB(mux, dbMgr)
+	// Do not register legacy global /api/db endpoints; per-cluster routes are mounted below.
+
+	// New orchestration API wired with dependencies (single router instance mounted on multiple paths)
+	deps := api.Deps{DB: ldb, Secrets: sec, Runner: nil, DBMgr: dbMgr}
+	apiMux := api.Router(deps)
+	mux.Handle("/api/deploy/", apiMux)
+	mux.Handle("/api/jobs", apiMux)
+	mux.Handle("/api/jobs/", apiMux)
+	mux.Handle("/api/jobs-logs/", apiMux)
+	mux.Handle("/ws/jobs", apiMux)
+	// Mount additional API groups served by router
+	mux.Handle("/api/cluster/", apiMux)
+	mux.Handle("/sse/cluster/", apiMux)
+	// Ensure core health endpoint is reachable
+	mux.Handle("/api/health", apiMux)
 
 	// health check
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -777,7 +810,7 @@ func main() {
 	})
 
 	// jobs (Workspace CRD only; legacy Deployment path removed)
-	mux.HandleFunc("/api/jobs", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/workspace-jobs", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return

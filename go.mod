@@ -3,6 +3,7 @@ module github.com/your/module
 go 1.22.0
 
 require (
+	go.etcd.io/bbolt v1.3.8
 	gopkg.in/rethinkdb/rethinkdb-go.v6 v6.2.0
 	tailscale.com v1.66.4
 )
@@ -56,7 +57,6 @@ require (
 	github.com/google/go-cmp v0.6.0 // indirect
 	github.com/google/gofuzz v1.2.0 // indirect
 	github.com/google/nftables v0.2.1-0.20240414091927-5e242ec57806 // indirect
-	github.com/google/uuid v1.5.0 // indirect
 	github.com/gorilla/csrf v1.7.2 // indirect
 	github.com/gorilla/securecookie v1.1.2 // indirect
 	github.com/gorilla/websocket v1.5.0 // indirect
@@ -143,6 +143,7 @@ require (
 )
 
 require (
+	github.com/google/uuid v1.5.0
 	k8s.io/api v0.30.1
 	k8s.io/apimachinery v0.30.1
 	k8s.io/client-go v0.30.1

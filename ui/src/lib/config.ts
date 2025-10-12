@@ -4,16 +4,26 @@
 
 const trimSlash = (s: string) => s.replace(/\/$/, '')
 
-export const API_BASE = (() => {
-  const b = import.meta.env.VITE_API_BASE
-  if (b) return trimSlash(b)
-  // In dev, default to same-origin and rely on Vite proxy (no base prefix)
-  if (import.meta.env.DEV) return ''
-  return ''
-})()
+// Return the current API base, considering build-time and runtime overrides.
+export function getApiBase(): string {
+  // Prefer explicit build-time override
+  const envBase = import.meta.env.VITE_API_BASE as string | undefined
+  if (envBase) return trimSlash(envBase)
+  // Allow a runtime override set by the join-file import flow
+  let runBase = ''
+  if (typeof window !== 'undefined') {
+    try {
+      runBase = sessionStorage.getItem('GN_VITE_API_BASE') || ''
+    } catch {
+      runBase = ''
+    }
+  }
+  return runBase ? trimSlash(runBase) : ''
+}
 
 export function apiUrl(path: string) {
-  return API_BASE ? `${API_BASE}${path}` : path
+  const base = getApiBase()
+  return base ? `${base}${path}` : path
 }
 
 export async function fetchUiConfig() {

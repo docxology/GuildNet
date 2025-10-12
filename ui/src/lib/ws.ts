@@ -59,19 +59,17 @@ export class WSManager extends Emitter {
 
   open() {
     this.cleanup()
+    // Reset single-shot error probe on a brand new connection attempt
+    this.didProbe = false
     this.state = this.retries > 0 ? 'reconnecting' : 'connecting'
     this.emit('state', this.state, this.retries)
     try {
-      // Dev diagnostics
-      try {
-        console.info('[SSE] connecting', this.resolveUrl())
-      } catch {}
+      try { console.info('[SSE] connecting', this.resolveUrl()) } catch {}
       this.es = new EventSource(this.resolveUrl())
     } catch (e) {
       this.fail(e instanceof Error ? e.message : String(e))
       return
     }
-    // Mark open on first message, since EventSource has no explicit onopen in all browsers
     const markOpenOnce = () => {
       if (this.state !== 'open') {
         this.state = 'open'
@@ -79,68 +77,36 @@ export class WSManager extends Emitter {
         this.emit('state', this.state, this.retries)
       }
     }
-    ;(this.es as EventSource).onopen = () => {
-      try {
-        console.info('[SSE] open', this.resolveUrl())
-      } catch {}
-      this.state = 'open'
-      this.retries = 0
-      this.emit('state', this.state, this.retries)
-    }
-    const onMessage = (text: string) => {
-      markOpenOnce()
-      try {
-        const obj = JSON.parse(text)
-        this.emit('message', obj)
-      } catch {}
-    }
+    if (this.es)
+      this.es.onopen = () => {
+        try { console.info('[SSE] open', this.resolveUrl()) } catch {}
+        markOpenOnce()
+      }
     if (this.es)
       this.es.onmessage = (ev) => {
-        if (typeof ev.data === 'string') onMessage(ev.data)
+        markOpenOnce()
+        if (typeof ev.data === 'string') {
+          try {
+            const obj = JSON.parse(ev.data)
+            this.emit('message', obj)
+          } catch {}
+        }
       }
     if (this.es)
       this.es.onerror = async (ev) => {
         try {
-          console.error('[SSE] error event', {
-            readyState: (this.es as EventSource).readyState,
-            ev
-          })
+          console.error('[SSE] error event', { readyState: (this.es as EventSource).readyState, ev })
         } catch {}
-        // Best-effort: try to fetch the same URL once to surface HTTP status/body when server rejects (e.g., 400/404/500)
         if (!this.didProbe) {
           this.didProbe = true
           try {
-            const res = await fetch(this.resolveUrl(), {
-              method: 'GET',
-              headers: { Accept: 'application/json' }
-            })
+            const res = await fetch(this.resolveUrl(), { method: 'GET', headers: { Accept: 'application/json' } })
             const ct = res.headers.get('content-type') || ''
             let body: any = undefined
-            if (ct.includes('application/json')) {
-              try {
-                body = await res.json()
-              } catch {}
-            } else {
-              try {
-                body = await res.text()
-              } catch {}
-            }
-            console.error('[SSE] probe status', {
-              status: res.status,
-              statusText: res.statusText,
-              body
-            })
-            this.emit('error', {
-              status: res.status,
-              statusText: res.statusText,
-              body
-            })
+            if (ct.includes('application/json')) { try { body = await res.json() } catch {} } else { try { body = await res.text() } catch {} }
+            this.emit('error', { status: res.status, statusText: res.statusText, body })
           } catch (e) {
-            console.error('[SSE] probe failed', e)
-            this.emit('error', {
-              probeFailed: true,
-              message: e instanceof Error ? e.message : String(e)
-            })
+            this.emit('error', { probeFailed: true, message: e instanceof Error ? e.message : String(e) })
           }
         }
         this.fail('sse error')
@@ -186,7 +152,13 @@ export class WSManager extends Emitter {
   private cleanup() {
     if (this.connectTimer) window.clearTimeout(this.connectTimer)
     this.connectTimer = undefined
-    this.es?.close?.()
+    if (this.es) {
+      // Clear handlers to avoid duplicate invocations if browser delays GC
+      this.es.onopen = null as any
+      this.es.onmessage = null as any
+      this.es.onerror = null as any
+      try { this.es.close?.() } catch {}
+    }
     this.es = undefined
   }
 }

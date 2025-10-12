@@ -32,3 +32,5 @@ ui/dist/
 /hostapp
 
 /certs
+
+guildnet.config

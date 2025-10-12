@@ -11,19 +11,22 @@ import Table from '../components/Table'
 import StatusPill from '../components/StatusPill'
 import Card from '../components/Card'
 import Input from '../components/Input'
-import { A } from '@solidjs/router'
-import { listServers } from '../lib/api'
+import { A, useParams } from '@solidjs/router'
+import { listClusterServers } from '../lib/api'
 import { timeAgo } from '../lib/format'
 import type { Server } from '../lib/types'
 
 const intervals = [5000, 10000, 30000, 0] as const
 
 export default function Servers() {
+  const params = useParams()
+  const clusterId = () => params.clusterId || ''
   const [search, setSearch] = createSignal('')
   const [status, setStatus] = createSignal<string>('')
   const [period, setPeriod] = createSignal<(typeof intervals)[number]>(10000)
-  const [servers, { refetch }] = createResource<Server[]>(async () =>
-    listServers()
+  const [servers, { refetch }] = createResource<Server[], string>(
+    clusterId,
+    async (cid: string) => listClusterServers(cid)
   )
 
   let timer: number | undefined
@@ -67,7 +70,7 @@ export default function Servers() {
         <td class="py-2 pr-4">
           <A
             class="inline-flex items-center justify-center gap-2 rounded-md px-3 py-2 text-sm font-medium border bg-neutral-50 dark:bg-neutral-800 hover:bg-neutral-100 dark:hover:bg-neutral-700"
-            href={`/servers/${encodeURIComponent(srv.id)}`}
+            href={`/c/${encodeURIComponent(clusterId())}/servers/${encodeURIComponent(srv.id)}`}
           >
             Inspect
           </A>

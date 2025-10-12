@@ -2,25 +2,33 @@
 set -euo pipefail
 
 # Create a portable GuildNet join configuration (guildnet.config)
-# This captures:
-# - Host App URL reachable over the tailnet (https://<ts-fqdn>:443)
-# - Optional CA PEM to trust that Host App URL
-# - Headscale/Tailscale login server and a pre-auth key (sensitive)
-# - Suggested hostname and display name
+# This captures everything needed to add a cluster via the UI wizard:
+# - Cluster: name label and kubeconfig YAML (required)
+# - Optional UI base URL (vite_api_base) and an extra CA PEM to trust it
+# - Optional hostapp.url and hostapp.ca_pem for CLI join compatibility
+# - Optional notes for the operator/UI
 #
-# Usage examples:
+# Backwards-compatible optional fields retained for Tailscale/Headscale hints:
+# - tailscale.login_server, tailscale.preauth_key, tailscale.hostname_suggest
+#
+# The resulting JSON can be safely shared (kubeconfig may contain credentials; handle securely).
+#
+# Examples:
 #   scripts/create_join_info.sh \
-#     --hostapp-url https://myhost.tailnet-abc.ts.net:443 \
-#     --include-ca certs/server.crt \
-#     --login-server https://headscale.example.com \
-#     --auth-key tskey-abc123 \
-#     --hostname teammate-1 \
+#     --kubeconfig ~/.kube/config \
 #     --name "Dev Cluster" \
 #     --out guildnet.config
 #
+#   scripts/create_join_info.sh \
+#     --kubeconfig ~/.kube/config \
+#     --name "Prod EKS" \
+#     --hostapp-url https://guildnet.example.com \
+#     --include-ca certs/server.crt \
+#     --notes "Use SSO account"
+#
 # Notes:
-# - The output contains a pre-auth key if provided. Handle securely and share out-of-band.
 # - File is written with permissions 0600.
+# - jq must be installed (used to safely encode strings as JSON).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -29,6 +37,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUT_FILE="guildnet.config"
 HOSTAPP_URL=""
 INCLUDE_CA=""
+KUBECONFIG_PATH="${KUBECONFIG:-$HOME/.kube/config}"
 LOGIN_SERVER=""
 AUTH_KEY=""
 HOSTNAME_SUGGEST=""
@@ -40,20 +49,22 @@ usage() {
 Usage: scripts/create_join_info.sh [options]
 
 Options:
-  --hostapp-url URL       Host App URL reachable over tailnet (e.g., https://<ts-fqdn>:443)
-  --include-ca PATH       Include PEM-encoded CA/cert at PATH (e.g., certs/server.crt)
-  --login-server URL      Headscale/Tailscale login server URL
-  --auth-key KEY          Pre-auth key (sensitive)
-  --hostname NAME         Suggested tsnet hostname for the joiner
-  --name LABEL            Optional display name/cluster label shown in UI
-  --notes TEXT            Optional free-form note/instructions
-  --out FILE              Output path (default: guildnet.config)
-  --help                  Show this help
+  --kubeconfig PATH     Kubeconfig file to embed (default: $KUBECONFIG or ~/.kube/config)
+  --name LABEL          Optional display name/cluster label shown in UI
+  --notes TEXT          Optional free-form note/instructions
+  --hostapp-url URL     Optional Host App base URL for UI/API (sets ui.vite_api_base and hostapp.url)
+  --include-ca PATH     Include PEM-encoded CA/cert at PATH (for ui.ca_pem and hostapp.ca_pem)
+  --login-server URL    (optional) Tailscale/Headscale login server URL (hint)
+  --auth-key KEY        (optional) Pre-auth key (sensitive, hint)
+  --hostname NAME       (optional) Suggested tsnet hostname (hint)
+  --out FILE            Output path (default: guildnet.config)
+  --help                Show this help
 USAGE
 }
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --kubeconfig) KUBECONFIG_PATH="${2:-}"; shift 2 ;;
     --hostapp-url) HOSTAPP_URL="${2:-}"; shift 2 ;;
     --include-ca) INCLUDE_CA="${2:-}"; shift 2 ;;
     --login-server) LOGIN_SERVER="${2:-}"; shift 2 ;;
@@ -67,19 +78,20 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# Try to pull defaults from ~/.guildnet/config.json when not provided
-CONF_FILE="$HOME/.guildnet/config.json"
-if [ -z "$LOGIN_SERVER" ] && [ -s "$CONF_FILE" ] && command -v jq >/dev/null 2>&1; then
-  LOGIN_SERVER="$(jq -r '.login_server // empty' "$CONF_FILE" 2>/dev/null || true)"
-fi
-if [ -z "$HOSTNAME_SUGGEST" ] && [ -s "$CONF_FILE" ] && command -v jq >/dev/null 2>&1; then
-  HOSTNAME_SUGGEST="$(jq -r '.hostname // empty' "$CONF_FILE" 2>/dev/null || true)"
-fi
-if [ -z "$NAME_LABEL" ] && [ -s "$CONF_FILE" ] && command -v jq >/dev/null 2>&1; then
-  NAME_LABEL="$(jq -r '.name // empty' "$CONF_FILE" 2>/dev/null || true)"
+if ! command -v jq >/dev/null 2>&1; then
+  echo "ERROR: jq is required (for JSON encoding)" >&2
+  exit 2
 fi
 
-# Read CA PEM if requested or fallback to repo certs/server.crt
+# Read kubeconfig
+if [ -z "$KUBECONFIG_PATH" ] || [ ! -s "$KUBECONFIG_PATH" ]; then
+  echo "ERROR: --kubeconfig PATH is required and must exist (got: '$KUBECONFIG_PATH')" >&2
+  exit 2
+fi
+KC_YAML="$(cat "$KUBECONFIG_PATH")"
+KC_JSON="$(jq -Rs . <<<"$KC_YAML")"
+
+# Read CA PEM if requested or fallback to repo certs/server.crt (optional)
 CA_PEM=""
 if [ -n "$INCLUDE_CA" ]; then
   if [ -f "$INCLUDE_CA" ]; then
@@ -91,12 +103,19 @@ elif [ -f "$REPO_ROOT/certs/server.crt" ]; then
   CA_PEM="$(cat "$REPO_ROOT/certs/server.crt")"
 fi
 
-# Minimal validation
-if [ -z "$HOSTAPP_URL" ]; then
-  echo "ERROR: --hostapp-url is required" >&2; exit 2
-fi
+# Build dynamic UI object fields (conditionally emit keys)
+UI_FIELDS=()
+if [ -n "$HOSTAPP_URL" ]; then UI_FIELDS+=("\"vite_api_base\": $(jq -Rn --arg v \"$HOSTAPP_URL\" '$v')"); fi
+if [ -n "$CA_PEM" ]; then UI_FIELDS+=("\"ca_pem\": $(jq -Rs . <<<\"$CA_PEM\")"); fi
+UI_JSON_CONTENT="$(IFS=, ; echo "${UI_FIELDS[*]}")"
 
-# Build JSON
+# Build dynamic hostapp fields (CLI/join.sh compatibility)
+HOSTAPP_FIELDS=()
+if [ -n "$HOSTAPP_URL" ]; then HOSTAPP_FIELDS+=("\"url\": $(jq -Rn --arg v \"$HOSTAPP_URL\" '$v')"); fi
+if [ -n "$CA_PEM" ]; then HOSTAPP_FIELDS+=("\"ca_pem\": $(jq -Rs . <<<\"$CA_PEM\")"); fi
+HOSTAPP_JSON_CONTENT="$(IFS=, ; echo "${HOSTAPP_FIELDS[*]}")"
+
+# Metadata
 NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 HOSTNAME_LOCAL="$(hostname 2>/dev/null || echo unknown)"
 CREATOR_USER="${USER:-unknown}"
@@ -104,18 +123,21 @@ CREATOR_USER="${USER:-unknown}"
 TMP_JSON="$(mktemp)"
 cat >"$TMP_JSON" <<JSON
 {
-  "version": 1,
+  "version": 2,
   "created_at": "$NOW_ISO",
   "creator": {"host": "$HOSTNAME_LOCAL", "user": "$CREATOR_USER"},
-  "hostapp": {"url": "$HOSTAPP_URL"$( [ -n "$CA_PEM" ] && printf ", \"ca_pem\": %s" "$(jq -Rs . <<<"$CA_PEM")" )},
+  "ui": { $UI_JSON_CONTENT },
+  "hostapp": { $HOSTAPP_JSON_CONTENT },
+  "cluster": {
+    "name": $(jq -Rn --arg v "$NAME_LABEL" '$v // empty'),
+    "kubeconfig": $KC_JSON,
+    "notes": $(jq -Rn --arg v "$NOTES" '$v // empty')
+  },
   "tailscale": {
     "login_server": $(jq -Rn --arg v "$LOGIN_SERVER" '$v // empty'),
     "preauth_key": $(jq -Rn --arg v "$AUTH_KEY" '$v // empty'),
     "hostname_suggest": $(jq -Rn --arg v "$HOSTNAME_SUGGEST" '$v // empty')
-  },
-  "ui": {"vite_api_base": "$HOSTAPP_URL"},
-  "name": $(jq -Rn --arg v "$NAME_LABEL" '$v // empty'),
-  "notes": $(jq -Rn --arg v "$NOTES" '$v // empty')
+  }
 }
 JSON
 
@@ -123,9 +145,11 @@ cp "$TMP_JSON" "$OUT_FILE"
 rm -f "$TMP_JSON"
 chmod 600 "$OUT_FILE" || true
 
+# Summary
 echo "guildnet.config written: $OUT_FILE"
-echo "  Host App URL: $HOSTAPP_URL"
+if [ -n "$NAME_LABEL" ]; then echo "  Name: $NAME_LABEL"; fi
+echo "  Kubeconfig: $KUBECONFIG_PATH"
+if [ -n "$HOSTAPP_URL" ]; then echo "  UI base: $HOSTAPP_URL"; fi
 if [ -n "$LOGIN_SERVER" ]; then echo "  Login server: $LOGIN_SERVER"; fi
 if [ -n "$HOSTNAME_SUGGEST" ]; then echo "  Hostname suggest: $HOSTNAME_SUGGEST"; fi
-if [ -n "$NAME_LABEL" ]; then echo "  Name: $NAME_LABEL"; fi
 if [ -n "$AUTH_KEY" ]; then echo "  Includes pre-auth key (sensitive)"; fi

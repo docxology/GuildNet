@@ -29,7 +29,13 @@ if [ ! -s "$CFG_FILE" ]; then echo "ERROR: config file not found: $CFG_FILE" >&2
 JQ() { jq -r "$@" "$CFG_FILE" 2>/dev/null || true; }
 
 HOSTAPP_URL="$(JQ '.hostapp.url // empty')"
+if [ -z "$HOSTAPP_URL" ] || [ "$HOSTAPP_URL" = "null" ]; then
+  HOSTAPP_URL="$(JQ '.ui.vite_api_base // empty')"
+fi
 HOSTAPP_CA_PEM="$(jq -r '.hostapp.ca_pem // empty' "$CFG_FILE" 2>/dev/null || true)"
+if [ -z "$HOSTAPP_CA_PEM" ] || [ "$HOSTAPP_CA_PEM" = "null" ]; then
+  HOSTAPP_CA_PEM="$(jq -r '.ui.ca_pem // empty' "$CFG_FILE" 2>/dev/null || true)"
+fi
 TS_LOGIN="$(JQ '.tailscale.login_server // empty')"
 TS_KEY="$(JQ '.tailscale.preauth_key // empty')"
 TS_HOSTNAME="$(JQ '.tailscale.hostname_suggest // empty')"

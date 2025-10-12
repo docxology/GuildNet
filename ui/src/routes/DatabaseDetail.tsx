@@ -1,23 +1,27 @@
 import { createResource, For, createSignal } from 'solid-js'
-import { useParams } from '@solidjs/router'
-import { apiUrl } from '../lib/config'
+import { useParams, A } from '@solidjs/router'
 import Button from '../components/Button'
 import Modal from '../components/Modal'
 import Input from '../components/Input'
 import {
-  createTable,
-  listTables,
+  createClusterTable,
+  listClusterTables,
   type TableDef,
   type ColumnDef
 } from '../lib/api'
 
-async function fetchTables(dbId: string): Promise<TableDef[]> {
-  return listTables(dbId)
+async function fetchTables(clusterId: string, dbId: string): Promise<TableDef[]> {
+  return listClusterTables(clusterId, dbId)
 }
 
 export default function DatabaseDetail() {
   const params = useParams()
-  const [tables, { refetch }] = createResource(() => params.dbId, fetchTables)
+  const clusterId = () => params.clusterId!
+  const dbId = () => params.dbId!
+  const [tables, { refetch }] = createResource(
+    () => [clusterId(), dbId()] as [string, string],
+    ([c, d]) => fetchTables(c as string, d as string)
+  )
   const [open, setOpen] = createSignal(false)
   const [name, setName] = createSignal('')
   const [pk, setPk] = createSignal('id')
@@ -36,7 +40,7 @@ export default function DatabaseDetail() {
   const submit = async () => {
     if (!name().trim()) return
     setCreating(true)
-    await createTable(params.dbId!, {
+    await createClusterTable(clusterId(), dbId(), {
       name: name().trim(),
       primary_key: pk().trim() || undefined,
       schema: columns()
@@ -51,7 +55,7 @@ export default function DatabaseDetail() {
   return (
     <div class="space-y-4">
       <div class="flex items-center justify-between">
-        <h1 class="text-xl font-semibold">Database: {params.dbId}</h1>
+        <h1 class="text-xl font-semibold">Database: {dbId()}</h1>
         <Button variant="primary" onClick={() => setOpen(true)}>
           New Table
         </Button>
@@ -59,8 +63,8 @@ export default function DatabaseDetail() {
       <div class="border rounded-lg divide-y overflow-hidden bg-white dark:bg-neutral-900">
         <For each={tables()}>
           {(t) => (
-            <a
-              href={`/databases/${encodeURIComponent(params.dbId || '')}/tables/${encodeURIComponent(t.name)}`}
+            <A
+              href={`/c/${encodeURIComponent(clusterId())}/databases/${encodeURIComponent(dbId())}/tables/${encodeURIComponent(t.name)}`}
               class="flex items-center px-4 py-3 hover:bg-neutral-50 dark:hover:bg-neutral-800"
             >
               <div class="flex-1">
@@ -69,7 +73,7 @@ export default function DatabaseDetail() {
                   PK: {t.primary_key || 'id'}
                 </div>
               </div>
-            </a>
+            </A>
           )}
         </For>
         {tables.loading && <div class="p-4 text-sm">Loading…</div>}

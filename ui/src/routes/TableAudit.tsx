@@ -5,9 +5,9 @@ import { pushToast } from '../components/Toaster'
 
 type Audit = { id: string; action: string; ts: string; diff?: any }
 
-async function fetchAudit(db: string): Promise<Audit[]> {
+async function fetchAudit(clusterId: string, db: string): Promise<Audit[]> {
   try {
-    const r = await fetch(apiUrl(`/api/db/${encodeURIComponent(db)}/audit`))
+    const r = await fetch(apiUrl(`/api/cluster/${encodeURIComponent(clusterId)}/db/${encodeURIComponent(db)}/audit`))
     if (!r.ok) return []
     return await r.json()
   } catch {
@@ -17,7 +17,7 @@ async function fetchAudit(db: string): Promise<Audit[]> {
 
 export default function TableAudit() {
   const params = useParams()
-  const [events] = createResource(() => params.dbId!, fetchAudit)
+  const [events] = createResource(() => [params.clusterId!, params.dbId!] as [string, string], ([c, d]) => fetchAudit(c, d))
   const [q, setQ] = createSignal('')
   const [action, setAction] = createSignal('')
   const filtered = createMemo(() => {
@@ -39,7 +39,7 @@ export default function TableAudit() {
       if (e.action === 'update' && e.diff && typeof e.diff === 'object') {
         const res = await fetch(
           apiUrl(
-            `/api/db/${encodeURIComponent(String(params.dbId || ''))}/tables/${encodeURIComponent(String(table))}/rows/${encodeURIComponent(String(rowId))}`
+            `/api/cluster/${encodeURIComponent(params.clusterId || '')}/db/${encodeURIComponent(String(params.dbId || ''))}/tables/${encodeURIComponent(String(table))}/rows/${encodeURIComponent(String(rowId))}`
           ),
           {
             method: 'PATCH',
@@ -56,7 +56,7 @@ export default function TableAudit() {
       ) {
         const res = await fetch(
           apiUrl(
-            `/api/db/${encodeURIComponent(String(params.dbId || ''))}/tables/${encodeURIComponent(String(table))}/rows`
+            `/api/cluster/${encodeURIComponent(params.clusterId || '')}/db/${encodeURIComponent(String(params.dbId || ''))}/tables/${encodeURIComponent(String(table))}/rows`
           ),
           {
             method: 'POST',
@@ -94,7 +94,7 @@ export default function TableAudit() {
       const body = JSON.stringify(e.diff)
       const res = await fetch(
         apiUrl(
-          `/api/db/${encodeURIComponent(String(params.dbId || ''))}/tables/${encodeURIComponent(String(table))}`
+          `/api/cluster/${encodeURIComponent(params.clusterId || '')}/db/${encodeURIComponent(String(params.dbId || ''))}/tables/${encodeURIComponent(String(table))}`
         ),
         {
           method: 'PATCH',

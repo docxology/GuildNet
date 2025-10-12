@@ -12,10 +12,12 @@ type Binding = {
   created_at?: string
 }
 
-async function fetchPerms(db: string): Promise<Binding[]> {
+async function fetchPerms(clusterId: string, db: string): Promise<Binding[]> {
   try {
     const r = await fetch(
-      apiUrl(`/api/db/${encodeURIComponent(db)}/permissions`)
+      apiUrl(
+        `/api/cluster/${encodeURIComponent(clusterId)}/db/${encodeURIComponent(db)}/permissions`
+      )
     )
     if (!r.ok) return []
     return await r.json()
@@ -26,13 +28,16 @@ async function fetchPerms(db: string): Promise<Binding[]> {
 
 export default function TablePermissions() {
   const params = useParams()
-  const [perms, { refetch }] = createResource(() => params.dbId!, fetchPerms)
+  const [perms, { refetch }] = createResource(
+    () => [params.clusterId!, params.dbId!] as [string, string],
+    ([c, d]) => fetchPerms(c, d)
+  )
   const [schema] = createResource(async () => {
-    if (!params.dbId || !params.table) return null
+    if (!params.clusterId || !params.dbId || !params.table) return null
     try {
       const r = await fetch(
         apiUrl(
-          `/api/db/${encodeURIComponent(params.dbId)}/tables/${encodeURIComponent(params.table)}`
+          `/api/cluster/${encodeURIComponent(params.clusterId)}/db/${encodeURIComponent(params.dbId)}/tables/${encodeURIComponent(params.table)}`
         )
       )
       if (!r.ok) return null
@@ -56,7 +61,9 @@ export default function TablePermissions() {
   const add = async () => {
     try {
       const res = await fetch(
-        apiUrl(`/api/db/${encodeURIComponent(params.dbId || '')}/permissions`),
+        apiUrl(
+          `/api/cluster/${encodeURIComponent(params.clusterId || '')}/db/${encodeURIComponent(params.dbId || '')}/permissions`
+        ),
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -77,7 +84,7 @@ export default function TablePermissions() {
   const revoke = async (s: string, p: string) => {
     try {
       const url = apiUrl(
-        `/api/db/${encodeURIComponent(params.dbId || '')}/permissions?scope=${encodeURIComponent(s)}&principal=${encodeURIComponent(p)}`
+        `/api/cluster/${encodeURIComponent(params.clusterId || '')}/db/${encodeURIComponent(params.dbId || '')}/permissions?scope=${encodeURIComponent(s)}&principal=${encodeURIComponent(p)}`
       )
       const res = await fetch(url, { method: 'DELETE' })
       if (!res.ok) throw new Error(`${res.status}`)
