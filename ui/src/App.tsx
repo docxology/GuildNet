@@ -129,6 +129,22 @@ function Sidebar() {
       const m = new Map((h?.clusters || []).map((c: any) => [c.id, c.status]))
       return (m.get(props.id) as string) || 'unknown'
     }
+    const tooltip = () => {
+      const h = health()
+      const m = new Map((h?.clusters || []).map((c: any) => [c.id, c]))
+      const item = m.get(props.id) as any
+      if (!item) return `Health: ${status()}`
+      if (item.status === 'error') {
+        const parts = ["Health: error"]
+        if (item.code) parts.push(`code=${item.code}`)
+        if (item.error) parts.push(item.error)
+        return parts.join(' — ')
+      }
+      if (item.status === 'unknown' && item.code) {
+        return `Health: unknown — code=${item.code}`
+      }
+      return `Health: ${item.status}`
+    }
     const dot = () => {
       const h = status()
       if (h === 'ok') return 'bg-green-500'
@@ -136,7 +152,7 @@ function Sidebar() {
       return 'bg-neutral-400'
     }
     return (
-      <A href={`/c/${encodeURIComponent(props.id)}/servers`} class="flex items-center gap-2 px-2 py-1 rounded hover:bg-neutral-100 dark:hover:bg-neutral-800" title={`Health: ${status()}`}>
+      <A href={`/c/${encodeURIComponent(props.id)}/servers`} class="flex items-center gap-2 px-2 py-1 rounded hover:bg-neutral-100 dark:hover:bg-neutral-800" title={tooltip()}>
         <span class={`w-2 h-2 rounded-full ${dot()}`} />
         <span class="truncate text-sm">{props.name || props.id}</span>
         <span class="ml-auto text-[10px] text-neutral-500 uppercase">{status()}</span>

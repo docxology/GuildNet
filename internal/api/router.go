@@ -235,14 +235,22 @@ func Router(deps Deps) *http.ServeMux {
 				name := fmt.Sprint(c["name"]) // include name for UI
 				kc, ok := readClusterKubeconfig(deps.DB, deps.Secrets, id)
 				st := map[string]any{"id": id, "name": name, "status": "unknown"}
-				if ok {
+				if !ok {
+					st["code"] = "no_kubeconfig"
+				} else {
 					if cfg, err := kubeconfigFrom(kc); err == nil {
 						applyProxyOverride(cfg)
-						if healthyCluster(cfg) == nil {
+						if err := healthyCluster(cfg); err == nil {
 							st["status"] = "ok"
 						} else {
 							st["status"] = "error"
+							st["code"] = "cluster_unreachable"
+							st["error"] = err.Error()
 						}
+					} else {
+						st["status"] = "error"
+						st["code"] = "bad_kubeconfig"
+						st["error"] = err.Error()
 					}
 				}
 				arrCL = append(arrCL, st)

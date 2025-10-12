@@ -335,7 +335,7 @@ export async function postClusterAction<T = any>(
 }
 
 export async function getHealthSummary(): Promise<{
-  clusters: Array<{ id: string; status: 'ok' | 'error' | 'unknown' | string }>
+  clusters: Array<{ id: string; name?: string; status: 'ok' | 'error' | 'unknown' | string; code?: string; error?: string }>
   headscale: any[]
 }> {
   try {
