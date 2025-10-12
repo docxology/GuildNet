@@ -1,4 +1,4 @@
-import { Show, createResource, createSignal } from 'solid-js'
+import { Show, createResource, createSignal, createEffect } from 'solid-js'
 import Card from '../components/Card'
 import Input from '../components/Input'
 import { useNavigate, useParams } from '@solidjs/router'
@@ -21,7 +21,6 @@ export default function Settings() {
   const [busy, setBusy] = createSignal(false)
   const [healthDetail, setHealthDetail] = createSignal<{ status: string; code?: string; error?: string } | null>(null)
 
-  // Fetch detailed health info from backend when Settings loads
   const fetchHealthDetail = async () => {
     try {
       const res = await fetch(`/api/deploy/clusters/${encodeURIComponent(clusterId())}?action=health`, { method: 'POST' })
@@ -35,7 +34,12 @@ export default function Settings() {
       setHealthDetail({ status: 'unknown' })
     }
   }
-  fetchHealthDetail()
+
+  // Keep health detail in sync with selected cluster
+  createEffect(() => {
+    const _ = clusterId()
+    fetchHealthDetail()
+  })
 
   const rotateKubeconfig = async () => {
     setBusy(true)
@@ -100,12 +104,16 @@ export default function Settings() {
                   <div>{c().name || '-'}</div>
                 </div>
                 <div>
-                  <div class="text-xs text-neutral-500">Health</div>
-                  <div>{health() || 'unknown'}</div>
+                  <div class="flex items-center justify-between">
+                    <div>
+                      <div class="text-xs text-neutral-500">Health</div>
+                      <div>{healthDetail()?.status || health() || 'unknown'}</div>
+                    </div>
+                    <button class="btn" onClick={() => { refetchHealth(); fetchHealthDetail() }}>Refresh</button>
+                  </div>
                   <Show when={healthDetail()}>
                     {(h) => (
                       <div class="text-xs text-neutral-500 mt-1">
-                        <div>status: {h().status}</div>
                         <Show when={h().code}><div>code: {h().code}</div></Show>
                         <Show when={h().error}><div class="text-red-600 dark:text-red-300 break-all">error: {h().error}</div></Show>
                       </div>

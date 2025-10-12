@@ -237,6 +237,7 @@ func Router(deps Deps) *http.ServeMux {
 				st := map[string]any{"id": id, "name": name, "status": "unknown"}
 				if ok {
 					if cfg, err := kubeconfigFrom(kc); err == nil {
+						applyProxyOverride(cfg)
 						if healthyCluster(cfg) == nil {
 							st["status"] = "ok"
 						} else {
