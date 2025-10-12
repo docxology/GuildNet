@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -535,17 +537,29 @@ func Router(deps Deps) *http.ServeMux {
 			if action == "health" {
 				kc, ok := readClusterKubeconfig(deps.DB, deps.Secrets, id)
 				if !ok {
-					_ = json.NewEncoder(w).Encode(map[string]any{"status": "unknown"})
+					// No kubeconfig available
+					// Log for server diagnostics
+					log.Printf("cluster %s health: no kubeconfig", id)
+					_ = json.NewEncoder(w).Encode(map[string]any{"status": "unknown", "code": "no_kubeconfig"})
 					return
 				}
-				if cfg, err := kubeconfigFrom(kc); err == nil {
-					if err := healthyCluster(cfg); err == nil {
-						_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
-						return
-					}
+				cfg, err := kubeconfigFrom(kc)
+				if err != nil {
+					// Kubeconfig present but invalid YAML/parse error
+					log.Printf("cluster %s health: bad kubeconfig: %v", id, err)
+					_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "code": "bad_kubeconfig", "error": err.Error()})
+					return
 				}
-				_ = json.NewEncoder(w).Encode(map[string]any{"status": "error"})
-				return
+				applyProxyOverride(cfg)
+				if err := healthyCluster(cfg); err == nil {
+					_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+					return
+				} else {
+					// Cluster reachable check failed; include reason and log
+					log.Printf("cluster %s health: unreachable: %v", id, err)
+					_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "code": "cluster_unreachable", "error": err.Error()})
+					return
+				}
 			}
 			if action == "kubeconfig" {
 				kc, ok := readClusterKubeconfig(deps.DB, deps.Secrets, id)
@@ -596,6 +610,7 @@ func Router(deps Deps) *http.ServeMux {
 			httpx.JSONError(w, http.StatusBadRequest, "invalid kubeconfig", "bad_kubeconfig", err.Error())
 			return
 		}
+		applyProxyOverride(cfg)
 		cli, err := kubernetes.NewForConfig(cfg)
 		if err != nil {
 			httpx.JSONError(w, http.StatusInternalServerError, "k8s client error", "k8s_client", err.Error())
@@ -1003,7 +1018,7 @@ func headscaleHealth(endpoint string) (string, error) {
 		return "unknown", nil
 	}
 	u, err := url.Parse(endpoint)
-	if err != nil || u.Host == "" {
+	if err != nil {
 		return "unknown", err
 	}
 	addr := u.Host
@@ -1020,4 +1035,17 @@ func headscaleHealth(endpoint string) (string, error) {
 		return "ok", nil
 	}
 	return "error", err
+}
+
+func applyProxyOverride(cfg *rest.Config) {
+	if cfg == nil {
+		return
+	}
+	if v := strings.TrimSpace(os.Getenv("HOSTAPP_API_PROXY_URL")); v != "" {
+		cfg.Host = v
+		// If using plain HTTP proxy, clear TLS to avoid confusion
+		if strings.HasPrefix(v, "http://") {
+			cfg.TLSClientConfig = rest.TLSClientConfig{}
+		}
+	}
 }

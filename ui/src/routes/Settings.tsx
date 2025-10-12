@@ -19,6 +19,23 @@ export default function Settings() {
   const [health, { refetch: refetchHealth }] = createResource(clusterId, clusterHealth)
   const [kubeconfig, setKubeconfig] = createSignal('')
   const [busy, setBusy] = createSignal(false)
+  const [healthDetail, setHealthDetail] = createSignal<{ status: string; code?: string; error?: string } | null>(null)
+
+  // Fetch detailed health info from backend when Settings loads
+  const fetchHealthDetail = async () => {
+    try {
+      const res = await fetch(`/api/deploy/clusters/${encodeURIComponent(clusterId())}?action=health`, { method: 'POST' })
+      if (res.ok) {
+        const data = await res.json()
+        setHealthDetail({ status: String(data?.status || 'unknown'), code: data?.code, error: data?.error })
+      } else {
+        setHealthDetail({ status: 'unknown' })
+      }
+    } catch {
+      setHealthDetail({ status: 'unknown' })
+    }
+  }
+  fetchHealthDetail()
 
   const rotateKubeconfig = async () => {
     setBusy(true)
@@ -32,6 +49,7 @@ export default function Settings() {
         pushToast({ type: 'success', message: 'Kubeconfig attached' })
         setKubeconfig('')
         refetchHealth()
+        fetchHealthDetail()
       } else {
         pushToast({ type: 'error', message: 'Attach failed' })
       }
@@ -84,6 +102,15 @@ export default function Settings() {
                 <div>
                   <div class="text-xs text-neutral-500">Health</div>
                   <div>{health() || 'unknown'}</div>
+                  <Show when={healthDetail()}>
+                    {(h) => (
+                      <div class="text-xs text-neutral-500 mt-1">
+                        <div>status: {h().status}</div>
+                        <Show when={h().code}><div>code: {h().code}</div></Show>
+                        <Show when={h().error}><div class="text-red-600 dark:text-red-300 break-all">error: {h().error}</div></Show>
+                      </div>
+                    )}
+                  </Show>
                 </div>
               </div>
 
