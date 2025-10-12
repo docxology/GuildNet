@@ -34,7 +34,7 @@ flowchart LR
     RDB["RethinkDB Service\n(28015)"]
   end
 
-  UI -->|HTTPS (single origin)| API
+  UI -->|"HTTPS (single origin)"| API
   UI -->|Iframe / IDE| RP
 
   API -->|Create Workspace| CRD
@@ -63,6 +63,7 @@ flowchart LR
 ```
 
 Key properties
+
 - Single HTTPS origin: UI, APIs, logs, and proxied IDEs share one origin for cookies and security headers.
 - Embedded Operator: a controller inside the Host App manages `Workspace` resources → Deployments and Services.
 - Flexible reachability: traffic to Pods can go through the Kubernetes API server’s pod proxy, a Service ClusterIP/LB, or a managed port‑forward when needed.
@@ -71,25 +72,28 @@ Key properties
 ### Connectivity & Discovery
 
 Kubernetes client configuration (client‑go)
+
 - In‑cluster: automatic when Host App runs inside the cluster.
 - Out‑of‑cluster: reads kubeconfig (default `~/.guildnet/kubeconfig`).
 - Proxy‑aware: if `HOSTAPP_API_PROXY_URL` is set (e.g., http://127.0.0.1:8001 from `kubectl proxy`), client‑go uses that endpoint for discovery and all Kubernetes API calls.
 - NO_PROXY: recommended to include `localhost,127.0.0.1,10.0.0.0/8,.cluster.local` to avoid system proxies interfering with cluster traffic.
 
 Workspace access (reverse proxy)
+
 - Resolution order for `/proxy/server/{id}/...`:
-  1) Target the Workspace Service (ClusterIP/LB) by labels/id.
-  2) If the server declares `Env.AGENT_HOST`, use it (infers scheme by port: 8443 → https, else http).
-  3) Fallback `<dns1123(name)>.${namespace}.svc.cluster.local` with a well‑known port (prefers 8080, else 8443, else first).
-  4) When direct dialing is not viable, use the Kubernetes API server Pod Proxy.
-  5) As a last resort, open a local SPDY port‑forward against the Pod and route via 127.0.0.1:
+  1. Target the Workspace Service (ClusterIP/LB) by labels/id.
+  2. If the server declares `Env.AGENT_HOST`, use it (infers scheme by port: 8443 → https, else http).
+  3. Fallback `<dns1123(name)>.${namespace}.svc.cluster.local` with a well‑known port (prefers 8080, else 8443, else first).
+  4. When direct dialing is not viable, use the Kubernetes API server Pod Proxy.
+  5. As a last resort, open a local SPDY port‑forward against the Pod and route via 127.0.0.1:
 - Dual transports: the proxy uses a standard transport for direct/PF paths, and a Kubernetes API transport for pod‑proxy paths, with header rewrites tuned for iframe use (Location, Set‑Cookie, CSP, COOP/COEP).
 
 Database (RethinkDB) service discovery
+
 - Address precedence:
-  1) `RETHINKDB_ADDR` (host:port) explicit override.
-  2) If inside the cluster: `RETHINKDB_SERVICE_HOST`/`PORT` env vars, else `<service>.<namespace>.svc.cluster.local:28015`.
-  3) Outside the cluster via kubeconfig:
+  1. `RETHINKDB_ADDR` (host:port) explicit override.
+  2. If inside the cluster: `RETHINKDB_SERVICE_HOST`/`PORT` env vars, else `<service>.<namespace>.svc.cluster.local:28015`.
+  3. Outside the cluster via kubeconfig:
      - Prefer Service LoadBalancer IP/hostname.
      - Fallback to NodePort + a node IP (ExternalIP, else InternalIP).
      - Fallback to Service ClusterIP if routed (e.g., via a tailnet subnet router).
@@ -114,6 +118,7 @@ Database (RethinkDB) service discovery
 ### Request Flows
 
 Workspace lifecycle
+
 ```mermaid
 sequenceDiagram
   autonumber
@@ -128,20 +133,22 @@ sequenceDiagram
   K-->>B: 201 Created
   O->>K: Apply Deployment & Service
   K-->>O: OK
-  K-->>B: Pod becomes Ready; Service endpoints populated
-  B-->>U: Server shows Running; IDE iframe available via /proxy
+  K-->>B: Pod becomes Ready, Service endpoints populated
+  B-->>U: Server shows Running, IDE iframe available via /proxy
 ```
 
 Proxy to Workspace
+
 ```mermaid
 flowchart LR
-  B[Browser] -->|GET /proxy/server/{id}/...| H[Host App]
+  B[Browser] -->|GET /proxy/server/:id/...| H[Host App]
   H -->|Service ClusterIP/LB| S[(Service)]
   H -->|Pod Proxy via APIS| A[Kubernetes API]
   H -->|Local PF to Pod| L[127.0.0.1:port]
 ```
 
 Database operations
+
 ```mermaid
 sequenceDiagram
   autonumber
@@ -165,6 +172,7 @@ sequenceDiagram
 ### API Surface (selected)
 
 Core
+
 - GET `/healthz` — liveness
 - GET `/api/ui-config` — minimal UI config
 - GET `/api/images` — presets; GET `/api/image-defaults?image=<ref>`
@@ -174,6 +182,7 @@ Core
 - Reverse proxy: `/proxy?to=host:port&path=/...`, `/proxy/{to}/{rest}`, `/proxy/server/{id}/{rest}`
 
 Database
+
 - GET `/api/db/health` — {status, addr, error?}
 - GET `/api/db` — list databases (per org)
 - POST `/api/db` — create database {id, name?, description?}
