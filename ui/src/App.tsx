@@ -18,6 +18,7 @@ const TableSchema = lazy(() => import('./routes/TableSchema'))
 const TableAudit = lazy(() => import('./routes/TableAudit'))
 const TablePermissions = lazy(() => import('./routes/TablePermissions'))
 const TableImportExport = lazy(() => import('./routes/TableImportExport'))
+const Deploy = lazy(() => import('./routes/Deploy'))
 
 function AppShell(props: RouteSectionProps) {
   const navigate = useNavigate()
@@ -72,6 +73,13 @@ function AppShell(props: RouteSectionProps) {
               Launch
             </A>
             <A
+              href="/deploy"
+              activeClass="text-brand-600"
+              class="hover:underline"
+            >
+              Deploy
+            </A>
+            <A
               href="/databases"
               activeClass="text-brand-600"
               class="hover:underline"
@@ -103,6 +111,7 @@ export default function App() {
         <Route path="/" component={Servers} />
         <Route path="/servers/:id" component={ServerDetail} />
         <Route path="/launch" component={Launch} />
+        <Route path="/deploy" component={Deploy} />
         <Route path="/databases" component={Databases} />
         <Route path="/databases/:dbId" component={DatabaseDetail} />
         <Route path="/databases/:dbId/tables/:table" component={TableView} />

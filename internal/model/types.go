@@ -83,3 +83,99 @@ type ResolveResponse struct {
 	Ports     map[string]int `json:"ports,omitempty"`
 	ExpiresAt string         `json:"expires_at,omitempty"`
 }
+
+// Orchestration data model (stored in local DB)
+
+type Org struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	CreatedAt string `json:"createdAt"`
+}
+
+type HeadscaleInstance struct {
+	ID          string `json:"id"`
+	OrgID       string `json:"orgId,omitempty"`
+	Name        string `json:"name"`
+	Type        string `json:"type"` // managed|external
+	Endpoint    string `json:"endpoint,omitempty"`
+	State       string `json:"state"`
+	ConfigJSON  string `json:"configJSON,omitempty"`
+	Credentials string `json:"credentials,omitempty"` // encrypted blob
+	CreatedAt   string `json:"createdAt"`
+}
+
+type TailnetNamespace struct {
+	ID          string   `json:"id"`
+	HeadscaleID string   `json:"headscaleId"`
+	Name        string   `json:"name"`
+	ACLsJSON    string   `json:"aclsJSON,omitempty"`
+	Tags        []string `json:"tags,omitempty"`
+	CreatedAt   string   `json:"createdAt"`
+}
+
+type PreAuthKey struct {
+	ID          string  `json:"id"`
+	HeadscaleID string  `json:"headscaleId"`
+	NamespaceID string  `json:"namespaceId"`
+	Tag         *string `json:"tag,omitempty"`
+	Value       string  `json:"value"` // encrypted
+	ExpiresAt   *string `json:"expiresAt,omitempty"`
+	LastUsedAt  *string `json:"lastUsedAt,omitempty"`
+}
+
+type TalosCluster struct {
+	ID                 string `json:"id"`
+	OrgID              string `json:"orgId"`
+	HeadscaleID        string `json:"headscaleId"`
+	Name               string `json:"name"`
+	PodCIDR            string `json:"podCIDR"`
+	SvcCIDR            string `json:"svcCIDR"`
+	Version            string `json:"version"`
+	DesiredReplicasCP  int    `json:"desiredReplicasCP"`
+	DesiredReplicasW   int    `json:"desiredReplicasW"`
+	SubnetRouterNodeID string `json:"subnetRouterNodeId,omitempty"`
+	State              string `json:"state"`
+	CreatedAt          string `json:"createdAt"`
+}
+
+type TalosNode struct {
+	ID            string   `json:"id"`
+	ClusterID     string   `json:"clusterId"`
+	Role          string   `json:"role"` // cp|worker
+	ProviderRef   string   `json:"providerRef,omitempty"`
+	TailscaleTags []string `json:"tailscaleTags,omitempty"`
+	TailscaleIP   string   `json:"tailscaleIP,omitempty"`
+	KubeNodeName  string   `json:"kubeNodeName,omitempty"`
+	State         string   `json:"state"`
+	CreatedAt     string   `json:"createdAt"`
+}
+
+type Credential struct {
+	ID        string `json:"id"`
+	ScopeType string `json:"scopeType"`
+	ScopeID   string `json:"scopeId"`
+	Kind      string `json:"kind"`
+	Value     string `json:"value"` // encrypted
+	RotatedAt string `json:"rotatedAt,omitempty"`
+}
+
+type Job struct {
+	ID        string  `json:"id"`
+	Kind      string  `json:"kind"`
+	SpecJSON  string  `json:"specJSON"`
+	Status    string  `json:"status"` // queued|running|succeeded|failed|canceled
+	Progress  float64 `json:"progress"`
+	LogsRef   string  `json:"logsRef,omitempty"`
+	CreatedAt string  `json:"createdAt"`
+	UpdatedAt string  `json:"updatedAt"`
+}
+
+type OrchestrationAuditEvent struct {
+	ID         string `json:"id"`
+	Actor      string `json:"actor"`
+	Action     string `json:"action"`
+	EntityType string `json:"entityType"`
+	EntityID   string `json:"entityId"`
+	DiffJSON   string `json:"diffJSON,omitempty"`
+	TS         string `json:"ts"`
+}
