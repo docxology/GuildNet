@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 type fakeCF struct {
 	closed chan struct{}
 	last   *db.ChangefeedStream
+	mu     sync.Mutex
 }
 
 func (f *fakeCF) ListDatabases(ctx context.Context, orgID string) ([]model.DatabaseInstance, error) {
@@ -55,13 +57,18 @@ func (f *fakeCF) SubscribeTable(ctx context.Context, orgID, dbID, table string) 
 	// populate with a single init event then block until canceled
 	ch <- model.ChangefeedEvent{Type: "init", TableID: table, TS: model.NowISO()}
 	s := &db.ChangefeedStream{C: ch, Cancel: func() { close(ch); close(f.closed) }}
+	f.mu.Lock()
 	f.last = s
+	f.mu.Unlock()
 	return s, nil
 }
 
 func (f *fakeCF) Close() error {
-	if f.last != nil && f.last.Cancel != nil {
-		f.last.Cancel()
+	f.mu.Lock()
+	last := f.last
+	f.mu.Unlock()
+	if last != nil && last.Cancel != nil {
+		last.Cancel()
 	}
 	return nil
 }

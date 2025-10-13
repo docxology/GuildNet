@@ -62,6 +62,13 @@ type Cluster struct {
 
 	// Optional org scope if multi-tenant DB is used per cluster scope
 	OrgID string `json:"org_id,omitempty"`
+
+	// Tailscale per-cluster connector (plain K8S multi-tailnet)
+	TSLoginServer   string `json:"ts_login_server,omitempty"`
+	TSClientAuthKey string `json:"-"` // never echo back
+	TSRoutes        string `json:"ts_routes,omitempty"`
+	TSStatePath     string `json:"ts_state_path,omitempty"`
+	HeadscaleNS     string `json:"headscale_namespace,omitempty"`
 }
 
 // Manager wraps localdb for typed settings.
@@ -173,6 +180,11 @@ func (m Manager) GetCluster(clusterID string, out *Cluster) error {
 	out.IngressAuthSignin = strings.TrimSpace(asString(tmp["ingress_auth_signin"]))
 	out.ImagePullSecret = strings.TrimSpace(asString(tmp["image_pull_secret"]))
 	out.OrgID = strings.TrimSpace(asString(tmp["org_id"]))
+	// TS fields; client auth key intentionally omitted from GET
+	out.TSLoginServer = strings.TrimSpace(asString(tmp["ts_login_server"]))
+	out.TSRoutes = strings.TrimSpace(asString(tmp["ts_routes"]))
+	out.TSStatePath = strings.TrimSpace(asString(tmp["ts_state_path"]))
+	out.HeadscaleNS = strings.TrimSpace(asString(tmp["headscale_namespace"]))
 	return nil
 }
 
@@ -196,6 +208,14 @@ func (m Manager) PutCluster(clusterID string, cs Cluster) error {
 		"ingress_auth_signin":  strings.TrimSpace(cs.IngressAuthSignin),
 		"image_pull_secret":    strings.TrimSpace(cs.ImagePullSecret),
 		"org_id":               strings.TrimSpace(cs.OrgID),
+		"ts_login_server":      strings.TrimSpace(cs.TSLoginServer),
+		"ts_routes":            strings.TrimSpace(cs.TSRoutes),
+		"ts_state_path":        strings.TrimSpace(cs.TSStatePath),
+		"headscale_namespace":  strings.TrimSpace(cs.HeadscaleNS),
+	}
+	// Store client auth key in credentials bucket to avoid accidental echo
+	if strings.TrimSpace(cs.TSClientAuthKey) != "" && m.DB != nil {
+		_ = m.DB.Put("credentials", fmt.Sprintf("cl:%s:ts_client_auth", clusterID), map[string]any{"value": cs.TSClientAuthKey, "encrypted": false})
 	}
 	return m.DB.Put(bucketClusters, clusterID, rec)
 }

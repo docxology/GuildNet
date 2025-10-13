@@ -78,7 +78,7 @@ func HandlerFor(kind string, deps Deps) func(ctx context.Context, j *jobs.Record
 			if id == "" {
 				return
 			}
-			logf("create", "creating talos cluster", map[string]any{"id": id, "name": name})
+			logf("create", "registering cluster", map[string]any{"id": id, "name": name})
 			if deps.DB != nil {
 				var rec map[string]any
 				if err := deps.DB.Get("clusters", id, &rec); err == nil {

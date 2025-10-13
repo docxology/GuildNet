@@ -98,17 +98,6 @@
       "command": "make agent-build",
       "group": "build"
     },
-    {
-      "label": "Talos: fresh deploy",
-      "type": "shell",
-      "command": "make talos-fresh",
-      "group": "build"
-    },
-    {
-      "label": "Talos: upgrade cluster",
-      "type": "shell",
-      "command": "make talos-upgrade",
-      "group": "build"
-    }
+    
   ]
 }

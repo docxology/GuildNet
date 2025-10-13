@@ -438,7 +438,7 @@ func main() {
 		}{Snapshot: metrics.Export()})
 	})
 
-	// Kubernetes client (Talos cluster required; no local mode)
+	// Kubernetes client (use existing Kubernetes; no separate local dev mode)
 	kcli, err := k8s.New(ctx)
 	if err != nil {
 		log.Fatalf("k8s client: %v", err)

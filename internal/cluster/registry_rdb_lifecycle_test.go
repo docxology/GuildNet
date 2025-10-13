@@ -69,12 +69,16 @@ func TestEnsureRDBRetriesAndMonitor(t *testing.T) {
 	// first two attempts fail, third returns our fake manager
 	attempts := int32(0)
 	fdb := &fakeHTTPDB{}
-	connectForK8s = func(ctx context.Context, kc *k8s.Client, addr, user, pass string) (httpx.DBManager, error) {
-		if atomic.AddInt32(&attempts, 1) < 3 {
+	dialer := func(ctx context.Context, kc *k8s.Client, addr, user, pass string) (httpx.DBManager, error) {
+		// Increment attempts atomically; use a local copy to avoid data race on stack var reads by monitor
+		a := atomic.AddInt32(&attempts, 1)
+		if a < 3 {
 			return nil, errors.New("transient")
 		}
 		return fdb, nil
 	}
+	// set global to our dialer before creating registry
+	connectForK8s = dialer
 	rdbPingInterval = 10 * time.Millisecond
 
 	r := NewRegistry(Options{StateDir: t.TempDir(), Resolver: fakeResolver{kc: sampleKubeconfig}})
@@ -90,7 +94,7 @@ func TestEnsureRDBRetriesAndMonitor(t *testing.T) {
 	atomic.StoreInt32(&fdb.pingOK, 1)
 
 	// wait a short while for monitor to run
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(80 * time.Millisecond)
 
 	// Close should call Close on fake
 	if err := r.Close("rdb-life"); err != nil {

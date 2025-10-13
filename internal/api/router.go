@@ -424,33 +424,46 @@ func Router(deps Deps) *http.ServeMux {
 				if !ok {
 					st["code"] = "no_kubeconfig"
 				} else {
-					if cfg, err := kubeconfigFrom(kc); err == nil {
-						// Apply per-cluster overrides and fallback to local proxy
-						applyClusterAPIProxy(cfg, setMgr, id)
-						if err := healthyCluster(cfg); err == nil {
-							st["status"] = "ok"
-						} else {
-							// Auto-heal: on timeout, try enabling local proxy fallback then retry once
-							if isTimeoutErr(err) && ensureProxyFallbackOnTimeout(setMgr, id) {
-								applyClusterAPIProxy(cfg, setMgr, id)
-								if err2 := healthyCluster(cfg); err2 == nil {
-									st["status"] = "ok"
-									st["note"] = "proxy_fallback_enabled"
+					// Prefer registry-provided client (tsnet Dial) if available
+					usedRegistry := false
+					if deps.Registry != nil {
+						if inst, err := deps.Registry.Get(r.Context(), id); err == nil && inst != nil && inst.K8s != nil {
+							cfg2 := inst.K8s.Config()
+							if err2 := healthyCluster(cfg2); err2 == nil {
+								st["status"] = "ok"
+								usedRegistry = true
+							}
+						}
+					}
+					if !usedRegistry {
+						if cfg, err := kubeconfigFrom(kc); err == nil {
+							// Apply per-cluster overrides and fallback to local proxy
+							applyClusterAPIProxy(cfg, setMgr, id)
+							if err := healthyCluster(cfg); err == nil {
+								st["status"] = "ok"
+							} else {
+								// Auto-heal: on timeout, try enabling local proxy fallback then retry once
+								if isTimeoutErr(err) && ensureProxyFallbackOnTimeout(setMgr, id) {
+									applyClusterAPIProxy(cfg, setMgr, id)
+									if err2 := healthyCluster(cfg); err2 == nil {
+										st["status"] = "ok"
+										st["note"] = "proxy_fallback_enabled"
+									} else {
+										st["status"] = "error"
+										st["code"] = "cluster_unreachable"
+										st["error"] = err2.Error()
+									}
 								} else {
 									st["status"] = "error"
 									st["code"] = "cluster_unreachable"
-									st["error"] = err2.Error()
+									st["error"] = err.Error()
 								}
-							} else {
-								st["status"] = "error"
-								st["code"] = "cluster_unreachable"
-								st["error"] = err.Error()
 							}
+						} else {
+							st["status"] = "error"
+							st["code"] = "bad_kubeconfig"
+							st["error"] = err.Error()
 						}
-					} else {
-						st["status"] = "error"
-						st["code"] = "bad_kubeconfig"
-						st["error"] = err.Error()
 					}
 				}
 				arrCL = append(arrCL, st)

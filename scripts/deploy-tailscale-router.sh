@@ -21,7 +21,7 @@ fi
 TS_LOGIN_SERVER=${TS_LOGIN_SERVER:-https://login.tailscale.com}
 # Include control-plane/node LAN, Service CIDR, and Pod CIDR by default
 TS_ROUTES=${TS_ROUTES:-10.0.0.0/24,10.96.0.0/12,10.244.0.0/16}
-TS_HOSTNAME=${TS_HOSTNAME:-talos-subnet-router}
+TS_HOSTNAME=${TS_HOSTNAME:-subnet-router}
 
 cat <<YAML | kubectl apply -f -
 apiVersion: apps/v1
@@ -84,7 +84,15 @@ spec:
 YAML
 
 echo "Waiting for tailscale subnet router to be ready..."
-kubectl -n kube-system rollout status ds/tailscale-subnet-router --timeout=240s || true
+if ! kubectl -n kube-system rollout status ds/tailscale-subnet-router --timeout=300s; then
+  echo "DaemonSet not ready; showing pod status and recent logs:" >&2
+  kubectl -n kube-system get pods -l app=tailscale-subnet-router -o wide || true
+  for p in $(kubectl -n kube-system get pods -l app=tailscale-subnet-router -o name 2>/dev/null | sed 's#pod/##'); do
+    echo "--- logs: $p (last 50 lines) ---"
+    kubectl -n kube-system logs "$p" --tail=50 || true
+  done
+  exit 1
+fi
 
 # Best-effort: show pod status and logs hint
 kubectl -n kube-system get pods -l app=tailscale-subnet-router -o wide || true

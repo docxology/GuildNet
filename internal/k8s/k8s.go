@@ -3,6 +3,7 @@ package k8s
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -64,6 +65,7 @@ func New(ctx context.Context) (*Client, error) {
 func NewFromKubeconfig(ctx context.Context, kubeconfigYAML string, opts struct {
 	APIProxyURL string
 	ForceHTTP   bool
+	Dial        func(ctx context.Context, network, addr string) (net.Conn, error)
 }) (*Client, error) {
 	if strings.TrimSpace(kubeconfigYAML) == "" {
 		return nil, fmt.Errorf("empty kubeconfig")
@@ -83,6 +85,10 @@ func NewFromKubeconfig(ctx context.Context, kubeconfigYAML string, opts struct {
 			u.Scheme = "http"
 			cfg.Host = u.String()
 		}
+	}
+	// Optional custom dialer (e.g., tsnet per-cluster)
+	if opts.Dial != nil {
+		cfg.Dial = opts.Dial
 	}
 	cs, err := kubernetes.NewForConfig(cfg)
 	if err != nil {

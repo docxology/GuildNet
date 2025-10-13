@@ -123,32 +123,7 @@ type PreAuthKey struct {
 	LastUsedAt  *string `json:"lastUsedAt,omitempty"`
 }
 
-type TalosCluster struct {
-	ID                 string `json:"id"`
-	OrgID              string `json:"orgId"`
-	HeadscaleID        string `json:"headscaleId"`
-	Name               string `json:"name"`
-	PodCIDR            string `json:"podCIDR"`
-	SvcCIDR            string `json:"svcCIDR"`
-	Version            string `json:"version"`
-	DesiredReplicasCP  int    `json:"desiredReplicasCP"`
-	DesiredReplicasW   int    `json:"desiredReplicasW"`
-	SubnetRouterNodeID string `json:"subnetRouterNodeId,omitempty"`
-	State              string `json:"state"`
-	CreatedAt          string `json:"createdAt"`
-}
-
-type TalosNode struct {
-	ID            string   `json:"id"`
-	ClusterID     string   `json:"clusterId"`
-	Role          string   `json:"role"` // cp|worker
-	ProviderRef   string   `json:"providerRef,omitempty"`
-	TailscaleTags []string `json:"tailscaleTags,omitempty"`
-	TailscaleIP   string   `json:"tailscaleIP,omitempty"`
-	KubeNodeName  string   `json:"kubeNodeName,omitempty"`
-	State         string   `json:"state"`
-	CreatedAt     string   `json:"createdAt"`
-}
+// (Talos types removed)
 
 type Credential struct {
 	ID        string `json:"id"`

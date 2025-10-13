@@ -4,7 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,6 +15,8 @@ import (
 	"github.com/your/module/internal/httpx"
 	"github.com/your/module/internal/k8s"
 	"github.com/your/module/internal/localdb"
+	"github.com/your/module/internal/settings"
+	"github.com/your/module/internal/ts/connector"
 )
 
 // ID represents a cluster identifier used as the registry key.
@@ -31,8 +36,15 @@ type Instance struct {
 	DB  *localdb.DB
 	K8s *k8s.Client
 	PF  *k8s.PortForwardManager
+	TS  *connector.Connector
 	// Optional per-cluster RethinkDB connector (lazy-initialized interface)
 	RDB httpx.DBManager
+
+	// capture of connectForK8s for race-free reconnects
+	rdbDial func(ctx context.Context, kc *k8s.Client, addr, user, pass string) (httpx.DBManager, error)
+
+	// capture of ping interval to avoid races on global during tests
+	rdbPingInterval time.Duration
 
 	mu  sync.Mutex
 	ctx context.Context
@@ -123,16 +135,53 @@ func (r *Registry) Get(ctx context.Context, clusterID string) (*Instance, error)
 	// Ensure common buckets per cluster
 	_ = db.EnsureBuckets("settings", "cluster-settings", "credentials", "jobs", "joblogs", "audit")
 
-	// Build k8s client
+	// Optional tsnet connector per cluster
+	var conn *connector.Connector
+	{
+		sm := settings.Manager{DB: db}
+		var cs settings.Cluster
+		_ = sm.GetCluster(id, &cs)
+		// Read client auth key from credentials bucket
+		var cred map[string]any
+		_ = db.Get("credentials", "cl:"+id+":ts_client_auth", &cred)
+		clientKey := ""
+		if len(cred) > 0 {
+			if v, ok := cred["value"].(string); ok {
+				clientKey = v
+			}
+		}
+		if strings.TrimSpace(cs.TSLoginServer) != "" || strings.TrimSpace(clientKey) != "" {
+			// Default state dir under ~/.guildnet/tsnet/cluster-<id>
+			state := ""
+			if h, err := os.UserHomeDir(); err == nil {
+				state = filepath.Join(h, ".guildnet", "tsnet", "cluster-"+id)
+			}
+			if c, err := connector.New(connector.Config{ClusterID: id, LoginServer: cs.TSLoginServer, ClientAuthKey: clientKey, StateDir: state}); err == nil {
+				// Best-effort start (non-blocking)
+				_ = c.Start(context.Background())
+				conn = c
+			}
+		}
+	}
+	// Build k8s client, using ts Dial if connector exists and has been started.
+	var dial func(context.Context, string, string) (net.Conn, error)
+	if conn != nil {
+		dial = conn.DialContext
+	}
 	kcli, err := k8s.NewFromKubeconfig(ctx, kc, struct {
 		APIProxyURL string
 		ForceHTTP   bool
-	}{APIProxyURL: "", ForceHTTP: false})
+		Dial        func(ctx context.Context, network, addr string) (net.Conn, error)
+	}{APIProxyURL: "", ForceHTTP: false, Dial: dial})
 	if err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("k8s client: %w", err)
 	}
-	inst := &Instance{id: id, stateDir: clDir, DB: db, K8s: kcli}
+	inst := &Instance{id: id, stateDir: clDir, DB: db, K8s: kcli, TS: conn}
+	// Capture current dialer to avoid races on global variable in tests
+	inst.rdbDial = connectForK8s
+	// Capture ping interval to avoid races on global variable in tests
+	inst.rdbPingInterval = rdbPingInterval
 	inst.PF = k8s.NewPortForwardManagerWithCluster(kcli.Config(), id, "")
 	// tie to context
 	cctx, cancel := context.WithCancel(context.Background())
@@ -168,7 +217,7 @@ func (inst *Instance) EnsureRDB(ctx context.Context, addrOverride, user, pass st
 	delay := 100 * time.Millisecond
 	var lastErr error
 	for i := 0; i < attempts; i++ {
-		mgrIface, err := connectForK8s(ctx, inst.K8s, addrOverride, user, pass)
+		mgrIface, err := inst.rdbDial(ctx, inst.K8s, addrOverride, user, pass)
 		if err == nil && mgrIface != nil {
 			inst.mu.Lock()
 			inst.RDB = mgrIface
@@ -192,7 +241,12 @@ func (inst *Instance) EnsureRDB(ctx context.Context, addrOverride, user, pass st
 // reconnect & health monitor: pings periodically and attempts reconnection on transient failures.
 func (inst *Instance) rdbMonitor() {
 	defer inst.wg.Done()
-	ticker := time.NewTicker(rdbPingInterval)
+	// use instance-captured interval to avoid races with global during tests
+	interval := inst.rdbPingInterval
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -221,7 +275,7 @@ func (inst *Instance) rdbMonitor() {
 						if inst.ctx.Err() != nil {
 							return
 						}
-						newMgrIface, err := connectForK8s(inst.ctx, inst.K8s, "", "", "")
+						newMgrIface, err := inst.rdbDial(inst.ctx, inst.K8s, "", "", "")
 						if err == nil && newMgrIface != nil {
 							inst.mu.Lock()
 							// close old if closable
