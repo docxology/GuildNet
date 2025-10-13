@@ -33,17 +33,14 @@ func IncOp(org, table, op string, delta uint64) {
 	if delta == 0 {
 		delta = 1
 	}
-	for {
-		cur := opCounts.load()
-		next := make(map[key]uint64, len(cur)+1)
-		for k, v := range cur {
-			next[k] = v
-		}
-		k := key{org: org, table: table, op: op}
-		next[k] = next[k] + delta
-		opCounts.swap(next)
-		return
+	cur := opCounts.load()
+	next := make(map[key]uint64, len(cur)+1)
+	for k, v := range cur {
+		next[k] = v
 	}
+	k := key{org: org, table: table, op: op}
+	next[k] = next[k] + delta
+	opCounts.swap(next)
 }
 
 // IncOpCluster increments an operation counter labeled with cluster_id.
@@ -51,17 +48,14 @@ func IncOpCluster(clusterID, org, table, op string, delta uint64) {
 	if delta == 0 {
 		delta = 1
 	}
-	for {
-		cur := opCountsC.load()
-		next := make(map[keyC]uint64, len(cur)+1)
-		for k, v := range cur {
-			next[k] = v
-		}
-		k := keyC{cluster: clusterID, org: org, table: table, op: op}
-		next[k] = next[k] + delta
-		opCountsC.swap(next)
-		return
+	cur := opCountsC.load()
+	next := make(map[keyC]uint64, len(cur)+1)
+	for k, v := range cur {
+		next[k] = v
 	}
+	k := keyC{cluster: clusterID, org: org, table: table, op: op}
+	next[k] = next[k] + delta
+	opCountsC.swap(next)
 }
 
 // ChangefeedInc increments active changefeed gauge.

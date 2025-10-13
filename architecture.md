@@ -1,6 +1,6 @@
 ## GuildNet Architecture
 
-GuildNet provides a single‑origin HTTPS Host App that manages Kubernetes Workspaces and a shared Database, exposing APIs, reverse proxying per‑Workspace UIs (e.g., IDEs), and offering optional tailnet access via Tailscale (tsnet). The Host App embeds a controller that reconciles a custom `Workspace` resource into Deployments and Services. All browser traffic terminates on the Host App for a consistent security boundary.
+GuildNet provides a single‑origin HTTPS Host App that manages Kubernetes Workspaces and per‑cluster database access. The Host App exposes APIs, reverse proxies per‑Workspace UIs (e.g., IDEs), and offers optional tailnet access via Tailscale (tsnet). It embeds an operator-like controller that reconciles a `Workspace` custom resource into Deployments and Services. All browser traffic terminates on the Host App for a consistent security boundary.
 
 ### Component Overview
 
@@ -14,9 +14,9 @@ flowchart LR
     direction TB
     API["API Layer\n(/api/*)"]
     RP["Reverse Proxy\n(/proxy/*)"]
-    SSE[SSE Streams]
+    SSE["SSE Streams\n(changefeeds, logs)"]
     OP["Embedded Operator\n(controller-runtime)"]
-    DBAPI["Database API\n(RethinkDB)"]
+    REG["Registry\n(per-cluster Instances)"]
     TS["tsnet Listener\n:443 (tailnet)"]
   end
 
@@ -48,8 +48,8 @@ flowchart LR
   RP -->|Pod Proxy| APIS
   RP -->|Alt: Direct Service| SVC
 
-  DBAPI -->|Service discovery| APIS
-  DBAPI -->|RPC| RDB
+  REG -->|"per-cluster discovery & DB API"| APIS
+  REG -->|"per-cluster RethinkDB RPC (in-cluster service)"| RDB
 
   TS --> HostApp
   HostApp -->|Encrypted tailnet| TS
@@ -66,8 +66,22 @@ Key properties
 
 - Single HTTPS origin: UI, APIs, logs, and proxied IDEs share one origin for cookies and security headers.
 - Embedded Operator: a controller inside the Host App manages `Workspace` resources → Deployments and Services.
-- Flexible reachability: traffic to Pods can go through the Kubernetes API server’s pod proxy, a Service ClusterIP/LB, or a managed port‑forward when needed.
-- Database integration: a RethinkDB service is discovered from Kubernetes and exposed via Host App APIs for listing, creating databases, tables, and row operations.
+- Per-cluster Instance model: the Host App maintains a `Registry` of per-cluster `Instance` objects. Each Instance holds the cluster-scoped local state (on-disk state dir), a Kubernetes client, a port-forward manager for that cluster, a per-cluster local DB (SQLite) and a lazily-initialized RethinkDB manager used by the DB HTTP API and changefeeds.
+ - Flexible reachability: traffic to Pods can go through the Kubernetes API server’s pod proxy, a Service ClusterIP/LB, or a managed SPDY port‑forward when needed. RethinkDB connections MUST use an in-cluster Service and are not accessed via local SPDY port‑forwards.
+ - Database integration: RethinkDB is discovered per-cluster via in-cluster service discovery; the Host App exposes a DB HTTP API per-cluster for database/table/row operations and SSE changefeeds.
+
+Per-cluster Instance model (Registry)
+
+- Registry: a thread-safe map of active cluster `Instance`s keyed by cluster id. The Host App creates an Instance on demand when a cluster-scoped API or operation is requested.
+- Instance responsibilities:
+  - localdb: per-cluster SQLite used for lightweight host-side state and caching (stored under the Host App state dir with a cluster subdirectory).
+  - k8s client: a cluster-scoped `client-go` configured from kubeconfig or in-cluster settings.
+  - port-forward manager: cluster-scoped manager that tracks SPDY port‑forwards and prevents duplicate forwards for the same pod/port.
+  - RDB manager: an interface-typed wrapper around the RethinkDB client that is created lazily by calling `EnsureRDB` (in-cluster discovery + connect). `EnsureRDB` requires an in-cluster service address and does not create local SPDY port‑forwards.
+  - background workers: changefeed consumers, processors and other long-running goroutines are started bound to the Instance's context so they stop automatically when the Instance is closed.
+  - lifecycle: each Instance has its own context/cancel and a waitgroup. `Registry.Close(clusterID)` cancels the Instance context, closes local and remote DB connections, tears down port-forwards for that Instance and waits for background workers to exit.
+
+This per-cluster model guarantees resource isolation between clusters and makes shutdown/restart deterministic for each cluster.
 
 ### Connectivity & Discovery
 
@@ -88,17 +102,20 @@ Workspace access (reverse proxy)
   5. As a last resort, open a local SPDY port‑forward against the Pod and route via 127.0.0.1:
 - Dual transports: the proxy uses a standard transport for direct/PF paths, and a Kubernetes API transport for pod‑proxy paths, with header rewrites tuned for iframe use (Location, Set‑Cookie, CSP, COOP/COEP).
 
-Database (RethinkDB) service discovery
+Database (RethinkDB) service discovery and connection
 
-- Address precedence:
-  1. `RETHINKDB_ADDR` (host:port) explicit override.
-  2. If inside the cluster: `RETHINKDB_SERVICE_HOST`/`PORT` env vars, else `<service>.<namespace>.svc.cluster.local:28015`.
-  3. Outside the cluster via kubeconfig:
-     - Prefer Service LoadBalancer IP/hostname.
-     - Fallback to NodePort + a node IP (ExternalIP, else InternalIP).
-     - Fallback to Service ClusterIP if routed (e.g., via a tailnet subnet router).
-     - If all else fails, and a Ready Pod exists, establish a temporary SPDY port‑forward to the Pod’s 28015 and use 127.0.0.1:<localport>.
-- Robustness: short, bounded connection attempts; retries/backoff for `DBList`, `DBCreate`, and meta‑table creation to tolerate leader or startup timing.
+- RethinkDB MUST run inside the Talos/Kubernetes cluster. The Host App discovers the DB via in-cluster service discovery and connects to the service address (ClusterIP / LoadBalancer / NodePort) for the configured `RETHINKDB_SERVICE_NAME` and `RETHINKDB_NAMESPACE`.
+
+- Address resolution notes:
+  - When running in-cluster the Host App prefers `RETHINKDB_SERVICE_HOST`/`RETHINKDB_SERVICE_PORT` or DNS name `<service>.<namespace>.svc.cluster.local:28015`.
+  - When running with a kubeconfig the Host App performs Kubernetes service discovery and expects to resolve to a cluster-reachable address (LB/NodePort/ClusterIP). The Host App will fail if the service is not resolvable as an in-cluster reachable address.
+
+- Lazy initialization and monitor:
+  - The Instance lazily creates a per-cluster RethinkDB manager when the DB API or a changefeed is first requested (`EnsureRDB`).
+  - Connections are established with bounded retries and exponential backoff for transient failures.
+  - A per-Instance monitor pings the RethinkDB manager at a configurable interval and classifies errors (transient vs fatal). On transient errors it will attempt reconnection; on fatal errors it surfaces the state to logs/metrics and stops reconnecting.
+
+- Robustness: operations that modify DB meta (create DB/table, ensure meta tables) use short, bounded retry loops so the Host App can tolerate brief startup races or leader elections.
 
 ### Control Plane and Reconciliation
 
@@ -158,11 +175,12 @@ sequenceDiagram
   participant R as RethinkDB Service
 
   U->>B: GET /api/cluster/:id/db
-  B->>K: Discover Service address (LB/NodePort/ClusterIP)
+  B->>REG: Registry.Get(clusterId) -> Instance
+  B->>Instance: Instance.EnsureRDB(ctx) (lazy) => connect (direct or PF)
   alt direct dial works
     B->>R: TCP 28015
   else PF fallback
-    B->>K: SPDY port-forward to Pod:28015
+    B->>K: SPDY port-forward to Pod:28015 (managed by Instance)
     B->>R: TCP 127.0.0.1:<pf>
   end
   R-->>B: DBList
@@ -189,6 +207,17 @@ Database (per-cluster)
 - DELETE `/api/cluster/{clusterId}/db/:dbId` — drop database
 - Table/rows endpoints under `/api/cluster/{clusterId}/db/:dbId/tables/...` including import, query, insert, update, delete
 - GET `/sse/cluster/{clusterId}/db/:dbId/tables/:table/changes` — changefeed (MVP)
+
+Wiring and how the pieces connect
+
+ - HTTP router: when cluster-scoped APIs are hit the router calls `Registry.Get(clusterId)` to obtain the Instance for that cluster. If the endpoint needs RethinkDB access the router invokes `Instance.EnsureRDB(ctx)` which performs in-cluster discovery and connects to the configured in-cluster service. The same Instance (and its RDB manager) is used for HTTP handlers and SSE changefeeds.
+- Background workers & changefeeds: workers are started per-Instance and inherit the Instance context so cancelling the Instance stops all cluster-scoped activity. This ensures predictable shutdown and garbage-free lifecycle.
+ - Port-forward lifecycle: port-forwards are tracked and de-duplicated within the Instance. Forwards are used for reverse-proxying browser/IDE traffic to pods when direct dialing is not viable; they are not used to reach RethinkDB.
+
+Observability and metrics
+
+- Per-cluster metrics: the Host App records operation counters and health metrics with a per-cluster prefix so dashboards and alerts can be scoped to a specific cluster. A Snapshot/exporter endpoint exposes merged metrics for Prometheus scraping or inspection.
+- Health endpoints: `/healthz` for overall process health and additional cluster-scoped health endpoints surface per-Instance RethinkDB connectivity and localdb health.
 
 ### Security and Headers
 

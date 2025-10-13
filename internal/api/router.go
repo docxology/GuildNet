@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -1145,8 +1146,15 @@ func Router(deps Deps) *http.ServeMux {
 			api := &httpx.DBAPI{Manager: func() httpx.DBManager {
 				if deps.Registry != nil {
 					if inst, err := deps.Registry.Get(r.Context(), clusterID); err == nil && inst != nil {
-						if m, ok := inst.RDB.(httpx.DBManager); ok {
-							return m
+						// If not yet initialized, attempt lazy initialization using cluster discovery.
+						if inst.RDB == nil {
+							if err := inst.EnsureRDB(r.Context(), "", "", ""); err != nil {
+								// Log and fall back to nil (handlers will handle nil manager)
+								log.Printf("cluster: ensure rdb failed id=%s err=%v", clusterID, err)
+							}
+						}
+						if inst.RDB != nil {
+							return inst.RDB
 						}
 					}
 				}
@@ -1183,8 +1191,13 @@ func Router(deps Deps) *http.ServeMux {
 			api := &httpx.DBAPI{Manager: func() httpx.DBManager {
 				if deps.Registry != nil {
 					if inst, err := deps.Registry.Get(r.Context(), clusterID); err == nil && inst != nil {
-						if m, ok := inst.RDB.(httpx.DBManager); ok {
-							return m
+						if inst.RDB == nil {
+							if err := inst.EnsureRDB(r.Context(), "", "", ""); err != nil {
+								log.Printf("cluster: ensure rdb failed id=%s err=%v", clusterID, err)
+							}
+						}
+						if inst.RDB != nil {
+							return inst.RDB
 						}
 					}
 				}

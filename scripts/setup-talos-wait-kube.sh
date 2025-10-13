@@ -50,11 +50,9 @@ wait_kube() {
 }
 wait_kube || true
 
-# If DB setup requested, ensure RethinkDB
-if [ "$DB_SETUP" = "1" ]; then
-  if [ -x "$ROOT/scripts/rethinkdb-setup.sh" ]; then
-    "$ROOT/scripts/rethinkdb-setup.sh" || echo "WARNING: RethinkDB setup reported an issue"
-  else
-    echo "WARNING: rethinkdb-setup.sh not found/executable; skipping DB setup" >&2
-  fi
+# Ensure RethinkDB is deployed in-cluster
+if [ -x "$ROOT/scripts/rethinkdb-setup.sh" ]; then
+  "$ROOT/scripts/rethinkdb-setup.sh" || echo "WARNING: RethinkDB setup reported an issue"
+else
+  echo "WARNING: rethinkdb-setup.sh not found/executable; skipping DB setup" >&2
 fi

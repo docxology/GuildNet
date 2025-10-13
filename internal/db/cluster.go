@@ -92,7 +92,7 @@ func ConnectForK8s(ctx context.Context, kc *k8sclient.Client, addrOverride, user
 		}
 	}
 	if addr == "" {
-		addr = "127.0.0.1:28015"
+		return nil, fmt.Errorf("rethinkdb: no in-cluster service address discovered for service '%s' in namespace '%s'", os.Getenv("RETHINKDB_SERVICE_NAME"), os.Getenv("RETHINKDB_NAMESPACE"))
 	}
 	opts := r.ConnectOpts{Address: addr, InitialCap: 2, MaxOpen: 10, Timeout: 3 * time.Second, ReadTimeout: 3 * time.Second, WriteTimeout: 3 * time.Second}
 	if strings.TrimSpace(user) != "" {
