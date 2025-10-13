@@ -441,7 +441,9 @@ func main() {
 	// Kubernetes client (use existing Kubernetes; no separate local dev mode)
 	kcli, err := k8s.New(ctx)
 	if err != nil {
-		log.Fatalf("k8s client: %v", err)
+		// Be tolerant in dev/first run: continue without k8s features
+		log.Printf("k8s client unavailable: %v (continuing without Kubernetes features)", err)
+		kcli = nil
 	}
 	var dyn dynamic.Interface
 	// Optional: local port-forward manager for pods (fallback when API server service/pod proxy is unreliable)
@@ -455,7 +457,11 @@ func main() {
 		}
 		pfMgr = k8s.NewPortForwardManager(kcli.Rest, "default")
 	}
-	log.Printf("Workspace CRD mode active (legacy paths removed)")
+	if kcli != nil && kcli.Rest != nil {
+		log.Printf("Workspace CRD mode active (legacy paths removed)")
+	} else {
+		log.Printf("Kubernetes not available; CRD/operator features disabled")
+	}
 
 	// Start operator (controller-runtime) in-process so status of Workspaces is managed.
 	if kcli != nil && kcli.Rest != nil {
@@ -1372,6 +1378,19 @@ func main() {
 	mux.Handle("/proxy", proxyHandler)
 	mux.Handle("/proxy/", proxyHandler)
 
+	// Resolve listen address: LISTEN_LOCAL env > settings.Global.ListenLocal > default
+	listenAddr := strings.TrimSpace(os.Getenv("LISTEN_LOCAL"))
+	if listenAddr == "" {
+		var g settings.Global
+		_ = setMgr.GetGlobal(&g)
+		if v := strings.TrimSpace(g.ListenLocal); v != "" {
+			listenAddr = v
+		}
+	}
+	if listenAddr == "" {
+		listenAddr = "127.0.0.1:8090"
+	}
+
 	// Wrap with middleware (logging, request id, CORS)
 	corsOrigin := func() string {
 		var g settings.Global
@@ -1379,7 +1398,15 @@ func main() {
 		if strings.TrimSpace(g.FrontendOrigin) != "" {
 			return strings.TrimSpace(g.FrontendOrigin)
 		}
-		// Default dev origin is the Host App on 8090
+		// Default dev origin follows listen address
+		host, port, err := net.SplitHostPort(listenAddr)
+		if err == nil {
+			// When bound to localhost or 127.0.0.1, use that; otherwise use host:port directly
+			if host == "" {
+				host = "127.0.0.1"
+			}
+			return "https://" + net.JoinHostPort(host, port)
+		}
 		return "https://127.0.0.1:8090"
 	}()
 	handler := httpx.RequestID(httpx.Logging(httpx.CORS(corsOrigin)(mux)))
@@ -1404,7 +1431,6 @@ func main() {
 	}
 
 	// local server (TLS only)
-	listenAddr := "127.0.0.1:8090"
 	localSrv := &http.Server{
 		Addr:         listenAddr,
 		Handler:      handler,

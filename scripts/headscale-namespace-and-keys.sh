@@ -4,7 +4,13 @@ set -euo pipefail
 # Outputs: tmp/cluster-<id>-headscale.json with fields: namespace, loginServer, routerAuthKey, clientAuthKey
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+# Preserve explicitly provided environment values across .env sourcing
+_USER_CLUSTER=${CLUSTER:-}
+_USER_HEADSCALE_URL=${HEADSCALE_URL:-}
 [ -f "$ROOT/.env" ] && . "$ROOT/.env"
+# Restore user-provided values if set
+[ -n "$_USER_CLUSTER" ] && CLUSTER="$_USER_CLUSTER"
+[ -n "$_USER_HEADSCALE_URL" ] && HEADSCALE_URL="$_USER_HEADSCALE_URL"
 
 CLUSTER=${CLUSTER:-${1:-default}}
 HEADSCALE_URL=${HEADSCALE_URL:-}

@@ -5,10 +5,41 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 export KUBECONFIG="${KUBECONFIG:-${GN_KUBECONFIG:-$HOME/.guildnet/kubeconfig}}"
 
 POOL_NAME=${METALLB_POOL_NAME:-workspaces}
-POOL_RANGE=${METALLB_POOL_RANGE:-10.0.0.200-10.0.0.250}
+POOL_RANGE=${METALLB_POOL_RANGE:-}
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }; }
 need kubectl
+
+# Skip silently if Kubernetes API is not reachable or kubeconfig is invalid
+if ! kubectl --request-timeout=3s get --raw=/readyz >/dev/null 2>&1; then
+  echo "[metallb] Kubernetes API not reachable or kubeconfig invalid; skipping"
+  exit 0
+fi
+
+# Auto-detect default pool for kind: derive a safe IPv4 /24 from the Docker 'kind' network
+if [ -z "$POOL_RANGE" ]; then
+  if docker network inspect kind >/dev/null 2>&1; then
+    SUBNET=$(docker network inspect kind -f '{{range .IPAM.Config}}{{.Subnet}}{{"\n"}}{{end}}' 2>/dev/null | grep -E '^[0-9]+\.' | head -n1)
+    # Typical kind subnet: 172.18.0.0/16 or 172.21.0.0/16
+    if [ -n "$SUBNET" ]; then
+      ipv4=$(echo "$SUBNET" | cut -d'/' -f1)
+      bits=$(echo "$SUBNET" | cut -d'/' -f2)
+      o1=$(echo "$ipv4" | awk -F. '{print $1}')
+      o2=$(echo "$ipv4" | awk -F. '{print $2}')
+      o3=$(echo "$ipv4" | awk -F. '{print $3}')
+      # If subnet is broader than /24, use .255 for third octet; else reuse existing third octet
+      if [ "${bits:-16}" -ge 24 ] 2>/dev/null; then
+        p3=$o3
+      else
+        p3=255
+      fi
+      base="$o1.$o2.$p3"
+      POOL_RANGE="${base}.200-${base}.250"
+      echo "[metallb] Auto-selected pool for kind (IPv4): $POOL_RANGE"
+    fi
+  fi
+fi
+POOL_RANGE=${POOL_RANGE:-10.0.0.200-10.0.0.250}
 
 # Install MetalLB manifests (idempotent)
 kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.13.12/config/manifests/metallb-native.yaml >/dev/null || true
@@ -19,7 +50,7 @@ kubectl wait --for=condition=Established crd/l2advertisements.metallb.io --timeo
 
 # Wait for controller/speaker rollouts to complete (best-effort)
 kubectl -n metallb-system rollout status deploy/controller --timeout=180s || true
-kubectl -n metallb-system rollout status deploy/speaker --timeout=180s || true
+kubectl -n metallb-system rollout status ds/speaker --timeout=180s || true
 
 # Prepare pool + L2Advertisement manifest
 MANIFEST=$(cat <<YAML

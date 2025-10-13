@@ -18,6 +18,7 @@ PROVIDER ?= lan
 	agent-build \
 	crd-apply operator-run operator-build db-health \
 	setup-headscale setup-tailscale setup-all \
+	kind-up \
 	deploy-k8s-addons deploy-operator deploy-hostapp verify-e2e \
 	diag-router diag-k8s diag-db headscale-approve-routes
 
@@ -45,14 +46,21 @@ setup-tailscale: ## Setup Tailscale router (enable forwarding, up, approve route
 
 ## (Talos flow removed) Use existing Kubernetes and per-cluster router.
 
-setup-all: ## One-command: Headscale up -> LAN sync -> Headscale namespace -> router DS -> addons -> operator -> hostapp -> verify
-	$(MAKE) headscale-up
-	$(MAKE) env-sync-lan
-	$(MAKE) headscale-namespace
-	$(MAKE) router-ensure
-	$(MAKE) deploy-k8s-addons
-	$(MAKE) deploy-operator || true
-	$(MAKE) deploy-hostapp || true
+setup-all: ## One-command: Headscale up -> LAN sync -> ensure Kubernetes (kind) -> Headscale namespace -> router DS -> addons -> operator -> hostapp -> verify
+	@CL=$${CLUSTER:-$${GN_CLUSTER_NAME:-default}}; \
+	echo "[setup-all] Using cluster: $$CL"; \
+	$(MAKE) headscale-up; \
+	$(MAKE) env-sync-lan; \
+	# Ensure Kubernetes is reachable; if not, bring up a local kind cluster and export kubeconfig
+	ok=1; kubectl --request-timeout=3s get --raw=/readyz >/dev/null 2>&1 || ok=0; \
+	if [ $$ok -eq 0 ]; then \
+		$(MAKE) kind-up; \
+	fi; \
+	CLUSTER=$$CL $(MAKE) headscale-namespace; \
+	CLUSTER=$$CL $(MAKE) router-ensure || true; \
+	$(MAKE) deploy-k8s-addons || true; \
+	$(MAKE) deploy-operator || true; \
+	$(MAKE) deploy-hostapp || true; \
 	$(MAKE) verify-e2e || true
 
 # ---------- Build ----------
@@ -104,10 +112,16 @@ stop-all: ## Stop all managed workloads via admin API
 CRD_DIR ?= config/crd
 crd-apply: ## Apply (or update) GuildNet CRDs into current kube-context
 	@[ -d $(CRD_DIR) ] || { echo "CRD dir $(CRD_DIR) missing"; exit 1; }
-	@for f in $(CRD_DIR)/*.yaml; do \
-		echo "kubectl apply -f $$f"; \
-		KUBECONFIG=$(GN_KUBECONFIG) kubectl apply -f $$f >/dev/null || exit 1; \
-	done; echo "CRDs applied"
+	@ok=1; kubectl --request-timeout=3s get --raw=/readyz >/dev/null 2>&1 || ok=0; \
+	if [ $$ok -eq 0 ]; then \
+		echo "[crd-apply] Kubernetes API not reachable or kubeconfig invalid; skipping"; \
+	else \
+		for f in $(CRD_DIR)/*.yaml; do \
+			echo "kubectl apply -f $$f"; \
+			KUBECONFIG=$(GN_KUBECONFIG) kubectl apply -f $$f >/dev/null || exit 1; \
+		done; \
+		echo "CRDs applied"; \
+	fi
 
 operator-run: ## Run workspace operator (controller-runtime manager) locally
 	go run ./cmd/hostapp --mode operator 2>&1 | sed 's/^/[operator] /'
@@ -256,18 +270,42 @@ headscale-namespace: ## Ensure Headscale namespace and emit keys (CLUSTER=...)
 	CLUSTER=$${CLUSTER:-$${GN_CLUSTER_NAME:-default}} bash ./scripts/headscale-namespace-and-keys.sh
 
 router-ensure: ## Deploy Tailscale subnet router DaemonSet (uses tmp/cluster-<id>-headscale.json when present)
-	@set -e; \
-	CL=$${CLUSTER:-$${GN_CLUSTER_NAME:-default}}; \
-	J=tmp/cluster-$$CL-headscale.json; \
-	if [ -f $$J ]; then \
-	  TS_AUTHKEY=$$(jq -r '.routerAuthKey' $$J); \
-	  TS_LOGIN_SERVER=$$(jq -r '.loginServer' $$J); \
-	  : $${TS_ROUTES:=$${GN_TS_ROUTES:-10.96.0.0/12,10.244.0.0/16}}; \
-	  : $${TS_HOSTNAME:=router-$$CL}; \
-	  TS_AUTHKEY="$$TS_AUTHKEY" TS_LOGIN_SERVER="$$TS_LOGIN_SERVER" TS_ROUTES="$$TS_ROUTES" TS_HOSTNAME="$$TS_HOSTNAME" bash ./scripts/deploy-tailscale-router.sh; \
-	else \
-	  echo "Missing $$J; run: make headscale-namespace CLUSTER=$$CL"; exit 2; \
-	fi
+		@set -e; \
+		CL=$${CLUSTER:-$${GN_CLUSTER_NAME:-}}; \
+		if [ -z "$$CL" ]; then \
+			CNT=$$(ls -1 tmp/cluster-*-headscale.json 2>/dev/null | wc -l | tr -d ' '); \
+			if [ "$$CNT" = "1" ]; then \
+				J=$$(ls -1 tmp/cluster-*-headscale.json); \
+				CL=$$(basename "$$J" | sed -E 's/^cluster-(.+)-headscale\.json/\1/'); \
+			fi; \
+		fi; \
+		: $${CL:=$${GN_CLUSTER_NAME:-default}}; \
+		J=tmp/cluster-$$CL-headscale.json; \
+		if [ ! -f $$J ]; then \
+			CNT=$$(ls -1 tmp/cluster-*-headscale.json 2>/dev/null | wc -l | tr -d ' '); \
+			if [ "$$CNT" = "1" ]; then \
+				J=$$(ls -1 tmp/cluster-*-headscale.json); \
+				CL=$$(basename "$$J" | sed -E 's/^cluster-(.+)-headscale\.json/\1/'); \
+				echo "[router-ensure] Auto-detected cluster: $$CL"; \
+			else \
+				echo "Missing $$J; run: make headscale-namespace CLUSTER=$$CL"; exit 0; \
+			fi; \
+		fi; \
+		if [ ! -f "$(GN_KUBECONFIG)" ]; then \
+			echo "[router-ensure] No kubeconfig at $(GN_KUBECONFIG); skipping"; exit 0; \
+		fi; \
+		if ! kubectl version --request-timeout=3s >/dev/null 2>&1; then \
+			echo "[router-ensure] Kubernetes API not reachable; skipping"; exit 0; \
+		fi; \
+		TS_AUTHKEY=$$(jq -r '.routerAuthKey' $$J); \
+		TS_LOGIN_SERVER=$$(jq -r '.loginServer' $$J); \
+		: $${TS_ROUTES:=$${GN_TS_ROUTES:-10.96.0.0/12,10.244.0.0/16}}; \
+		: $${TS_HOSTNAME:=router-$$CL}; \
+		TS_AUTHKEY="$$TS_AUTHKEY" TS_LOGIN_SERVER="$$TS_LOGIN_SERVER" TS_ROUTES="$$TS_ROUTES" TS_HOSTNAME="$$TS_HOSTNAME" bash ./scripts/deploy-tailscale-router.sh
 
 plain-quickstart: ## Alias to setup-all for plain K8S flow
 	$(MAKE) setup-all
+
+# ---------- Kind (local Kubernetes) ----------
+kind-up: ## Create a local kind cluster and write kubeconfig to $(GN_KUBECONFIG)
+	bash ./scripts/kind-setup.sh

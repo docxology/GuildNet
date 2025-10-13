@@ -11,6 +11,12 @@ IMAGE=${OPERATOR_IMAGE:-ghcr.io/your/module/hostapp:latest}
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }; }
 need kubectl
 
+# Skip silently if Kubernetes API is not reachable or kubeconfig is invalid
+if ! kubectl --request-timeout=3s get --raw=/readyz >/dev/null 2>&1; then
+  echo "[operator] Kubernetes API not reachable or kubeconfig invalid; skipping"
+  exit 0
+fi
+
 kubectl get ns "$NAMESPACE" >/dev/null 2>&1 || kubectl create ns "$NAMESPACE"
 
 # Minimal RBAC for controller-runtime manager across namespaces

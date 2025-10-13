@@ -70,9 +70,9 @@ spec:
         - -c
         - |
           set -e
-          /usr/sbin/tailscaled --state=/var/lib/tailscale/tailscaled.state &
+          /usr/local/bin/tailscaled --state=/var/lib/tailscale/tailscaled.state &
           sleep 2
-          tailscale up --authkey="${TS_AUTHKEY}" --login-server="${TS_LOGIN_SERVER}" --advertise-routes="${TS_ROUTES}" --hostname="${TS_HOSTNAME}" --accept-routes
+          /usr/local/bin/tailscale up --authkey="${TS_AUTHKEY}" --login-server="${TS_LOGIN_SERVER}" --advertise-routes="${TS_ROUTES}" --hostname="${TS_HOSTNAME}" --accept-routes
           tail -f /dev/null
       volumes:
       - name: state
