@@ -30,7 +30,6 @@ import (
 	crlog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	"github.com/your/module/internal/db"
 	"github.com/your/module/internal/httpx"
 	"github.com/your/module/internal/k8s"
 	"github.com/your/module/internal/metrics"
@@ -58,9 +57,39 @@ import (
 
 	// New imports
 	"github.com/your/module/internal/api"
+	"github.com/your/module/internal/cluster"
 	"github.com/your/module/internal/localdb"
 	"github.com/your/module/internal/secrets"
 )
+
+// kubeconfigResolver implements cluster.Resolver backed by localdb credentials.
+type kubeconfigResolver struct {
+	DB  *localdb.DB
+	Sec *secrets.Manager
+}
+
+func (r kubeconfigResolver) KubeconfigYAML(clusterID string) (string, error) {
+	if r.DB == nil {
+		return "", fmt.Errorf("no db")
+	}
+	var cred map[string]any
+	key := fmt.Sprintf("cl:%s:kubeconfig", clusterID)
+	if err := r.DB.Get("credentials", key, &cred); err != nil {
+		return "", err
+	}
+	val := fmt.Sprint(cred["value"])
+	if enc, _ := cred["encrypted"].(bool); enc {
+		if r.Sec == nil {
+			return "", fmt.Errorf("encrypted but no secrets manager")
+		}
+		s, err := r.Sec.Decrypt(val)
+		if err != nil {
+			return "", err
+		}
+		return s, nil
+	}
+	return val, nil
+}
 
 // startOperator boots a controller-runtime manager that reconciles Workspace CRDs.
 func startOperator(ctx context.Context, restCfg *rest.Config) error {
@@ -295,7 +324,7 @@ func main() {
 		gset.FrontendOrigin = "https://127.0.0.1:8090"
 		changed = true
 	}
-	gset.EmbedOperator = gset.EmbedOperator // no-op; keep existing
+	// keep existing EmbedOperator value as-is
 	if changed {
 		_ = setMgr.PutGlobal(gset)
 	}
@@ -325,26 +354,11 @@ func main() {
 		}
 	}()
 
-	// Initialize RethinkDB from settings if present
-	var dbMgr *db.Manager
-	var dbSet settings.Database
-	_ = setMgr.GetDatabase(&dbSet)
-	if strings.TrimSpace(dbSet.Addr) != "" {
-		if mgr, derr := db.ConnectWithOptions(ctx, dbSet.Addr, dbSet.User, dbSet.Pass); derr != nil {
-			log.Printf("rethinkdb unavailable (using without DB features): %v", derr)
-		} else {
-			dbMgr = mgr
-		}
-	} else {
-		if mgr, derr := db.Connect(ctx); derr != nil {
-			log.Printf("rethinkdb unavailable (databases feature off): %v", derr)
-		} else {
-			dbMgr = mgr
-		}
-	}
+	// Per-cluster registry (always on in prototype)
+	reg := cluster.NewRegistry(cluster.Options{StateDir: stateDir, Resolver: kubeconfigResolver{DB: ldb, Sec: sec}})
 
 	// New orchestration API wired with dependencies and settings change hook
-	deps := api.Deps{DB: ldb, Secrets: sec, Runner: nil, DBMgr: dbMgr, OnSettingsChanged: func(kind string) {
+	deps := api.Deps{DB: ldb, Secrets: sec, Runner: nil, Registry: reg, OnSettingsChanged: func(kind string) {
 		log.Printf("settings updated: %s; restarting to apply", kind)
 		stop() // trigger graceful shutdown; external supervisor restarts process
 	}}

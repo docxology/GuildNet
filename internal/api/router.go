@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"nhooyr.io/websocket"
 
+	"github.com/your/module/internal/cluster"
 	"github.com/your/module/internal/httpx"
 	"github.com/your/module/internal/jobs"
 	"github.com/your/module/internal/localdb"
@@ -22,8 +23,6 @@ import (
 	"github.com/your/module/internal/proxy"
 	"github.com/your/module/internal/secrets"
 
-	// Added for DB API delegation
-	"github.com/your/module/internal/db"
 	// New settings
 	"github.com/your/module/internal/settings"
 
@@ -43,10 +42,10 @@ type Deps struct {
 	Secrets *secrets.Manager
 	Runner  *jobs.Runner
 	Token   string // optional bearer token for mutating endpoints
-	// Optional shared DB manager for database API; if nil, handlers will lazy-connect
-	DBMgr *db.Manager
 	// Optional callback to trigger host restart/reload when certain settings change
 	OnSettingsChanged func(kind string)
+	// Optional per-cluster registry for isolation
+	Registry *cluster.Registry
 }
 
 func (d Deps) ensure() Deps {
@@ -207,10 +206,7 @@ func Router(deps Deps) *http.ServeMux {
 			if deps.OnSettingsChanged != nil {
 				deps.OnSettingsChanged("database")
 			}
-			// Reconnect shared DB manager if present
-			if deps.DBMgr != nil {
-				// no live reconnect here; hostapp will handle reload
-			}
+			// No-op: global DB manager removed in prototype
 			httpx.JSON(w, http.StatusOK, map[string]any{"ok": true})
 			return
 		}
@@ -253,16 +249,27 @@ func Router(deps Deps) *http.ServeMux {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
+		// Always use per-cluster DB via registry
+		if deps.Registry == nil {
+			httpx.JSONError(w, http.StatusServiceUnavailable, "registry not available", "no_registry")
+			return
+		}
+		inst, err := deps.Registry.Get(r.Context(), id)
+		if err != nil || inst == nil {
+			httpx.JSONError(w, http.StatusNotFound, "cluster not found", "no_cluster")
+			return
+		}
+		sm := settings.Manager{DB: inst.DB}
 		if r.Method == http.MethodGet {
 			var cs settings.Cluster
-			_ = setMgr.GetCluster(id, &cs)
+			_ = sm.GetCluster(id, &cs)
 			_ = json.NewEncoder(w).Encode(cs)
 			return
 		}
 		if r.Method == http.MethodPut {
 			var cs settings.Cluster
 			_ = json.NewDecoder(r.Body).Decode(&cs)
-			_ = setMgr.PutCluster(id, cs)
+			_ = sm.PutCluster(id, cs)
 			if deps.OnSettingsChanged != nil {
 				deps.OnSettingsChanged("cluster:" + id)
 			}
@@ -805,33 +812,44 @@ func Router(deps Deps) *http.ServeMux {
 			return
 		}
 		clusterID := parts[0]
-		// build clients for this cluster from stored kubeconfig
-		kc, ok := readClusterKubeconfig(deps.DB, deps.Secrets, clusterID)
-		if !ok || strings.TrimSpace(kc) == "" {
-			httpx.JSONError(w, http.StatusNotFound, "cluster kubeconfig not found", "no_kubeconfig")
+		// Optionally resolve via per-cluster registry
+		var (
+			cfg         *rest.Config
+			cli         *kubernetes.Clientset
+			dyn         dynamic.Interface
+			cs          settings.Cluster
+			setMgrLocal settings.Manager
+		)
+		setMgrLocal = setMgr
+		if deps.Registry != nil {
+			if inst, err := deps.Registry.Get(r.Context(), clusterID); err == nil && inst != nil {
+				// Use per-cluster DB for settings
+				setMgrLocal = settings.Manager{DB: inst.DB}
+				// Build clients from instance
+				cfg = inst.K8s.Config()
+				// Apply proxy overrides
+				applyClusterAPIProxy(cfg, setMgrLocal, clusterID)
+				// Clients
+				var e error
+				cli, e = kubernetes.NewForConfig(cfg)
+				if e != nil {
+					httpx.JSONError(w, http.StatusInternalServerError, "k8s client error", "k8s_client", e.Error())
+					return
+				}
+				dyn, e = dynamic.NewForConfig(cfg)
+				if e != nil {
+					httpx.JSONError(w, http.StatusInternalServerError, "dynamic client error", "dyn_client", e.Error())
+					return
+				}
+			}
+		}
+		// Require registry to provide clients in prototype
+		if cli == nil || dyn == nil {
+			httpx.JSONError(w, http.StatusServiceUnavailable, "registry not available", "no_registry")
 			return
 		}
-		cfg, err := kubeconfigFrom(kc)
-		if err != nil {
-			httpx.JSONError(w, http.StatusBadRequest, "invalid kubeconfig", "bad_kubeconfig", err.Error())
-			return
-		}
-		// Apply cluster-scoped overrides and fallback to local proxy
-		applyClusterAPIProxy(cfg, setMgr, clusterID)
-		// Build clients
-		cli, err := kubernetes.NewForConfig(cfg)
-		if err != nil {
-			httpx.JSONError(w, http.StatusInternalServerError, "k8s client error", "k8s_client", err.Error())
-			return
-		}
-		dyn, err := dynamic.NewForConfig(cfg)
-		if err != nil {
-			httpx.JSONError(w, http.StatusInternalServerError, "dynamic client error", "dyn_client", err.Error())
-			return
-		}
-		// Fetch per-cluster settings to derive default namespace
-		var cs settings.Cluster
-		_ = setMgr.GetCluster(clusterID, &cs)
+		// Fetch per-cluster settings to derive default namespace using (possibly) per-cluster DB
+		_ = setMgrLocal.GetCluster(clusterID, &cs)
 		defaultNS := strings.TrimSpace(cs.Namespace)
 		if defaultNS == "" {
 			defaultNS = "default"
@@ -1125,8 +1143,12 @@ func Router(deps Deps) *http.ServeMux {
 		// Per-cluster Databases API routes: delegate to httpx.DBAPI with OrgID=clusterID
 		if len(parts) >= 2 && parts[1] == "db" {
 			api := &httpx.DBAPI{Manager: func() httpx.DBManager {
-				if deps.DBMgr != nil {
-					return deps.DBMgr
+				if deps.Registry != nil {
+					if inst, err := deps.Registry.Get(r.Context(), clusterID); err == nil && inst != nil {
+						if m, ok := inst.RDB.(httpx.DBManager); ok {
+							return m
+						}
+					}
 				}
 				// nil -> lazy connect inside handler
 				return nil
@@ -1159,8 +1181,12 @@ func Router(deps Deps) *http.ServeMux {
 		clusterID := parts[0]
 		if len(parts) >= 2 && parts[1] == "db" {
 			api := &httpx.DBAPI{Manager: func() httpx.DBManager {
-				if deps.DBMgr != nil {
-					return deps.DBMgr
+				if deps.Registry != nil {
+					if inst, err := deps.Registry.Get(r.Context(), clusterID); err == nil && inst != nil {
+						if m, ok := inst.RDB.(httpx.DBManager); ok {
+							return m
+						}
+					}
 				}
 				return nil
 			}(), OrgID: clusterID, RBAC: httpx.NewRBACStore()}

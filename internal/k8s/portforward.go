@@ -21,6 +21,7 @@ import (
 type PortForwardManager struct {
 	cfg       *rest.Config
 	namespace string
+	clusterID string
 	mu        sync.Mutex
 	forwards  map[string]*pfEntry // key: ns/pod:port
 }
@@ -32,7 +33,13 @@ type pfEntry struct {
 }
 
 func NewPortForwardManager(cfg *rest.Config, namespace string) *PortForwardManager {
+	// Backward-compatible constructor (no explicit cluster id)
 	return &PortForwardManager{cfg: cfg, namespace: namespace, forwards: make(map[string]*pfEntry)}
+}
+
+// NewPortForwardManagerWithCluster sets a cluster ID to ensure keys are globally unique across clusters.
+func NewPortForwardManagerWithCluster(cfg *rest.Config, clusterID, namespace string) *PortForwardManager {
+	return &PortForwardManager{cfg: cfg, namespace: namespace, clusterID: clusterID, forwards: make(map[string]*pfEntry)}
 }
 
 // Ensure ensures a port-forward is running to pod:podPort and returns localPort.
@@ -40,7 +47,7 @@ func (m *PortForwardManager) Ensure(ctx context.Context, namespace, pod string, 
 	if namespace == "" {
 		namespace = m.namespace
 	}
-	key := fmt.Sprintf("%s/%s:%d", namespace, pod, podPort)
+	key := fmt.Sprintf("%s|%s/%s:%d", m.clusterID, namespace, pod, podPort)
 	m.mu.Lock()
 	if e, ok := m.forwards[key]; ok {
 		lp := e.localPort

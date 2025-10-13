@@ -317,6 +317,24 @@ func isTransientErr(err error) bool {
 	return false
 }
 
+// ClassifyError returns a coarse classification for connector errors: transient, auth, schema, fatal.
+func ClassifyError(err error) string {
+	if err == nil {
+		return "none"
+	}
+	s := strings.ToLower(err.Error())
+	if isTransientErr(err) {
+		return "transient"
+	}
+	if strings.Contains(s, "auth") || strings.Contains(s, "unauthorized") || strings.Contains(s, "permission") {
+		return "auth"
+	}
+	if strings.Contains(s, "no such table") || strings.Contains(s, "no such database") || strings.Contains(s, "missing") {
+		return "schema"
+	}
+	return "fatal"
+}
+
 func retryTransient(attempts int, fn func() error) error {
 	if attempts < 1 {
 		attempts = 1
