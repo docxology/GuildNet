@@ -24,6 +24,11 @@ fi
 CLUSTER=${CLUSTER:-guildnet}
 NAMESPACE=${NAMESPACE:-default}
 
+# Optional: TALOS_DISK (MB) - when set, passed to `talosctl cluster create --disk` (qemu)
+TALOS_DISK=${TALOS_DISK:-}
+# Optional: TALOS_INSTALL_IMAGE - explicit installer image to pass to talosctl (overrides bundle)
+TALOS_INSTALL_IMAGE=${TALOS_INSTALL_IMAGE:-}
+
 # Support Headscale aliases
 if [ -n "${HEADSCALE_URL:-}" ] && [ -z "${TS_LOGIN_SERVER:-}" ]; then
   TS_LOGIN_SERVER="$HEADSCALE_URL"
@@ -215,7 +220,23 @@ main() {
   if [ $reuse -ne 1 ]; then
   log "Creating Talos cluster: $CLUSTER (provisioner=${TALOS_PROVISIONER:-auto}, cidr=${TALOS_CIDR})"
     set +e
-  talosctl cluster create --name "$CLUSTER" --workers 0 --wait ${TALOS_PROVISIONER:+--provisioner "$TALOS_PROVISIONER"} --cidr "$TALOS_CIDR"
+  # If TALOS_DISK is set and we're using the qemu provisioner, include disk size flag
+  DISK_FLAG=""
+  if [ -n "${TALOS_DISK:-}" ]; then
+    if [ "${TALOS_PROVISIONER}" = "qemu" ]; then
+      DISK_FLAG="--disk ${TALOS_DISK}"
+      log "Using TALOS_DISK=${TALOS_DISK} (MB) -> passing ${DISK_FLAG} to talosctl"
+    else
+      log "disk flag has been set but has no effect with the ${TALOS_PROVISIONER:-docker} provisioner"
+    fi
+  fi
+  # Optionally pass an explicit installer image
+  INSTALL_FLAG=""
+  if [ -n "${TALOS_INSTALL_IMAGE:-}" ]; then
+    INSTALL_FLAG="--install-image ${TALOS_INSTALL_IMAGE}"
+    log "Using TALOS_INSTALL_IMAGE=${TALOS_INSTALL_IMAGE} -> passing ${INSTALL_FLAG} to talosctl"
+  fi
+  talosctl cluster create --name "$CLUSTER" --workers 0 --wait ${TALOS_PROVISIONER:+--provisioner "$TALOS_PROVISIONER"} ${DISK_FLAG} ${INSTALL_FLAG} --cidr "$TALOS_CIDR"
     rc=$?
     set -e
     if [ $rc -ne 0 ]; then
@@ -225,7 +246,7 @@ main() {
       set -e
       ALT_CIDR=${ALT_CIDR:-10.66.0.0/24}
       log "Recreating cluster with alternate CIDR ${ALT_CIDR}"
-  talosctl cluster create --name "$CLUSTER" --workers 0 --wait ${TALOS_PROVISIONER:+--provisioner "$TALOS_PROVISIONER"} --cidr "$ALT_CIDR"
+  talosctl cluster create --name "$CLUSTER" --workers 0 --wait ${TALOS_PROVISIONER:+--provisioner "$TALOS_PROVISIONER"} ${DISK_FLAG} ${INSTALL_FLAG} --cidr "$ALT_CIDR"
     fi
   # After creation, capture newest context (version sort)
   ctx=$(kubectl config get-contexts -o name | grep "admin@${CLUSTER}" | sort -V | tail -n 1 || true)

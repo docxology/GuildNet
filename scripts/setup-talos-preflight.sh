@@ -8,7 +8,7 @@ need talosctl
 # Router health gate (best-effort)
 if command -v tailscale >/dev/null 2>&1; then
   if ! tailscale status >/dev/null 2>&1; then
-    echo "WARN: tailscale not connected; run: make setup-tailscale" >&2
+    echo "WARN: tailscale not connected; run: sudo make setup-tailscale" >&2
   fi
 fi
 

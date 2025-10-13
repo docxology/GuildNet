@@ -88,7 +88,7 @@ Join existing (another device):
 
 Notes:
 
-- You can also use `make setup-tailscale` to run the end-to-end router setup (enables IP forwarding, brings Tailscale up, attempts route approval).
+- You can also use `sudo make setup-tailscale` to run the end-to-end router setup (enables IP forwarding, brings Tailscale up, attempts route approval).
 - Route examples commonly include cluster/service/pod CIDRs (e.g., `10.96.0.0/12`, `10.244.0.0/16`) plus any node CIDRs.
 
 ## 3) Talos (new cluster or use existing)

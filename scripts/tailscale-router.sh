@@ -50,11 +50,20 @@ start() {
   if ! need tailscaled; then err "tailscaled not installed; run: scripts/tailscale-router.sh install"; exit 1; fi
   # Start daemon if not running
   if command -v systemctl >/dev/null 2>&1; then
-    # Try user/system, then sudo (non-interactive) as fallback
-    systemctl --user enable --now tailscaled 2>/dev/null || true
-    systemctl enable --now tailscaled 2>/dev/null || sudo -n systemctl enable --now tailscaled 2>/dev/null || true
+    # If running as root, operate on system service directly.
+    if [ "$(id -u)" -eq 0 ]; then
+      systemctl enable --now tailscaled 2>/dev/null || true
+    else
+      # Try user/system, then sudo (non-interactive) as fallback
+      systemctl --user enable --now tailscaled 2>/dev/null || true
+      systemctl enable --now tailscaled 2>/dev/null || sudo -n systemctl enable --now tailscaled 2>/dev/null || true
+    fi
   elif command -v service >/dev/null 2>&1; then
-    service tailscaled start || sudo -n service tailscaled start || true
+    if [ "$(id -u)" -eq 0 ]; then
+      service tailscaled start || true
+    else
+      service tailscaled start || sudo -n service tailscaled start || true
+    fi
   else
     # macOS: try brew services first, otherwise run tailscaled in user space
     if command -v brew >/dev/null 2>&1; then
@@ -76,7 +85,29 @@ up() {
     err "TS_LOGIN_SERVER points to 127.0.0.1 which may not be reachable from this router host. Use a reachable URL."
   fi
   start
-  # Try without sudo first
+  # If running as root (sudo make ...), prefer running tailscale directly and set operator
+  OP_USER=${SUDO_USER:-${USER:-root}}
+  if [ "$(id -u)" -eq 0 ]; then
+    # Ensure service is running as system service
+    systemctl enable --now tailscaled 2>/dev/null || true
+    # Try to set operator (best-effort)
+    tailscale set --operator="$OP_USER" >/dev/null 2>&1 || true
+    if tailscale up \
+      --reset \
+      --authkey="$TS_AUTHKEY" \
+      --login-server="$TS_LOGIN_SERVER" \
+      --advertise-routes="$TS_ROUTES" \
+      --hostname="$TS_HOSTNAME" \
+      --accept-routes \
+      --accept-dns=false \
+      --timeout=60s; then
+      return 0
+    fi
+    err "tailscale up failed when running as root. Ensure the daemon is running and the auth key is valid."
+    exit 1
+  fi
+
+  # Try without sudo first for non-root users
   if tailscale up \
     --reset \
     --authkey="$TS_AUTHKEY" \
@@ -88,7 +119,8 @@ up() {
     --timeout=60s; then
     return 0
   fi
-  # Try non-interactive sudo
+
+  # Try non-interactive sudo for non-root
   if command -v sudo >/dev/null 2>&1; then
     sudo -n tailscale set --operator="$USER" >/dev/null 2>&1 || true
     if sudo -n tailscale up \
