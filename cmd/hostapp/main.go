@@ -251,7 +251,8 @@ func main() {
 		return
 	case "operator":
 		// Run only the operator manager (no tsnet or HTTP server)
-		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		// Terminate on INT/TERM/HUP/QUIT to match typical terminal behavior (close window, Ctrl+C)
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 		defer stop()
 		kcli, err := k8s.New(ctx)
 		if err != nil || kcli == nil || kcli.Rest == nil {
@@ -276,9 +277,14 @@ func main() {
 		log.Fatalf("invalid config: %v", err)
 	}
 
-	// Create cancellation context for the serve lifecycle
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	// Create cancellation context for the serve lifecycle; include HUP/QUIT so closing the terminal also stops the server
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 	defer stop()
+
+	// On Linux, ask the kernel to send us SIGTERM if the parent dies (e.g., terminal closed).
+	if strings.ToLower(strings.TrimSpace(os.Getenv("GN_DISABLE_PDEATHSIG"))) != "1" {
+		_ = setParentDeathSignal(syscall.SIGTERM)
+	}
 
 	// Server-first runtime: open local DB and secrets manager
 	stateDir := config.StateDir()
@@ -335,6 +341,10 @@ func main() {
 		log.Fatalf("tsnet start: %v", err)
 	}
 	tsServer := s
+	// Ensure tsnet server is closed on exit to avoid lingering background activity
+	defer func() {
+		_ = tsServer.Close()
+	}()
 
 	mux := http.NewServeMux()
 
@@ -1497,6 +1507,8 @@ func main() {
 			_ = v6Srv.Shutdown(shutdownCtx)
 		}
 		_ = tsSrv.Shutdown(shutdownCtx)
+		// Close tsnet server explicitly; defer already handles normal path but ensure prompt teardown on signal
+		_ = tsServer.Close()
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("server error: %v", err)

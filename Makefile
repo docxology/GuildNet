@@ -76,8 +76,11 @@ build-ui: ## Build UI (Vite)
 	cd ui && npm ci && npm run build
 
 # ---------- Run ----------
-run: build ## Build all (backend+UI) and run backend (serve)
+run: build stop-hostapp ## Build all (backend+UI), stop any existing hostapp, then run backend (serve)
 	bash ./scripts/run-hostapp.sh
+
+stop-hostapp: ## Stop any hostapp instances listening on $(LISTEN_LOCAL) (safe: only kills hostapp processes)
+	LISTEN_LOCAL=$(LISTEN_LOCAL) bash ./scripts/stop-hostapp.sh
 
 # ---------- DB / Health ----------
 db-health: ## Check backend health summary
