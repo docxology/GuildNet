@@ -75,6 +75,12 @@ else
   CLUSTER_NAME=""
 fi
 
+# Ensure RAND is always set (used for workspace/db names) even when not creating kind
+RAND=${RAND:-}
+if [ -z "$RAND" ]; then
+  RAND=$(head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n')
+fi
+
 # Track hostapp we may start during the run
 HOSTAPP_STARTED=0
 HOSTAPP_PID_FILE="/tmp/verify-hostapp-${RAND:-noid}.pid"
@@ -290,47 +296,34 @@ echolog "Step: list servers (expect empty)"
 SERVERS=$(curl --insecure -sS "$HOSTAPP_URL/api/cluster/$CLUSTER_ID/servers" | tee -a "$LOGFILE") || true
 echolog "Servers: $SERVERS"
 
-echolog "Step: create a code-server workspace"
-# Compose minimal job payload that matches server creation API
+echolog "Step: create a code-server workspace via per-cluster API"
+# Compose workspace spec for API
 WORKSPACE_NAME="verify-cs-$RAND"
 IMAGE=${VERIFY_CODESERVER_IMAGE:-"codercom/code-server:4.9.0"}
-JOB_PAYLOAD=$(jq -n --arg name "$WORKSPACE_NAME" --arg img "$IMAGE" '{kind:"workspace", spec: { name: $name, image:$img, ports:[{port:8080,name:"http"}], env:[{name:"PASSWORD", value:"testpass"}]}}')
-echolog "Job payload: $JOB_PAYLOAD"
+WS_PAYLOAD=$(jq -n --arg name "$WORKSPACE_NAME" --arg img "$IMAGE" '{name:$name, image:$img, ports:[{containerPort:8080,name:"http"}], env:[{name:"PASSWORD", value:"testpass"}] }')
+echolog "Workspace payload: $WS_PAYLOAD"
 
-CREATE_JOB_RESP=$(mktemp)
-HTTP_CODE=$(curl --insecure -sS -w "%{http_code}" -o "$CREATE_JOB_RESP" -X POST "$HOSTAPP_URL/api/jobs" -H "Content-Type: application/json" --data "$JOB_PAYLOAD" || true)
-echolog "Create job HTTP code: $HTTP_CODE"
-sed -n '1,200p' "$CREATE_JOB_RESP" | tee -a "$LOGFILE"
-# Accept 200/201 (sync create) and 202 (accepted async job)
+CREATE_WS_RESP=$(mktemp)
+HTTP_CODE=$(curl --insecure -sS -w "%{http_code}" -o "$CREATE_WS_RESP" -X POST "$HOSTAPP_URL/api/cluster/$CLUSTER_ID/workspaces" -H "Content-Type: application/json" --data "$WS_PAYLOAD" || true)
+echolog "Create workspace HTTP code: $HTTP_CODE"
+sed -n '1,200p' "$CREATE_WS_RESP" | tee -a "$LOGFILE"
 if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ] && [ "$HTTP_CODE" != "202" ]; then
-  echolog "Job creation failed (http_code=$HTTP_CODE)"; exit 8
+  echolog "Workspace creation failed (http_code=$HTTP_CODE)"; exit 8
 fi
 
-# Extract job id from common response shapes: jobId, id, metadata.name
-JOB_ID=$(jq -r '.jobId // .id // .metadata.name // empty' "$CREATE_JOB_RESP" | tr -d '\n')
-if [ -z "$JOB_ID" ]; then
-  echolog "Unable to obtain job id from response; http_code=$HTTP_CODE"; exit 9
-fi
-echolog "Created job ID: $JOB_ID (http_code=$HTTP_CODE)"
-
-echolog "Step: wait for server to become ready and fetch proxy target"
+echolog "Step: wait for workspace to be reconciled and fetch proxy target"
 PROXY_TARGET=""
-# Poll job status until succeeded/failed or timeout
-JOB_STATUS=""
+WS_STATUS=""
 for i in $(seq 1 60); do
   sleep 2
-  S=$(curl --insecure -sS "$HOSTAPP_URL/api/jobs/$JOB_ID" || echo "")
+  S=$(curl --insecure -sS "$HOSTAPP_URL/api/cluster/$CLUSTER_ID/workspaces/$WORKSPACE_NAME" || echo "")
   echo "$S" | tee -a "$LOGFILE"
-  # Extract job status safely
-  JOB_STATUS=$(echo "$S" | jq -r 'try .status // .state // empty' 2>/dev/null || true)
-  # Extract proxy target if present (check multiple possible field names and casings)
+  # Extract workspace phase/status and proxy/service info
+  WS_STATUS=$(echo "$S" | jq -r 'try .status.phase // try .status.Phase // try .status // empty' 2>/dev/null || true)
   PROXY_TARGET=$(echo "$S" | jq -r 'try .status.proxyTarget // try .status.proxy_target // try .status.externalURL // try .status.serviceDNS // try .status.serviceIP // try .proxyTarget // try .proxy_target // empty' 2>/dev/null || true)
-  echolog "Job status: ${JOB_STATUS:-<empty>} proxy_target: ${PROXY_TARGET:-<empty>}"
-  if [ "$JOB_STATUS" = "succeeded" ]; then
-    echolog "Job succeeded"; break
-  fi
-  if [ "$JOB_STATUS" = "failed" ]; then
-    echolog "Job failed"; break
+  echolog "Workspace status: ${WS_STATUS:-<empty>} proxy_target: ${PROXY_TARGET:-<empty>}"
+  if [ "$WS_STATUS" = "Running" ] || [ "$WS_STATUS" = "running" ]; then
+    echolog "Workspace running"; break
   fi
   if [ -n "$PROXY_TARGET" ] && [ "$PROXY_TARGET" != "null" ]; then
     echolog "Proxy target: $PROXY_TARGET"; break
@@ -435,9 +428,7 @@ sleep 1
 echolog "Deleting DB $DB_NAME"
 curl --insecure -sS -X DELETE "$HOSTAPP_URL/api/cluster/$CLUSTER_ID/db/$DB_NAME" | tee -a "$LOGFILE" || true
 
-echolog "All tests executed, destroying cluster"
-kind delete cluster --name "$CLUSTER_NAME" 2>&1 | tee -a "$LOGFILE" || echolog "kind delete failed"
-
+echolog "All tests executed"
 echolog "verify-cluster.sh completed successfully"
 
 exit 0
