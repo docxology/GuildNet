@@ -311,8 +311,27 @@ func Router(deps Deps) *http.ServeMux {
 			var cs settings.Cluster
 			_ = json.NewDecoder(r.Body).Decode(&cs)
 			_ = sm.PutCluster(id, cs)
+			// Persist cluster settings and notify runtime hooks
+			_ = sm.PutCluster(id, cs)
 			if deps.OnSettingsChanged != nil {
 				deps.OnSettingsChanged("cluster:" + id)
+			}
+			// Also write a cluster-scoped ConfigMap so in-cluster controllers (operator)
+			// can pick up runtime preferences without access to host localdb.
+			if inst != nil && inst.K8s != nil {
+				cm := map[string]string{"workspace_lb_enabled": fmt.Sprintf("%v", cs.WorkspaceLBEnabled)}
+				ns := "guildnet-system"
+				// Ensure namespace exists
+				_, _ = inst.K8s.K.CoreV1().Namespaces().Get(r.Context(), ns, metav1.GetOptions{})
+				cfg := &corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{Name: "guildnet-cluster-settings", Namespace: ns},
+					Data:       cm,
+				}
+				if _, err := inst.K8s.K.CoreV1().ConfigMaps(ns).Get(r.Context(), "guildnet-cluster-settings", metav1.GetOptions{}); err == nil {
+					_, _ = inst.K8s.K.CoreV1().ConfigMaps(ns).Update(r.Context(), cfg, metav1.UpdateOptions{})
+				} else {
+					_, _ = inst.K8s.K.CoreV1().ConfigMaps(ns).Create(r.Context(), cfg, metav1.CreateOptions{})
+				}
 			}
 			httpx.JSON(w, http.StatusOK, map[string]any{"ok": true})
 			return

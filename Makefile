@@ -341,3 +341,12 @@ plain-quickstart: ## Alias to setup-all for plain K8S flow
 # ---------- Kind (local Kubernetes) ----------
 kind-up: ## Create a local kind cluster and write kubeconfig to $(GN_KUBECONFIG)
 	bash ./scripts/kind-setup.sh
+
+.PHONY: deploy-networkpolicies
+deploy-networkpolicies: ## Apply recommended network policies for workspace isolation
+	@echo "Applying networkpolicies..."
+	@if kubectl version --request-timeout=3s >/dev/null 2>&1; then \
+		kubectl apply -f k8s/networkpolicies/ || true; \
+	else \
+		echo "Kubernetes API not reachable; skipping networkpolicies"; \
+	fi

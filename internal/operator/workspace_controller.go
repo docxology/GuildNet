@@ -3,7 +3,9 @@ package operator
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -25,6 +27,12 @@ import (
 type WorkspaceReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// cached operator-level default for whether workspaces without an explicit
+	// exposure should be LoadBalancer. This value is kept up-to-date by watching
+	// the in-cluster ConfigMap `guildnet-cluster-settings` in namespace
+	// `guildnet-system` so we avoid a GET on every reconcile.
+	DefaultLB bool
+	mu        sync.RWMutex
 }
 
 // Reconcile implements the reconciliation loop.
@@ -150,6 +158,19 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
+	// Use cached operator-level default which is kept in memory by a watch.
+	// Fallback to env var if the in-memory value hasn't been initialized yet.
+	r.mu.RLock()
+	defaultLB := r.DefaultLB
+	r.mu.RUnlock()
+	if !defaultLB {
+		// If cached is false, still allow env var fallback (for clusters where no
+		// ConfigMap exists and the operator hasn't initialized the cache yet).
+		if v := strings.ToLower(strings.TrimSpace(os.Getenv("WORKSPACE_LB_DEFAULT"))); v == "1" || v == "true" || v == "yes" {
+			defaultLB = true
+		}
+	}
+
 	// Reconcile Service via CreateOrUpdate with retry
 	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: svcName, Namespace: ws.Namespace}}
 	if err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
@@ -167,6 +188,9 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			// Include not-ready addresses so proxy can route during warmup
 			svc.Spec.PublishNotReadyAddresses = true
 			if ws.Spec.Exposure != nil && ws.Spec.Exposure.Type == apiv1alpha1.ExposureLoadBalancer {
+				svc.Spec.Type = corev1.ServiceTypeLoadBalancer
+			} else if ws.Spec.Exposure == nil && defaultLB {
+				// Operator-level default: expose workspace as LoadBalancer when no explicit exposure set
 				svc.Spec.Type = corev1.ServiceTypeLoadBalancer
 			}
 			return controllerutil.SetControllerReference(ws, svc, r.Scheme)
@@ -213,9 +237,80 @@ func intstrFromPort(p corev1.ContainerPort) intstr.IntOrString {
 
 // SetupWithManager wires controller to manager.
 func (r *WorkspaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	// Initialize cached default from existing ConfigMap (if present) so we have
+	// a sensible value on startup.
+	ctx := context.Background()
+	var cm corev1.ConfigMap
+	if err := mgr.GetClient().Get(ctx, client.ObjectKey{Namespace: "guildnet-system", Name: "guildnet-cluster-settings"}, &cm); err == nil {
+		if v, ok := cm.Data["workspace_lb_enabled"]; ok {
+			vv := strings.ToLower(strings.TrimSpace(v))
+			if vv == "1" || vv == "true" || vv == "yes" {
+				r.mu.Lock()
+				r.DefaultLB = true
+				r.mu.Unlock()
+			}
+		}
+	}
+
+	// Build core controller for Workspace resources.
+	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&apiv1alpha1.Workspace{}).
 		Owns(&appsv1.Deployment{}).
-		Owns(&corev1.Service{}).
-		Complete(r)
+		Owns(&corev1.Service{})
+
+	// Start a background goroutine that polls the guildnet-cluster-settings
+	// ConfigMap in `guildnet-system` for changes. When the boolean value
+	// changes we update the cached flag and patch all Workspace objects with a
+	// short annotation (`guildnet.io/config-hash`) to force reconcile.
+	go func() {
+		// use the manager's client for reads/patches
+		cli := mgr.GetClient()
+		var last string
+		for {
+			var cm corev1.ConfigMap
+			err := cli.Get(context.Background(), client.ObjectKey{Namespace: "guildnet-system", Name: "guildnet-cluster-settings"}, &cm)
+			v := ""
+			if err == nil {
+				v = strings.ToLower(strings.TrimSpace(cm.Data["workspace_lb_enabled"]))
+			}
+			if v == "1" || v == "true" || v == "yes" {
+				v = "true"
+			} else if v == "0" || v == "false" || v == "no" {
+				v = "false"
+			}
+			if v == "" {
+				// No explicit configmap value; fall back to env var
+				if ev := strings.ToLower(strings.TrimSpace(os.Getenv("WORKSPACE_LB_DEFAULT"))); ev == "1" || ev == "true" || ev == "yes" {
+					v = "true"
+				} else {
+					v = "false"
+				}
+			}
+
+			if v != last {
+				last = v
+				val := v == "true"
+				r.mu.Lock()
+				r.DefaultLB = val
+				r.mu.Unlock()
+
+				// Patch workspaces to trigger reconciles by setting/updating an annotation
+				var wsList apiv1alpha1.WorkspaceList
+				if err := cli.List(context.Background(), &wsList); err == nil {
+					for _, w := range wsList.Items {
+						patch := client.MergeFrom(w.DeepCopy())
+						if w.Annotations == nil {
+							w.Annotations = map[string]string{}
+						}
+						w.Annotations["guildnet.io/config-hash"] = fmt.Sprintf("%d", time.Now().Unix())
+						_ = cli.Patch(context.Background(), &w, patch)
+					}
+				}
+			}
+
+			time.Sleep(5 * time.Second)
+		}
+	}()
+
+	return builder.Complete(r)
 }

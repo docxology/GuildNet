@@ -33,8 +33,11 @@ metadata:
   name: workspace-operator
 rules:
   - apiGroups: [""]
-    resources: ["configmaps","secrets","events"]
+    resources: ["configmaps","secrets"]
     verbs: ["get","list","watch","create","update","patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create","patch","update","list","watch"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get","list","watch","create","update","patch","delete"]
@@ -95,6 +98,8 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
+        - name: WORKSPACE_LB_DEFAULT
+          value: "true"
         resources: {}
 YAML
 else

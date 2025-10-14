@@ -60,6 +60,9 @@ type Cluster struct {
 	IngressAuthSignin  string `json:"ingress_auth_signin,omitempty"`
 	ImagePullSecret    string `json:"image_pull_secret,omitempty"`
 
+	// Default to expose workspaces as LoadBalancer when not specified per-workspace
+	WorkspaceLBEnabled bool `json:"workspace_lb_enabled,omitempty"`
+
 	// Optional org scope if multi-tenant DB is used per cluster scope
 	OrgID string `json:"org_id,omitempty"`
 
@@ -179,6 +182,7 @@ func (m Manager) GetCluster(clusterID string, out *Cluster) error {
 	out.IngressAuthURL = strings.TrimSpace(asString(tmp["ingress_auth_url"]))
 	out.IngressAuthSignin = strings.TrimSpace(asString(tmp["ingress_auth_signin"]))
 	out.ImagePullSecret = strings.TrimSpace(asString(tmp["image_pull_secret"]))
+	out.WorkspaceLBEnabled = asBool(tmp["workspace_lb_enabled"])
 	out.OrgID = strings.TrimSpace(asString(tmp["org_id"]))
 	// TS fields; client auth key intentionally omitted from GET
 	out.TSLoginServer = strings.TrimSpace(asString(tmp["ts_login_server"]))
@@ -207,6 +211,7 @@ func (m Manager) PutCluster(clusterID string, cs Cluster) error {
 		"ingress_auth_url":     strings.TrimSpace(cs.IngressAuthURL),
 		"ingress_auth_signin":  strings.TrimSpace(cs.IngressAuthSignin),
 		"image_pull_secret":    strings.TrimSpace(cs.ImagePullSecret),
+		"workspace_lb_enabled": cs.WorkspaceLBEnabled,
 		"org_id":               strings.TrimSpace(cs.OrgID),
 		"ts_login_server":      strings.TrimSpace(cs.TSLoginServer),
 		"ts_routes":            strings.TrimSpace(cs.TSRoutes),
