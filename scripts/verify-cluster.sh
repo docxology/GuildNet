@@ -16,21 +16,35 @@ echolog() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" | tee -a "$LOGFILE"; }
 
 cleanup() {
   rc=$?
+  # Avoid unbound variable errors if cleanup runs before CLUSTER_NAME is set
+  CLUSTER_NAME=${CLUSTER_NAME:-}
+  HOSTAPP_STARTED=${HOSTAPP_STARTED:-0}
+  HOSTAPP_PID_FILE=${HOSTAPP_PID_FILE:-/dev/null}
   echolog "Cleaning up: attempting to destroy kind cluster '$CLUSTER_NAME'"
   # If we started a hostapp, kill it
-  if [ "${HOSTAPP_STARTED:-0}" -eq 1 ] && [ -f "${HOSTAPP_PID_FILE:-/dev/null}" ]; then
+  if [ "${HOSTAPP_STARTED}" -eq 1 ] && [ -f "${HOSTAPP_PID_FILE}" ]; then
     pid=$(cat "${HOSTAPP_PID_FILE}" 2>/dev/null || true)
     if [ -n "$pid" ]; then
       echolog "Killing hostapp pid=$pid"
       kill "$pid" 2>/dev/null || true
     fi
   fi
-  if command -v kind >/dev/null 2>&1; then
-    if kind get clusters | grep -qx "$CLUSTER_NAME"; then
-      echolog "Deleting kind cluster $CLUSTER_NAME"
-      kind delete cluster --name "$CLUSTER_NAME" || echolog "kind delete cluster failed"
+  if [ "$NO_DELETE" = "1" ]; then
+    echolog "NO_DELETE=1; skipping cluster deletion"
+  else
+    if [ -n "$CLUSTER_NAME" ]; then
+      if command -v kind >/dev/null 2>&1; then
+        if kind get clusters | grep -qx "$CLUSTER_NAME"; then
+          echolog "Deleting kind cluster $CLUSTER_NAME"
+          kind delete cluster --name "$CLUSTER_NAME" 2>&1 | tee -a "$LOGFILE" || echolog "kind delete cluster failed"
+        else
+          echolog "No kind cluster $CLUSTER_NAME found"
+        fi
+      else
+        echolog "Skipping kind delete: 'kind' not found in PATH"
+      fi
     else
-      echolog "No kind cluster $CLUSTER_NAME found"
+      echolog "No CLUSTER_NAME set; skipping kind delete"
     fi
   fi
   echolog "Logs saved to $LOGFILE"
@@ -44,41 +58,77 @@ need bash
 need curl
 need jq
 need kubectl
+need kind
 
-# Generate a short random suffix
-RAND=$(head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n')
-CLUSTER_NAME="test-$RAND"
-export KIND_CLUSTER_NAME="$CLUSTER_NAME"
+# NO_DELETE: when set to 1, do not delete clusters at the end (useful for debugging)
+NO_DELETE=${NO_DELETE:-0}
+
+# Control whether we create a local kind cluster. Default: do NOT use kind (use real k8s).
+USE_KIND=${USE_KIND:-0}
+
+# If using kind, generate a short random suffix and cluster name; otherwise leave empty
+if [ "$USE_KIND" = "1" ]; then
+  RAND=$(head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  CLUSTER_NAME="test-$RAND"
+  export KIND_CLUSTER_NAME="$CLUSTER_NAME"
+else
+  CLUSTER_NAME=""
+fi
 
 # Track hostapp we may start during the run
 HOSTAPP_STARTED=0
-HOSTAPP_PID_FILE="/tmp/verify-hostapp-$RAND.pid"
+HOSTAPP_PID_FILE="/tmp/verify-hostapp-${RAND:-noid}.pid"
 
 
-# Pick an available host port for the kind API server (default 6443); avoid collisions
-pick_port() {
-  for p in $(seq 6443 6500); do
-    if ! ss -ltn "sport = :$p" | grep -q LISTEN; then
-      echo $p; return
-    fi
-  done
-  echo 6443
-}
-KIND_API_SERVER_PORT=$(pick_port)
-export KIND_API_SERVER_PORT
-echolog "Selected KIND API server host port: $KIND_API_SERVER_PORT"
+
+# Control whether we create a local kind cluster. Default: do NOT use kind (use real k8s).
+# Set USE_KIND=1 in CI to create a disposable kind cluster.
+USE_KIND=${USE_KIND:-0}
+if [ "$USE_KIND" = "1" ]; then
+  # Pick an available host port for the kind API server (default 6443); avoid collisions
+  pick_port() {
+    for p in $(seq 6443 6500); do
+      if ! ss -ltn "sport = :$p" | grep -q LISTEN; then
+        echo $p; return
+      fi
+    done
+    echo 6443
+  }
+  KIND_API_SERVER_PORT=$(pick_port)
+  export KIND_API_SERVER_PORT
+  echolog "Selected KIND API server host port: $KIND_API_SERVER_PORT"
+else
+  echolog "USE_KIND not set; skipping local kind cluster creation and using existing kubeconfig"
+fi
 
 echolog "Starting verify-cluster run for cluster: $CLUSTER_NAME"
 echolog "Logfile: $LOGFILE"
 
-echolog "Step: create kind cluster"
-if ! bash "$ROOT/scripts/kind-setup.sh" 2>&1 | tee -a "$LOGFILE"; then
-  echolog "kind-setup failed"; exit 3
+if [ "$USE_KIND" = "1" ]; then
+  echolog "Step: create kind cluster"
+  if ! bash "$ROOT/scripts/kind-setup.sh" 2>&1 | tee -a "$LOGFILE"; then
+    echolog "kind-setup failed"; exit 3
+  fi
+  KUBECONFIG_OUT=${KUBECONFIG_OUT:-${GN_KUBECONFIG:-$HOME/.guildnet/kubeconfig}}
+  if [ ! -f "$KUBECONFIG_OUT" ]; then
+    echolog "Expected kubeconfig at $KUBECONFIG_OUT not found after kind setup"; exit 4
+  fi
+else
+  # Use existing kubeconfig from environment if present, otherwise default location
+  KUBECONFIG_OUT=${KUBECONFIG_OUT:-${GN_KUBECONFIG:-${KUBECONFIG:-$HOME/.kube/config}}}
+  if [ ! -f "$KUBECONFIG_OUT" ]; then
+    echolog "No kubeconfig found at $KUBECONFIG_OUT; set KUBECONFIG or USE_KIND=1 to create a kind cluster"; exit 4
+  fi
 fi
 
-KUBECONFIG_OUT=${KUBECONFIG_OUT:-${GN_KUBECONFIG:-$HOME/.guildnet/kubeconfig}}
-if [ ! -f "$KUBECONFIG_OUT" ]; then
-  echolog "Expected kubeconfig at $KUBECONFIG_OUT not found"; exit 4
+# Export KUBECONFIG for subsequent kubectl calls and perform a quick preflight check
+export KUBECONFIG="$KUBECONFIG_OUT"
+echolog "Using kubeconfig: $KUBECONFIG_OUT"
+echolog "Performing Kubernetes API preflight check (timeout 5s)"
+if ! kubectl --request-timeout=5s get --raw='/readyz' >/dev/null 2>&1; then
+  echolog "Kubernetes API not reachable using kubeconfig $KUBECONFIG_OUT."
+  echolog "Set KUBECONFIG to a reachable cluster or run with USE_KIND=1 to create a local kind cluster.";
+  exit 4
 fi
 
 echolog "Step: generate guildnet.config (join file)"
@@ -88,13 +138,25 @@ if ! bash "$ROOT/scripts/create_join_info.sh" --kubeconfig "$KUBECONFIG_OUT" --n
 fi
 echolog "Join file created: $JOIN_OUT"
 
-echolog "Step: deploy MetalLB into the new cluster"
-if ! bash "$ROOT/scripts/deploy-metallb.sh" 2>&1 | tee -a "$LOGFILE"; then
-  echolog "deploy-metallb.sh failed (continuing to try)";
+echolog "Step: preflight checks for target Kubernetes cluster"
+if ! bash "$ROOT/scripts/verify-cluster-preflight.sh" 2>&1 | tee -a "$LOGFILE"; then
+  echolog "Preflight checks failed; aborting"; exit 5
 fi
 
-echolog "Step: deploy RethinkDB StatefulSet"
-kubectl apply -f "$ROOT/k8s/rethinkdb.yaml" 2>&1 | tee -a "$LOGFILE" || true
+SKIP_METALLB=${SKIP_METALLB:-0}
+if [ "$SKIP_METALLB" = "1" ]; then
+  echolog "SKIP_METALLB=1; skipping MetalLB installation"
+else
+  echolog "Step: deploy MetalLB into the new cluster"
+  if ! bash "$ROOT/scripts/deploy-metallb.sh" 2>&1 | tee -a "$LOGFILE"; then
+    echolog "deploy-metallb.sh failed (continuing to try)";
+  fi
+fi
+
+echolog "Step: deploy RethinkDB StatefulSet (apply with --validate=false for compatibility)"
+# Some Kubernetes API servers reject server-side validation (openapi) for CRDs or when API aggregation is limited.
+# Use --validate=false to avoid failing apply on such clusters.
+kubectl apply --validate=false -f "$ROOT/k8s/rethinkdb.yaml" 2>&1 | tee -a "$LOGFILE" || true
 
 # Wait for rethinkdb pod to be Running and for logs to contain 'Server ready'
 echolog "Waiting up to 180s for rethinkdb pods to be ready and server to announce readiness"
@@ -129,7 +191,7 @@ echolog "RethinkDB service clusterIP=$RDB_SVC_CLUSTERIP loadbalancer=$RDB_SVC_LB
 if [ -z "$RDB_SVC_CLUSTERIP" ] || [ "$RDB_SVC_CLUSTERIP" = "" ]; then
   echolog "No rethinkdb Service found; creating fallback NodePort service"
   # Use NodePort so the Host App (running on the host) can reach the DB via nodeIP:nodePort
-  cat <<'YAML' | kubectl apply -f - 2>&1 | tee -a "$LOGFILE" || true
+  cat <<'YAML' | kubectl apply --validate=false -f - 2>&1 | tee -a "$LOGFILE" || true
 apiVersion: v1
 kind: Service
 metadata:
@@ -253,17 +315,92 @@ echolog "Created job ID: $JOB_ID (http_code=$HTTP_CODE)"
 
 echolog "Step: wait for server to become ready and fetch proxy target"
 PROXY_TARGET=""
-for i in {1..30}; do
+# Poll job status until succeeded/failed or timeout
+JOB_STATUS=""
+for i in $(seq 1 60); do
   sleep 2
   S=$(curl --insecure -sS "$HOSTAPP_URL/api/jobs/$JOB_ID" || echo "")
   echo "$S" | tee -a "$LOGFILE"
-  PROXY_TARGET=$(echo "$S" | jq -r '.status.proxy_target // .status.service // empty' || true)
+  # Extract job status safely
+  JOB_STATUS=$(echo "$S" | jq -r 'try .status // .state // empty' 2>/dev/null || true)
+  # Extract proxy target if present (check multiple possible field names and casings)
+  PROXY_TARGET=$(echo "$S" | jq -r 'try .status.proxyTarget // try .status.proxy_target // try .status.externalURL // try .status.serviceDNS // try .status.serviceIP // try .proxyTarget // try .proxy_target // empty' 2>/dev/null || true)
+  echolog "Job status: ${JOB_STATUS:-<empty>} proxy_target: ${PROXY_TARGET:-<empty>}"
+  if [ "$JOB_STATUS" = "succeeded" ]; then
+    echolog "Job succeeded"; break
+  fi
+  if [ "$JOB_STATUS" = "failed" ]; then
+    echolog "Job failed"; break
+  fi
   if [ -n "$PROXY_TARGET" ] && [ "$PROXY_TARGET" != "null" ]; then
     echolog "Proxy target: $PROXY_TARGET"; break
   fi
 done
 if [ -z "$PROXY_TARGET" ]; then
   echolog "Proxy target not available after wait"; # continue to try SSE via proxy path
+fi
+
+# If no proxy target is provided by Host App, attempt to locate a Service or Pod and forward a local port
+PORT_FORWARD_PID=""
+if [ -z "$PROXY_TARGET" ] || [ "$PROXY_TARGET" = "null" ]; then
+  echolog "Attempting cluster-side discovery for workspace service/pod as fallback"
+  # Try Service in default namespace with name == WORKSPACE_NAME
+  SVC_JSON=$(kubectl get svc -o json --namespace default "$WORKSPACE_NAME" 2>/dev/null || echo "")
+  # If service not found by name, try by label selector set by operator
+  if [ -z "$SVC_JSON" ]; then
+    SVC_NAME_BY_LABEL=$(kubectl get svc -n default -l "guildnet.io/workspace=$WORKSPACE_NAME" --no-headers -o custom-columns=NAME:.metadata.name 2>/dev/null | head -n1 || true)
+    if [ -n "$SVC_NAME_BY_LABEL" ]; then
+      SVC_JSON=$(kubectl get svc -o json --namespace default "$SVC_NAME_BY_LABEL" 2>/dev/null || echo "")
+    fi
+  fi
+  if [ -n "$SVC_JSON" ]; then
+    SVC_TYPE=$(echo "$SVC_JSON" | jq -r '.spec.type // empty' 2>/dev/null || echo "")
+    if [ "$SVC_TYPE" = "NodePort" ] || [ "$SVC_TYPE" = "LoadBalancer" ]; then
+      # Prefer external access via nodeIP:nodePort
+      NODE_PORT=$(echo "$SVC_JSON" | jq -r '.spec.ports[0].nodePort // empty' 2>/dev/null || echo "")
+      if [ -n "$NODE_PORT" ]; then
+        NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true)
+        if [ -n "$NODE_IP" ]; then
+          PROXY_TARGET="$NODE_IP:$NODE_PORT"
+          echolog "Found NodePort/LoadBalancer service; using proxy target $PROXY_TARGET"
+        fi
+      fi
+    else
+      # ClusterIP: we can port-forward the service locally
+      PORT=$(echo "$SVC_JSON" | jq -r '.spec.ports[0].port // empty' 2>/dev/null || echo "")
+      if [ -n "$PORT" ]; then
+        LOCAL_PORT=18080
+        echolog "Starting kubectl port-forward to service $WORKSPACE_NAME local:$LOCAL_PORT -> $PORT"
+        kubectl port-forward svc/"$WORKSPACE_NAME" $LOCAL_PORT:$PORT -n default >/dev/null 2>&1 &
+        PORT_FORWARD_PID=$!
+        echolog "Port-forward pid=$PORT_FORWARD_PID"
+        PROXY_TARGET="127.0.0.1:$LOCAL_PORT"
+        # Ensure port-forward cleanup
+        trap 'if [ -n "${PORT_FORWARD_PID}" ]; then kill ${PORT_FORWARD_PID} 2>/dev/null || true; fi' EXIT
+      fi
+    fi
+  fi
+
+  # If still not found, try to find a pod using the operator label selector and port-forward
+  if [ -z "$PROXY_TARGET" ]; then
+    POD_NAME=$(kubectl get pods -l "guildnet.io/workspace=$WORKSPACE_NAME" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+    if [ -z "$POD_NAME" ]; then
+      # try matching by pod name substring
+      POD_NAME=$(kubectl get pods --no-headers -o custom-columns=NAME:.metadata.name 2>/dev/null | grep "$WORKSPACE_NAME" | head -n1 || true)
+    fi
+    if [ -n "$POD_NAME" ]; then
+      LOCAL_PORT=18080
+      echolog "Starting kubectl port-forward to pod $POD_NAME local:$LOCAL_PORT -> 8080"
+      kubectl port-forward "$POD_NAME" $LOCAL_PORT:8080 -n default >/dev/null 2>&1 &
+      PORT_FORWARD_PID=$!
+      echolog "Port-forward pid=$PORT_FORWARD_PID"
+      PROXY_TARGET="127.0.0.1:$LOCAL_PORT"
+      # Ensure port-forward cleanup
+      trap 'if [ -n "${PORT_FORWARD_PID}" ]; then kill ${PORT_FORWARD_PID} 2>/dev/null || true; fi' EXIT
+    else
+      echolog "No pod or service found for workspace; cannot establish proxy target"
+    fi
+  fi
 fi
 
 echolog "Step: open SSE logs for the server (via Host App proxy)"

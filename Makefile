@@ -54,7 +54,11 @@ setup-all: ## One-command: Headscale up -> LAN sync -> ensure Kubernetes (kind) 
 	# Ensure Kubernetes is reachable; if not, bring up a local kind cluster and export kubeconfig
 	ok=1; kubectl --request-timeout=3s get --raw=/readyz >/dev/null 2>&1 || ok=0; \
 	if [ $$ok -eq 0 ]; then \
-		$(MAKE) kind-up; \
+		if [ "$${USE_KIND:-0}" = "1" ]; then \
+			$(MAKE) kind-up; \
+		else \
+			echo "Kubernetes API not reachable and USE_KIND!=1; please configure KUBECONFIG or set USE_KIND=1 to auto-create a kind cluster"; exit 2; \
+		fi; \
 	fi; \
 	CLUSTER=$$CL $(MAKE) headscale-namespace; \
 	CLUSTER=$$CL $(MAKE) router-ensure || true; \

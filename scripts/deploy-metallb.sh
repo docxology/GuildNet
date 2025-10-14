@@ -16,18 +16,16 @@ if ! kubectl --request-timeout=3s get --raw=/readyz >/dev/null 2>&1; then
   exit 0
 fi
 
-# Auto-detect default pool for kind: derive a safe IPv4 /24 from the Docker 'kind' network
 if [ -z "$POOL_RANGE" ]; then
+  # If running on a machine with a 'kind' docker network, auto-detect a pool. Otherwise require explicit pool
   if docker network inspect kind >/dev/null 2>&1; then
     SUBNET=$(docker network inspect kind -f '{{range .IPAM.Config}}{{.Subnet}}{{"\n"}}{{end}}' 2>/dev/null | grep -E '^[0-9]+\.' | head -n1)
-    # Typical kind subnet: 172.18.0.0/16 or 172.21.0.0/16
     if [ -n "$SUBNET" ]; then
       ipv4=$(echo "$SUBNET" | cut -d'/' -f1)
       bits=$(echo "$SUBNET" | cut -d'/' -f2)
       o1=$(echo "$ipv4" | awk -F. '{print $1}')
       o2=$(echo "$ipv4" | awk -F. '{print $2}')
       o3=$(echo "$ipv4" | awk -F. '{print $3}')
-      # If subnet is broader than /24, use .255 for third octet; else reuse existing third octet
       if [ "${bits:-16}" -ge 24 ] 2>/dev/null; then
         p3=$o3
       else
@@ -37,9 +35,13 @@ if [ -z "$POOL_RANGE" ]; then
       POOL_RANGE="${base}.200-${base}.250"
       echo "[metallb] Auto-selected pool for kind (IPv4): $POOL_RANGE"
     fi
+  else
+    echo "[metallb] METALLB_POOL_RANGE not set and no 'kind' docker network detected."
+    echo "Assuming this is a real cluster with external LoadBalancer support; skipping MetalLB installation."
+    echo "If you want MetalLB installed, set METALLB_POOL_RANGE to an appropriate L2 range and re-run."
+    exit 0
   fi
 fi
-POOL_RANGE=${POOL_RANGE:-10.0.0.200-10.0.0.250}
 
 # Install MetalLB manifests (idempotent)
 kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.13.12/config/manifests/metallb-native.yaml >/dev/null || true

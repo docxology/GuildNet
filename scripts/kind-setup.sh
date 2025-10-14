@@ -22,20 +22,31 @@ need docker
 need bash
 need curl
 
+# Ensure local bin is available and preferred so we control the installed kind binary
+mkdir -p "$HOME/.local/bin"
+export PATH="$HOME/.local/bin:$PATH"
+
 # Use local kind if available; otherwise, install a pinned kind binary into ~/.guildnet/bin
 run_kind() {
-  if command -v kind >/dev/null 2>&1; then
-    kind "$@"
+  # Prefer a managed binary in ~/.local/bin/kind
+  LOCAL_KIND="$HOME/.local/bin/kind"
+  if [ -x "$LOCAL_KIND" ]; then
+    "$LOCAL_KIND" "$@"
     return
   fi
-  KIND_BIN="$HOME/.guildnet/bin/kind"
-  if [ ! -x "$KIND_BIN" ]; then
-    echo "[kind-setup] Installing kind binary (linux-amd64) into $HOME/.guildnet/bin ..."
-    mkdir -p "$HOME/.guildnet/bin"
-    curl -fsSL -o "$KIND_BIN" "https://github.com/kubernetes-sigs/kind/releases/download/v0.25.0/kind-linux-amd64"
-    chmod +x "$KIND_BIN"
+
+  # Fallback to ~/.guildnet/bin for backwards compatibility
+  GUILD_KIND="$HOME/.guildnet/bin/kind"
+  if [ -x "$GUILD_KIND" ]; then
+    "$GUILD_KIND" "$@"
+    return
   fi
-  "$KIND_BIN" "$@"
+
+  # Install pinned kind into ~/.local/bin
+  echo "[kind-setup] Installing kind binary into $LOCAL_KIND ..."
+  curl -fsSL -o "$LOCAL_KIND" "https://github.com/kubernetes-sigs/kind/releases/download/v0.25.0/kind-linux-amd64"
+  chmod +x "$LOCAL_KIND"
+  "$LOCAL_KIND" "$@"
 }
 
 # Create cluster config
