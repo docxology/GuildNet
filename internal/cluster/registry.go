@@ -17,6 +17,7 @@ import (
 	"github.com/your/module/internal/localdb"
 	"github.com/your/module/internal/settings"
 	"github.com/your/module/internal/ts/connector"
+	"k8s.io/client-go/dynamic"
 )
 
 // ID represents a cluster identifier used as the registry key.
@@ -35,6 +36,7 @@ type Instance struct {
 	// Per-cluster components
 	DB  *localdb.DB
 	K8s *k8s.Client
+	Dyn dynamic.Interface
 	PF  *k8s.PortForwardManager
 	TS  *connector.Connector
 	// Optional per-cluster RethinkDB connector (lazy-initialized interface)
@@ -177,7 +179,12 @@ func (r *Registry) Get(ctx context.Context, clusterID string) (*Instance, error)
 		_ = db.Close()
 		return nil, fmt.Errorf("k8s client: %w", err)
 	}
-	inst := &Instance{id: id, stateDir: clDir, DB: db, K8s: kcli, TS: conn}
+	// build dynamic client for CRD access and cache it on the instance
+	var dynClient dynamic.Interface
+	if d, derr := dynamic.NewForConfig(kcli.Config()); derr == nil {
+		dynClient = d
+	}
+	inst := &Instance{id: id, stateDir: clDir, DB: db, K8s: kcli, Dyn: dynClient, TS: conn}
 	// Capture current dialer to avoid races on global variable in tests
 	inst.rdbDial = connectForK8s
 	// Capture ping interval to avoid races on global variable in tests

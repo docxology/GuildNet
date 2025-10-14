@@ -1,3 +1,5 @@
+IMPORTANT: Multi-line quoted commands usually stall the CLI - avoid them if possible.
+
 Any new features or configurations must work by default, but can be customized via environment variables or other configurations as appropriate. There is no dev flow for this project, only a production flow as this is a developer tool. Everything should work out of the box with sensible defaults.
 
 Prefer modularity and composability over monoliths. Each component should do one thing well and be replaceable.

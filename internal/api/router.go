@@ -100,7 +100,7 @@ func Router(deps Deps) *http.ServeMux {
 	setMgr := settings.Manager{DB: deps.DB}
 
 	// Bootstrap endpoint: accept a subset of guildnet.config and persist.
-	mux.HandleFunc("/api/bootstrap", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/bootstrap", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
@@ -140,6 +140,36 @@ func Router(deps Deps) *http.ServeMux {
 			rec := map[string]any{"id": id, "name": name, "state": "imported"}
 			_ = deps.DB.Put("clusters", id, rec)
 			_ = deps.DB.Put("credentials", fmt.Sprintf("cl:%s:kubeconfig", id), map[string]any{"value": body.Cluster.Kubeconfig})
+			// Attempt to pre-warm per-cluster clients via registry (if available).
+			// If pre-warm fails, remove persisted records and return an error to the caller.
+			if deps.Registry != nil {
+				// Try to build an instance and do a lightweight connectivity check.
+				inst, err := deps.Registry.Get(r.Context(), id)
+				if err != nil {
+					// cleanup persisted data
+					_ = deps.DB.Delete("clusters", id)
+					_ = deps.DB.Delete("credentials", fmt.Sprintf("cl:%s:kubeconfig", id))
+					httpx.JSONError(w, http.StatusUnprocessableEntity, "cluster connect failed", "cluster_connect", err.Error())
+					return
+				}
+				// perform a quick API connectivity check (server version) with a short timeout
+				checkCtx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+				defer cancel()
+				if inst == nil || inst.K8s == nil || inst.K8s.K == nil {
+					// cleanup persisted data
+					_ = deps.DB.Delete("clusters", id)
+					_ = deps.DB.Delete("credentials", fmt.Sprintf("cl:%s:kubeconfig", id))
+					httpx.JSONError(w, http.StatusUnprocessableEntity, "cluster client initialization failed", "cluster_client", "client not initialized")
+					return
+				}
+				// quick API call to ensure cluster is reachable: list namespaces with limit=1
+				if _, err := inst.K8s.K.CoreV1().Namespaces().List(checkCtx, metav1.ListOptions{Limit: 1}); err != nil {
+					_ = deps.DB.Delete("clusters", id)
+					_ = deps.DB.Delete("credentials", fmt.Sprintf("cl:%s:kubeconfig", id))
+					httpx.JSONError(w, http.StatusUnprocessableEntity, "cluster connect failed", "cluster_connect", err.Error())
+					return
+				}
+			}
 			// Persist per-cluster settings if provided
 			cs := settings.Cluster{
 				Name:               body.Cluster.Name,
@@ -166,7 +196,7 @@ func Router(deps Deps) *http.ServeMux {
 	})
 
 	// Settings CRUD (tailscale, database)
-	mux.HandleFunc("/api/settings/tailscale", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/settings/tailscale", func(w http.ResponseWriter, r *http.Request) {
 		if deps.DB == nil {
 			httpx.JSON(w, http.StatusServiceUnavailable, map[string]string{"error": "unavailable"})
 			return
@@ -189,7 +219,7 @@ func Router(deps Deps) *http.ServeMux {
 		}
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	})
-	mux.HandleFunc("/api/settings/database", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/settings/database", func(w http.ResponseWriter, r *http.Request) {
 		if deps.DB == nil {
 			httpx.JSON(w, http.StatusServiceUnavailable, map[string]string{"error": "unavailable"})
 			return
@@ -215,7 +245,7 @@ func Router(deps Deps) *http.ServeMux {
 	})
 
 	// Global settings CRUD
-	mux.HandleFunc("/api/settings/global", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/settings/global", func(w http.ResponseWriter, r *http.Request) {
 		if deps.DB == nil {
 			httpx.JSON(w, http.StatusServiceUnavailable, map[string]string{"error": "unavailable"})
 			return
@@ -809,7 +839,7 @@ func Router(deps Deps) *http.ServeMux {
 	})
 
 	// UI config for runtime overrides
-	mux.HandleFunc("/api/ui-config", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/ui-config", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
@@ -840,26 +870,64 @@ func Router(deps Deps) *http.ServeMux {
 				// Use per-cluster DB for settings
 				setMgrLocal = settings.Manager{DB: inst.DB}
 				// Build clients from instance
-				cfg = inst.K8s.Config()
+				if inst.K8s != nil {
+					cfg = inst.K8s.Config()
+				}
 				// Apply proxy overrides
 				applyClusterAPIProxy(cfg, setMgrLocal, clusterID)
 				// Clients
 				var e error
-				cli, e = kubernetes.NewForConfig(cfg)
+				// Reuse cached client if present
+				if inst.K8s != nil && inst.K8s.K != nil {
+					cli = inst.K8s.K
+				} else {
+					cli, e = kubernetes.NewForConfig(cfg)
+				}
 				if e != nil {
 					httpx.JSONError(w, http.StatusInternalServerError, "k8s client error", "k8s_client", e.Error())
 					return
 				}
-				dyn, e = dynamic.NewForConfig(cfg)
+				// Reuse cached dynamic client if available
+				if inst.Dyn != nil {
+					dyn = inst.Dyn
+				} else {
+					dyn, e = dynamic.NewForConfig(cfg)
+				}
 				if e != nil {
 					httpx.JSONError(w, http.StatusInternalServerError, "dynamic client error", "dyn_client", e.Error())
 					return
 				}
 			}
 		}
-		// Require registry to provide clients in prototype
+		// If registry didn't provide clients, attempt a best-effort fallback by
+		// reading the kubeconfig from the main DB and building clients directly.
 		if cli == nil || dyn == nil {
-			httpx.JSONError(w, http.StatusServiceUnavailable, "registry not available", "no_registry")
+			log.Printf("cluster: clients not provided by registry for id=%s; attempting fallback", clusterID)
+			// Try main DB kubeconfig (legacy path)
+			if deps.DB != nil {
+				if kc, ok := readClusterKubeconfig(deps.DB, deps.Secrets, clusterID); ok {
+					log.Printf("cluster: found kubeconfig in main DB for id=%s; trying to build clients", clusterID)
+					if cfg2, err := kubeconfigFrom(kc); err == nil && cfg2 != nil {
+						// apply any per-cluster API proxy overrides (uses main DB for settings)
+						applyClusterAPIProxy(cfg2, setMgrLocal, clusterID)
+						if c, e := kubernetes.NewForConfig(cfg2); e == nil {
+							cli = c
+							log.Printf("cluster: built kubernetes client from main kubeconfig for id=%s", clusterID)
+						}
+						if d, e := dynamic.NewForConfig(cfg2); e == nil {
+							dyn = d
+							log.Printf("cluster: built dynamic client from main kubeconfig for id=%s", clusterID)
+						}
+					}
+				}
+			}
+		}
+		// If we still don't have clients, be tolerant and return an empty list
+		// rather than a hard 5xx. This keeps the API usable when clusters are
+		// imported but not yet fully initialized or when the registry isn't
+		// ready.
+		if cli == nil || dyn == nil {
+			httpx.JSON(w, http.StatusOK, []any{})
 			return
 		}
 		// Fetch per-cluster settings to derive default namespace using (possibly) per-cluster DB

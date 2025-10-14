@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -335,6 +336,44 @@ func main() {
 		_ = setMgr.PutGlobal(gset)
 	}
 
+	// Single-instance lock to avoid multiple hostapp processes interfering
+	lockPath := filepath.Join(config.StateDir(), "hostapp.lock")
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		log.Fatalf("unable to open lock file %s: %v", lockPath, err)
+	}
+	// Try to acquire exclusive lock non-blocking
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		// Could not acquire; try to read pid and report
+		data, _ := io.ReadAll(lockFile)
+		existing := strings.TrimSpace(string(data))
+		if existing == "" {
+			log.Fatalf("another hostapp appears to be running (lock held) and no pid in %s", lockPath)
+		}
+		if pid, perr := strconv.Atoi(existing); perr == nil {
+			// Check process existence
+			if err := syscall.Kill(pid, 0); err == nil {
+				log.Fatalf("another hostapp (pid=%d) is already running; aborting", pid)
+			}
+		}
+		// stale lock file: attempt to acquire again
+		if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			log.Fatalf("unable to acquire lock file %s: %v", lockPath, err)
+		}
+	}
+	// Write our pid into the lock file
+	_ = lockFile.Truncate(0)
+	_, _ = lockFile.Seek(0, 0)
+	_, _ = lockFile.WriteString(strconv.Itoa(os.Getpid()))
+	// Ensure lock file is cleaned on exit
+	defer func() {
+		// remove pid contents and unlock
+		_ = lockFile.Truncate(0)
+		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		_ = lockFile.Close()
+		_ = os.Remove(lockPath)
+	}()
+
 	// Start tsnet from settings
 	s, err := ts.StartServer(ctx, ts.Options{StateDir: config.StateDir(), Hostname: tsSet.Hostname, LoginURL: tsSet.LoginServer, AuthKey: tsSet.PreauthKey})
 	if err != nil {
@@ -378,6 +417,8 @@ func main() {
 	mux.Handle("/api/jobs/", apiMux)
 	mux.Handle("/api/jobs-logs/", apiMux)
 	mux.Handle("/ws/jobs", apiMux)
+	// Mount API router for all /api/ paths so bootstrap and other endpoints are handled
+	mux.Handle("/api/", http.StripPrefix("/api", apiMux))
 	// Mount additional API groups served by router
 	mux.Handle("/api/cluster/", apiMux)
 	mux.Handle("/sse/cluster/", apiMux)
@@ -389,6 +430,26 @@ func main() {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
+	})
+
+	// internal shutdown endpoint for graceful stop from local tooling
+	mux.HandleFunc("/internal/shutdown", func(w http.ResponseWriter, r *http.Request) {
+		// only accept local POST requests
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		host, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if host != "127.0.0.1" && host != "::1" && host != "localhost" {
+			httpx.JSONError(w, http.StatusForbidden, "shutdown allowed from localhost only", "forbidden")
+			return
+		}
+		go func() {
+			// give caller a moment to receive response
+			time.Sleep(50 * time.Millisecond)
+			stop()
+		}()
+		httpx.JSON(w, http.StatusOK, map[string]any{"status": "shutting down"})
 	})
 
 	// Registry endpoints (minimal)
@@ -1481,7 +1542,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("tsnet listen: %v", err)
 		}
-		defer ln.Close()
+		// do not defer ln.Close() here; close explicitly on shutdown to guarantee timely teardown
 		tsSrv = &http.Server{
 			Handler:      handler,
 			ReadTimeout:  10 * time.Second,
@@ -1500,15 +1561,37 @@ func main() {
 
 	select {
 	case <-ctx.Done():
+		log.Printf("shutdown: signal received, closing listeners and servers")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = localSrv.Shutdown(shutdownCtx)
-		if v6Srv != nil {
-			_ = v6Srv.Shutdown(shutdownCtx)
+		// First, stop accepting new connections by closing listeners
+		_ = lnLocal.Close()
+		if lnLocalV6 != nil {
+			_ = lnLocalV6.Close()
 		}
-		_ = tsSrv.Shutdown(shutdownCtx)
-		// Close tsnet server explicitly; defer already handles normal path but ensure prompt teardown on signal
-		_ = tsServer.Close()
+		// then attempt graceful shutdown of HTTP servers
+		if err := localSrv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("localSrv.Shutdown error: %v", err)
+		}
+		if v6Srv != nil {
+			if err := v6Srv.Shutdown(shutdownCtx); err != nil {
+				log.Printf("v6Srv.Shutdown error: %v", err)
+			}
+		}
+		if err := tsSrv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("tsSrv.Shutdown error: %v", err)
+		}
+		// Close tsnet server explicitly and the ts listener
+		if err := tsServer.Close(); err != nil {
+			log.Printf("tsServer.Close error: %v", err)
+		}
+		if ln != nil {
+			_ = ln.Close()
+		}
+		// Give a small grace period to let goroutines exit, then force exit to avoid lingering backgrounds
+		time.Sleep(200 * time.Millisecond)
+		log.Printf("shutdown: complete, exiting")
+		os.Exit(0)
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("server error: %v", err)
