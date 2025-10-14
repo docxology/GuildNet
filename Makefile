@@ -222,3 +222,52 @@ diag-k8s: ## Show kube API status and nodes
 
 diag-db: ## Print DB service details
 	bash ./scripts/rethinkdb-setup.sh || true
+
+# ---------- MetaGuildNet ----------
+.PHONY: meta-setup meta-verify meta-diagnose meta-test meta-example
+
+meta-setup: ## MetaGuildNet automated setup wizard
+	bash $(CURDIR)/MetaGuildNet/scripts/setup/setup_wizard.sh
+
+meta-verify: ## MetaGuildNet comprehensive verification
+	bash $(CURDIR)/MetaGuildNet/scripts/verify/verify_all.sh
+
+meta-verify-network: ## Verify network layer only
+	bash $(CURDIR)/MetaGuildNet/scripts/verify/verify_network.sh
+
+meta-verify-cluster: ## Verify cluster layer only
+	bash $(CURDIR)/MetaGuildNet/scripts/verify/verify_cluster.sh
+
+meta-verify-database: ## Verify database layer only
+	bash $(CURDIR)/MetaGuildNet/scripts/verify/verify_database.sh
+
+meta-verify-application: ## Verify application layer only
+	bash $(CURDIR)/MetaGuildNet/scripts/verify/verify_application.sh
+
+meta-diagnose: ## MetaGuildNet diagnostics
+	bash $(CURDIR)/MetaGuildNet/scripts/utils/diagnose.sh 2>/dev/null || echo "Run: make -C $(CURDIR)/MetaGuildNet diagnose"
+
+meta-test: ## Run MetaGuildNet tests
+	make -C $(CURDIR)/MetaGuildNet test-all
+
+meta-test-integration: ## Run integration tests
+	make -C $(CURDIR)/MetaGuildNet test-integration
+
+meta-test-e2e: ## Run end-to-end tests
+	make -C $(CURDIR)/MetaGuildNet test-e2e
+
+meta-example: ## Run basic MetaGuildNet example
+	bash $(CURDIR)/MetaGuildNet/examples/basic/create-workspace.sh
+
+meta-docs: ## Show MetaGuildNet documentation
+	@echo "MetaGuildNet Documentation:"
+	@echo "  Main:         $(CURDIR)/MetaGuildNet/README.md"
+	@echo "  Setup:        $(CURDIR)/MetaGuildNet/docs/SETUP.md"
+	@echo "  Verification: $(CURDIR)/MetaGuildNet/docs/VERIFICATION.md"
+	@echo "  Architecture: $(CURDIR)/MetaGuildNet/docs/ARCHITECTURE.md"
+	@echo "  Contributing: $(CURDIR)/MetaGuildNet/docs/CONTRIBUTING.md"
+	@echo ""
+	@echo "Quick start: make meta-setup"
+
+meta-help: ## MetaGuildNet help
+	make -C $(CURDIR)/MetaGuildNet help

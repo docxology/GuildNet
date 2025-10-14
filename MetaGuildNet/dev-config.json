@@ -1,0 +1,45 @@
+{
+  "meta_setup": {
+    "enabled": false,
+    "mode": "auto",
+    "verify_timeout": 300,
+    "auto_approve_routes": true,
+    "log_level": "debug"
+  },
+  "verification": {
+    "enabled": true,
+    "layers": ["network", "cluster", "database", "application"],
+    "output_format": "json",
+    "timeout": 60
+  },
+  "testing": {
+    "enabled": true,
+    "run_integration_tests": true,
+    "run_e2e_tests": false,
+    "test_timeout": 300
+  },
+  "examples": {
+    "enabled": false,
+    "create_workspace": false,
+    "workspace_image": "codercom/code-server:latest",
+    "workspace_name": "dev-demo",
+    "multi_user_setup": false,
+    "comprehensive_output": true
+  },
+  "diagnostics": {
+    "enabled": true,
+    "export_diagnostics": true,
+    "diagnostic_timeout": 30
+  },
+  "cleanup": {
+    "enabled": false,
+    "remove_workspaces": true,
+    "stop_services": false
+  },
+  "logging": {
+    "level": "debug",
+    "format": "colored",
+    "timestamp": true,
+    "file": "metaguildnet-dev.log"
+  }
+}

@@ -174,6 +174,7 @@ up() {
   echo "[headscale] Server URL: ${SERVER_URL}"
   echo "[headscale] Data dir:  $STATE_DIR"
   # Persist the chosen URL for other scripts to consume
+  mkdir -p "$STATE_DIR"
   printf "%s" "$SERVER_URL" > "$STATE_DIR/server_url"
 }
 
