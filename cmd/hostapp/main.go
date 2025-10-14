@@ -1509,6 +1509,12 @@ func main() {
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
+	// Force HTTP/1.1 on the local listener to avoid HTTP/2 related TLS/internal errors
+	// which have been observed in development when clients and the server disagree
+	// on ALPN or when intermediates mishandle h2 framing. This keeps local dev
+	// interactions (curl, scripts) stable while still allowing tsnet :443 to
+	// serve with its default ALPN behavior.
+	localSrv.TLSConfig = &tls.Config{NextProtos: []string{"http/1.1"}}
 	var v6Srv *http.Server
 	// Pre-bind local listener and hard-fail if unavailable (no fallback)
 	bindAddr := listenAddr

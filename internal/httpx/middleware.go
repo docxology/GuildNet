@@ -58,6 +58,11 @@ func JSONError(w http.ResponseWriter, httpStatus int, msg string, errCodeAndDeta
 	if details != nil {
 		payload.Details = details
 	}
+	// Log the structured error server-side for easier debugging in CI and scripts.
+	// This does not expose secrets but gives operators visibility into the error shape.
+	if logger := Logger(); logger != nil {
+		logger.Printf("httpx.JSONError code=%d errcode=%s msg=%s details=%v request_id=%s", httpStatus, payload.Code, payload.Message, payload.Details, payload.Request)
+	}
 	_ = json.NewEncoder(w).Encode(payload)
 }
 

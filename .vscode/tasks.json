@@ -76,7 +76,7 @@
       "command": "make tls-check-backend",
       "group": "test"
     },
-    
+
     {
       "label": "Admin: stop all workloads",
       "type": "shell",
@@ -90,6 +90,20 @@
       "group": "build",
       "problemMatcher": []
     },
+    {
+      "label": "Verify cluster (script)",
+      "type": "shell",
+      "command": "bash -lc 'bash scripts/verify-cluster.sh 2>&1 | tee /tmp/verify-cluster-$(date +%s).log'",
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": false,
+        "panel": "shared",
+        "showReuseMessage": true,
+        "clear": false
+      },
+      "problemMatcher": []
+    },
 
     // Extras
     {
@@ -97,7 +111,6 @@
       "type": "shell",
       "command": "make agent-build",
       "group": "build"
-    },
-    
+    }
   ]
 }

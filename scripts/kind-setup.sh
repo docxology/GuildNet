@@ -13,6 +13,8 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 CLUSTER_NAME=${KIND_CLUSTER_NAME:-${CLUSTER_NAME:-guildnet}}
 POD_SUBNET=${KIND_POD_SUBNET:-10.244.0.0/16}
 SVC_SUBNET=${KIND_SVC_SUBNET:-10.96.0.0/12}
+# Allow overriding the API server host port (useful when 6443 is already bound on local host)
+KIND_API_SERVER_PORT=${KIND_API_SERVER_PORT:-6443}
 KUBECONFIG_OUT=${KUBECONFIG_OUT:-${GN_KUBECONFIG:-$HOME/.guildnet/kubeconfig}}
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }; }
@@ -45,7 +47,7 @@ networking:
   podSubnet: ${POD_SUBNET}
   serviceSubnet: ${SVC_SUBNET}
   apiServerAddress: 127.0.0.1
-  apiServerPort: 6443
+  apiServerPort: ${KIND_API_SERVER_PORT}
 nodes:
   - role: control-plane
   - role: worker

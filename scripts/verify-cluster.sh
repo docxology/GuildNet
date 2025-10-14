@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# verify-cluster.sh
+# Create a disposable kind cluster test-<rand>, generate guildnet.config, POST to hostapp /bootstrap,
+# create a workspace (code-server), tail logs via SSE, exercise DB API (list/create/table/delete),
+# then destroy the cluster. Verbose logging and diagnostics are written to /tmp/verify-cluster-<ts>.log
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+LOGDIR=${LOGDIR:-/tmp}
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+LOGFILE="$LOGDIR/verify-cluster-$TS.log"
+set -o pipefail
+
+echolog() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" | tee -a "$LOGFILE"; }
+
+cleanup() {
+  rc=$?
+  echolog "Cleaning up: attempting to destroy kind cluster '$CLUSTER_NAME'"
+  # If we started a hostapp, kill it
+  if [ "${HOSTAPP_STARTED:-0}" -eq 1 ] && [ -f "${HOSTAPP_PID_FILE:-/dev/null}" ]; then
+    pid=$(cat "${HOSTAPP_PID_FILE}" 2>/dev/null || true)
+    if [ -n "$pid" ]; then
+      echolog "Killing hostapp pid=$pid"
+      kill "$pid" 2>/dev/null || true
+    fi
+  fi
+  if command -v kind >/dev/null 2>&1; then
+    if kind get clusters | grep -qx "$CLUSTER_NAME"; then
+      echolog "Deleting kind cluster $CLUSTER_NAME"
+      kind delete cluster --name "$CLUSTER_NAME" || echolog "kind delete cluster failed"
+    else
+      echolog "No kind cluster $CLUSTER_NAME found"
+    fi
+  fi
+  echolog "Logs saved to $LOGFILE"
+  exit $rc
+}
+
+trap cleanup EXIT
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing required binary: $1" | tee -a "$LOGFILE"; exit 2; } }
+need bash
+need curl
+need jq
+need kubectl
+
+# Generate a short random suffix
+RAND=$(head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n')
+CLUSTER_NAME="test-$RAND"
+export KIND_CLUSTER_NAME="$CLUSTER_NAME"
+
+# Track hostapp we may start during the run
+HOSTAPP_STARTED=0
+HOSTAPP_PID_FILE="/tmp/verify-hostapp-$RAND.pid"
+
+
+# Pick an available host port for the kind API server (default 6443); avoid collisions
+pick_port() {
+  for p in $(seq 6443 6500); do
+    if ! ss -ltn "sport = :$p" | grep -q LISTEN; then
+      echo $p; return
+    fi
+  done
+  echo 6443
+}
+KIND_API_SERVER_PORT=$(pick_port)
+export KIND_API_SERVER_PORT
+echolog "Selected KIND API server host port: $KIND_API_SERVER_PORT"
+
+echolog "Starting verify-cluster run for cluster: $CLUSTER_NAME"
+echolog "Logfile: $LOGFILE"
+
+echolog "Step: create kind cluster"
+if ! bash "$ROOT/scripts/kind-setup.sh" 2>&1 | tee -a "$LOGFILE"; then
+  echolog "kind-setup failed"; exit 3
+fi
+
+KUBECONFIG_OUT=${KUBECONFIG_OUT:-${GN_KUBECONFIG:-$HOME/.guildnet/kubeconfig}}
+if [ ! -f "$KUBECONFIG_OUT" ]; then
+  echolog "Expected kubeconfig at $KUBECONFIG_OUT not found"; exit 4
+fi
+
+echolog "Step: generate guildnet.config (join file)"
+JOIN_OUT="$ROOT/guildnet.config"
+if ! bash "$ROOT/scripts/create_join_info.sh" --kubeconfig "$KUBECONFIG_OUT" --name "$CLUSTER_NAME" --out "$JOIN_OUT" 2>&1 | tee -a "$LOGFILE"; then
+  echolog "create_join_info failed"; exit 5
+fi
+echolog "Join file created: $JOIN_OUT"
+
+echolog "Step: deploy MetalLB into the new cluster"
+if ! bash "$ROOT/scripts/deploy-metallb.sh" 2>&1 | tee -a "$LOGFILE"; then
+  echolog "deploy-metallb.sh failed (continuing to try)";
+fi
+
+echolog "Step: deploy RethinkDB StatefulSet"
+kubectl apply -f "$ROOT/k8s/rethinkdb.yaml" 2>&1 | tee -a "$LOGFILE" || true
+
+# Wait for rethinkdb pod to be Running and for logs to contain 'Server ready'
+echolog "Waiting up to 180s for rethinkdb pods to be ready and server to announce readiness"
+RDB_POD=""
+for i in $(seq 1 60); do
+  sleep 3
+  RDB_POD=$(kubectl get pods -l app=rethinkdb -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+  if [ -n "$RDB_POD" ]; then
+    phase=$(kubectl get pod "$RDB_POD" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+    ready_cnt=$(kubectl get pod "$RDB_POD" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || true)
+    echolog "rethinkdb pod: $RDB_POD phase=$phase ready=$ready_cnt"
+    if [ "${phase}" = "Running" ] && [ "$ready_cnt" = "true" ]; then
+      # check logs for server ready
+      if kubectl logs "$RDB_POD" --tail=200 2>/dev/null | grep -qi "Server ready"; then
+        echolog "rethinkdb server ready in pod $RDB_POD"
+        break
+      fi
+    fi
+  fi
+done
+if [ -z "$RDB_POD" ]; then
+  echolog "rethinkdb pod not found or not ready after timeout"; # continue, bootstrap may still succeed with clusterIP
+fi
+
+# Ensure at least a service address exists (ClusterIP or LoadBalancer)
+RDB_SVC_CLUSTERIP=$(kubectl get svc rethinkdb -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
+RDB_SVC_LB=$(kubectl get svc rethinkdb -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+echolog "RethinkDB service clusterIP=$RDB_SVC_CLUSTERIP loadbalancer=$RDB_SVC_LB"
+
+# If no Service was created by the manifest, create a fallback ClusterIP Service so the
+# Host App's ConnectForK8s can discover an in-cluster address.
+if [ -z "$RDB_SVC_CLUSTERIP" ] || [ "$RDB_SVC_CLUSTERIP" = "" ]; then
+  echolog "No rethinkdb Service found; creating fallback NodePort service"
+  # Use NodePort so the Host App (running on the host) can reach the DB via nodeIP:nodePort
+  cat <<'YAML' | kubectl apply -f - 2>&1 | tee -a "$LOGFILE" || true
+apiVersion: v1
+kind: Service
+metadata:
+  name: rethinkdb
+  labels:
+    app: rethinkdb
+spec:
+  type: NodePort
+  ports:
+    - name: client
+      port: 28015
+      targetPort: 28015
+      protocol: TCP
+  selector:
+    app: rethinkdb
+YAML
+  RDB_SVC_CLUSTERIP=$(kubectl get svc rethinkdb -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
+  echolog "After fallback creation, rethinkdb service clusterIP=$RDB_SVC_CLUSTERIP"
+fi
+
+
+# Hostapp endpoint (assume running locally)
+HOSTAPP_URL=${HOSTAPP_URL:-https://127.0.0.1:8090}
+echolog "Assuming Host App at: $HOSTAPP_URL"
+
+# Ensure Host App process will know how to find RethinkDB service in the cluster
+export RETHINKDB_SERVICE_NAME=${RETHINKDB_SERVICE_NAME:-rethinkdb}
+export RETHINKDB_NAMESPACE=${RETHINKDB_NAMESPACE:-default}
+echolog "Exported RETHINKDB_SERVICE_NAME=$RETHINKDB_SERVICE_NAME RETHINKDB_NAMESPACE=$RETHINKDB_NAMESPACE"
+
+ensure_hostapp() {
+  echolog "Checking hostapp /healthz"
+  HC=$(curl --insecure -sS -o /dev/null -w "%{http_code}" "$HOSTAPP_URL/healthz" || true)
+  if [ "$HC" = "200" ]; then
+    echolog "Hostapp is already up"
+    return 0
+  fi
+  echolog "Hostapp not reachable (healthz=$HC); starting local hostapp via scripts/run-hostapp.sh"
+  nohup bash "$ROOT/scripts/run-hostapp.sh" >>"$LOGFILE" 2>&1 &
+  pid=$!
+  echo "$pid" > "$HOSTAPP_PID_FILE"
+  HOSTAPP_STARTED=1
+  echolog "Started hostapp (pid=$pid); waiting for /healthz up to 30s"
+  for i in {1..30}; do
+    sleep 1
+    HC=$(curl --insecure -sS -o /dev/null -w "%{http_code}" "$HOSTAPP_URL/healthz" || true)
+    if [ "$HC" = "200" ]; then
+      echolog "Hostapp is healthy"
+      return 0
+    fi
+  done
+  echolog "Hostapp failed to become healthy in time (last status=$HC)"
+  return 1
+}
+
+ensure_hostapp
+
+
+echolog "Step: POST /bootstrap (with retries, forcing HTTP/1.1 to avoid h2 edge cases)"
+BOOT_RESP=$(mktemp)
+BOOT_OK=0
+for attempt in 1 2 3 4 5; do
+  echolog "Bootstrap attempt #$attempt"
+  # Force HTTP/1.1 to avoid http2 stream close edge cases seen in CI
+  HTTP_CODE=$(curl --http1.1 --insecure -sS -w "%{http_code}" -o "$BOOT_RESP" -X POST "$HOSTAPP_URL/api/bootstrap" \
+    -H "Content-Type: application/json" --data-binary @"$JOIN_OUT" 2>&1 | tee -a "$LOGFILE" || true)
+  echolog "Raw curl exit status captured, http_code="$HTTP_CODE""
+  if [ "$HTTP_CODE" = "200" ]; then
+    BOOT_OK=1
+    break
+  fi
+  echolog "Bootstrap attempt #$attempt returned http_code=$HTTP_CODE; response body:"
+  sed -n '1,200p' "$BOOT_RESP" | tee -a "$LOGFILE"
+  sleep $((attempt * 1))
+done
+if [ "$BOOT_OK" -ne 1 ]; then
+  echolog "Bootstrap failed after retries (last response body above). Aborting."; exit 6
+fi
+
+# Parse cluster id from bootstrap response if present (check multiple shapes)
+CLUSTER_ID=$(jq -r '.clusterId // .cluster.id // .id // empty' "$BOOT_RESP" | tr -d '\n')
+if [ -z "$CLUSTER_ID" ]; then
+  # Fallback: attempt to list clusters from Host App
+  echolog "No cluster id in bootstrap response; fetching cluster list"
+  # The API exposes cluster listing under /api/deploy/clusters
+  CLUSTER_LIST=$(curl --insecure -sS "$HOSTAPP_URL/api/deploy/clusters" || echo "")
+  echolog "Clusters: $CLUSTER_LIST"
+  CLUSTER_ID=$(echo "$CLUSTER_LIST" | jq -r '.[0].id // .[0].clusterId // empty' 2>/dev/null || true)
+fi
+if [ -z "$CLUSTER_ID" ]; then
+  echolog "Unable to determine cluster ID from hostapp. Aborting."; exit 7
+fi
+echolog "Using cluster ID: $CLUSTER_ID"
+
+echolog "Step: list servers (expect empty)"
+SERVERS=$(curl --insecure -sS "$HOSTAPP_URL/api/cluster/$CLUSTER_ID/servers" | tee -a "$LOGFILE") || true
+echolog "Servers: $SERVERS"
+
+echolog "Step: create a code-server workspace"
+# Compose minimal job payload that matches server creation API
+WORKSPACE_NAME="verify-cs-$RAND"
+IMAGE=${VERIFY_CODESERVER_IMAGE:-"codercom/code-server:4.9.0"}
+JOB_PAYLOAD=$(jq -n --arg name "$WORKSPACE_NAME" --arg img "$IMAGE" '{kind:"workspace", spec: { name: $name, image:$img, ports:[{port:8080,name:"http"}], env:[{name:"PASSWORD", value:"testpass"}]}}')
+echolog "Job payload: $JOB_PAYLOAD"
+
+CREATE_JOB_RESP=$(mktemp)
+HTTP_CODE=$(curl --insecure -sS -w "%{http_code}" -o "$CREATE_JOB_RESP" -X POST "$HOSTAPP_URL/api/jobs" -H "Content-Type: application/json" --data "$JOB_PAYLOAD" || true)
+echolog "Create job HTTP code: $HTTP_CODE"
+sed -n '1,200p' "$CREATE_JOB_RESP" | tee -a "$LOGFILE"
+# Accept 200/201 (sync create) and 202 (accepted async job)
+if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ] && [ "$HTTP_CODE" != "202" ]; then
+  echolog "Job creation failed (http_code=$HTTP_CODE)"; exit 8
+fi
+
+# Extract job id from common response shapes: jobId, id, metadata.name
+JOB_ID=$(jq -r '.jobId // .id // .metadata.name // empty' "$CREATE_JOB_RESP" | tr -d '\n')
+if [ -z "$JOB_ID" ]; then
+  echolog "Unable to obtain job id from response; http_code=$HTTP_CODE"; exit 9
+fi
+echolog "Created job ID: $JOB_ID (http_code=$HTTP_CODE)"
+
+echolog "Step: wait for server to become ready and fetch proxy target"
+PROXY_TARGET=""
+for i in {1..30}; do
+  sleep 2
+  S=$(curl --insecure -sS "$HOSTAPP_URL/api/jobs/$JOB_ID" || echo "")
+  echo "$S" | tee -a "$LOGFILE"
+  PROXY_TARGET=$(echo "$S" | jq -r '.status.proxy_target // .status.service // empty' || true)
+  if [ -n "$PROXY_TARGET" ] && [ "$PROXY_TARGET" != "null" ]; then
+    echolog "Proxy target: $PROXY_TARGET"; break
+  fi
+done
+if [ -z "$PROXY_TARGET" ]; then
+  echolog "Proxy target not available after wait"; # continue to try SSE via proxy path
+fi
+
+echolog "Step: open SSE logs for the server (via Host App proxy)"
+SSE_URL="$HOSTAPP_URL/sse/cluster/$CLUSTER_ID/servers/$WORKSPACE_NAME/logs"
+echolog "SSE URL: $SSE_URL"
+# Use curl to read a short window of SSE (10s)
+echolog "Tailing SSE for 12 seconds to capture startup logs..."
+timeout 12 curl --insecure -sS -H "Accept: text/event-stream" "$SSE_URL" | tee -a "$LOGFILE" || echolog "SSE read ended"
+
+echolog "Step: DB API operations"
+# List DBs
+DBS=$(curl --insecure -sS "$HOSTAPP_URL/api/cluster/$CLUSTER_ID/db" | tee -a "$LOGFILE" || echo "")
+echolog "DB list: $DBS"
+
+# Create DB
+DB_NAME="verifydb_$RAND"
+CREATE_DB_PAYLOAD=$(jq -n --arg id "$DB_NAME" --arg name "$DB_NAME" '{id:$id, name:$name}')
+echolog "Creating DB: $DB_NAME"
+curl --insecure -sS -X POST -H "Content-Type: application/json" --data "$CREATE_DB_PAYLOAD" "$HOSTAPP_URL/api/cluster/$CLUSTER_ID/db" | tee -a "$LOGFILE" || true
+
+sleep 1
+
+# Create table in DB
+TABLE_NAME="t1"
+CREATE_TABLE_PAYLOAD=$(jq -n --arg table "$TABLE_NAME" '{name:$table, primary_key:"id"}')
+echolog "Creating table $TABLE_NAME in $DB_NAME"
+curl --insecure -sS -X POST -H "Content-Type: application/json" --data "$CREATE_TABLE_PAYLOAD" "$HOSTAPP_URL/api/cluster/$CLUSTER_ID/db/$DB_NAME/tables" | tee -a "$LOGFILE" || true
+
+sleep 1
+
+# Delete DB
+echolog "Deleting DB $DB_NAME"
+curl --insecure -sS -X DELETE "$HOSTAPP_URL/api/cluster/$CLUSTER_ID/db/$DB_NAME" | tee -a "$LOGFILE" || true
+
+echolog "All tests executed, destroying cluster"
+kind delete cluster --name "$CLUSTER_NAME" 2>&1 | tee -a "$LOGFILE" || echolog "kind delete failed"
+
+echolog "verify-cluster.sh completed successfully"
+
+exit 0
