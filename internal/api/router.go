@@ -169,6 +169,16 @@ func Router(deps Deps) *http.ServeMux {
 					httpx.JSONError(w, http.StatusUnprocessableEntity, "cluster connect failed", "cluster_connect", err.Error())
 					return
 				}
+				// Attempt to pre-warm RethinkDB (cluster DB) so DB endpoints respond quickly.
+				// Use a short timeout so bootstrap fails fast if the cluster DB is unreachable.
+				rdbCtx, rdbCancel := context.WithTimeout(r.Context(), 10*time.Second)
+				defer rdbCancel()
+				if err := inst.EnsureRDB(rdbCtx, "", "", ""); err != nil {
+					_ = deps.DB.Delete("clusters", id)
+					_ = deps.DB.Delete("credentials", fmt.Sprintf("cl:%s:kubeconfig", id))
+					httpx.JSONError(w, http.StatusUnprocessableEntity, "cluster rdb connect failed", "cluster_rdb", err.Error())
+					return
+				}
 			}
 			// Persist per-cluster settings if provided
 			cs := settings.Cluster{
@@ -1151,6 +1161,43 @@ func Router(deps Deps) *http.ServeMux {
 				httpx.JSON(w, http.StatusOK, out)
 				return
 			}
+
+			// Health endpoint: /api/cluster/{id}/health
+			if len(parts) == 2 && parts[1] == "health" {
+				if r.Method != http.MethodGet {
+					w.WriteHeader(http.StatusMethodNotAllowed)
+					return
+				}
+				status := map[string]any{"k8s": map[string]any{"ok": false}, "rdb": map[string]any{"ok": false}}
+				// k8s connectivity
+				if cli != nil {
+					ctxc, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+					defer cancel()
+					if _, err := cli.CoreV1().Namespaces().List(ctxc, metav1.ListOptions{Limit: 1}); err == nil {
+						status["k8s"] = map[string]any{"ok": true}
+					} else {
+						status["k8s"] = map[string]any{"ok": false, "error": err.Error()}
+					}
+				} else {
+					status["k8s"] = map[string]any{"ok": false, "error": "no client"}
+				}
+				// RethinkDB connectivity (if instance present and RDB initialized)
+				if deps.Registry != nil {
+					if present, err := deps.Registry.RDBPresent(clusterID); err == nil {
+						if present {
+							status["rdb"] = map[string]any{"ok": true}
+						} else {
+							status["rdb"] = map[string]any{"ok": false, "error": "rdb not initialized"}
+						}
+					} else {
+						status["rdb"] = map[string]any{"ok": false, "error": err.Error()}
+					}
+				} else {
+					status["rdb"] = map[string]any{"ok": false, "error": "no registry"}
+				}
+				httpx.JSON(w, http.StatusOK, status)
+				return
+			}
 			if len(parts) == 5 && parts[3] == "logs" && parts[4] == "stream" && r.Method == http.MethodGet {
 				name := parts[2]
 				pods, err := cli.CoreV1().Pods(defaultNS).List(r.Context(), metav1.ListOptions{LabelSelector: fmt.Sprintf("guildnet.io/workspace=%s", name)})
@@ -1225,21 +1272,17 @@ func Router(deps Deps) *http.ServeMux {
 		// Per-cluster Databases API routes: delegate to httpx.DBAPI with OrgID=clusterID
 		if len(parts) >= 2 && parts[1] == "db" {
 			api := &httpx.DBAPI{Manager: func() httpx.DBManager {
+				// Prefer an already-initialized per-cluster RDB manager. Avoid
+				// attempting EnsureRDB during request handling because it can
+				// block with retries and produce noisy logs. Pre-warming should
+				// be done at bootstrap; handlers will return nil if RDB isn't ready.
 				if deps.Registry != nil {
-					if inst, err := deps.Registry.Get(r.Context(), clusterID); err == nil && inst != nil {
-						// If not yet initialized, attempt lazy initialization using cluster discovery.
-						if inst.RDB == nil {
-							if err := inst.EnsureRDB(r.Context(), "", "", ""); err != nil {
-								// Log and fall back to nil (handlers will handle nil manager)
-								log.Printf("cluster: ensure rdb failed id=%s err=%v", clusterID, err)
-							}
-						}
-						if inst.RDB != nil {
+					if present, err := deps.Registry.RDBPresent(clusterID); err == nil && present {
+						if inst, err := deps.Registry.Get(r.Context(), clusterID); err == nil && inst != nil {
 							return inst.RDB
 						}
 					}
 				}
-				// nil -> lazy connect inside handler
 				return nil
 			}(), OrgID: clusterID, RBAC: httpx.NewRBACStore()}
 			mux2 := http.NewServeMux()
@@ -1270,14 +1313,11 @@ func Router(deps Deps) *http.ServeMux {
 		clusterID := parts[0]
 		if len(parts) >= 2 && parts[1] == "db" {
 			api := &httpx.DBAPI{Manager: func() httpx.DBManager {
+				// Use only an already-initialized RDB manager; do not attempt
+				// to Initialize here to avoid request-time retries.
 				if deps.Registry != nil {
-					if inst, err := deps.Registry.Get(r.Context(), clusterID); err == nil && inst != nil {
-						if inst.RDB == nil {
-							if err := inst.EnsureRDB(r.Context(), "", "", ""); err != nil {
-								log.Printf("cluster: ensure rdb failed id=%s err=%v", clusterID, err)
-							}
-						}
-						if inst.RDB != nil {
+					if present, err := deps.Registry.RDBPresent(clusterID); err == nil && present {
+						if inst, err := deps.Registry.Get(r.Context(), clusterID); err == nil && inst != nil {
 							return inst.RDB
 						}
 					}

@@ -204,6 +204,22 @@ func (r *Registry) Get(ctx context.Context, clusterID string) (*Instance, error)
 	return inst, nil
 }
 
+// RDBPresent returns true if the registry has an initialized RethinkDB manager
+// for the given cluster id.
+func (r *Registry) RDBPresent(clusterID string) (bool, error) {
+	id := NormalID(clusterID)
+	r.mu.RLock()
+	inst, ok := r.items[id]
+	r.mu.RUnlock()
+	if !ok || inst == nil {
+		return false, fmt.Errorf("instance not found")
+	}
+	inst.mu.Lock()
+	present := inst.RDB != nil
+	inst.mu.Unlock()
+	return present, nil
+}
+
 // EnsureRDB lazily initializes the per-cluster RethinkDB manager using
 // the cluster's K8s client for in-cluster service discovery. addrOverride/user/pass
 // are optional but the code enforces that RethinkDB must be reachable inside the
