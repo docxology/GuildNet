@@ -1,0 +1,15 @@
+# Minimal operator image that contains the hostapp binary and runs operator mode
+FROM debian:stable-slim
+LABEL maintainer="GuildNet <dev@hexafield.com>"
+
+# Install ca-certificates and tini for signal handling
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tini && rm -rf /var/lib/apt/lists/*
+
+# Create user
+RUN useradd -m -s /bin/false appuser || true
+
+COPY bin/hostapp /usr/local/bin/hostapp
+RUN chmod +x /usr/local/bin/hostapp
+
+ENTRYPOINT ["/usr/bin/tini","--","/usr/local/bin/hostapp"]
+CMD ["operator"]

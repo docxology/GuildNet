@@ -331,6 +331,22 @@ for i in $(seq 1 60); do
 done
 if [ -z "$PROXY_TARGET" ]; then
   echolog "Proxy target not available after wait"; # continue to try SSE via proxy path
+  # Dump diagnostics to aid debugging
+  dump_diagnostics() {
+    DIAG_DIR="$LOGDIR/verify-cluster-diagnostics-$TS"
+    mkdir -p "$DIAG_DIR"
+    echolog "Writing diagnostics to $DIAG_DIR"
+    kubectl get workspace "$WORKSPACE_NAME" -n default -o yaml >"$DIAG_DIR/workspace.yaml" 2>/dev/null || true
+    kubectl get all -l "guildnet.io/workspace=$WORKSPACE_NAME" -n default -o wide >"$DIAG_DIR/kubectl-get-all.txt" 2>/dev/null || true
+    kubectl describe workspace "$WORKSPACE_NAME" -n default >"$DIAG_DIR/workspace-describe.txt" 2>/dev/null || true
+    kubectl -n guildnet-system get pods -l app=workspace-operator -o name >"$DIAG_DIR/operator-pods.txt" 2>/dev/null || true
+    for p in $(kubectl -n guildnet-system get pods -l app=workspace-operator -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo ""); do
+      kubectl -n guildnet-system logs "$p" --tail=500 >"$DIAG_DIR/operator-${p}.log" 2>/dev/null || true
+    done
+    kubectl get events --sort-by='.lastTimestamp' -A >"$DIAG_DIR/events.txt" 2>/dev/null || true
+    echolog "Diagnostics written to $DIAG_DIR"
+  }
+  dump_diagnostics
 fi
 
 # If no proxy target is provided by Host App, attempt to locate a Service or Pod and forward a local port

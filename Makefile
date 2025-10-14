@@ -1,6 +1,9 @@
 BINARY := hostapp
 PKG := ./...
 
+# Operator image (can be overridden)
+OPERATOR_IMAGE ?= ghcr.io/your/module/hostapp:latest
+
 # Defaults (override as needed)
 LISTEN_LOCAL ?= 127.0.0.1:8090
 
@@ -75,6 +78,25 @@ build-backend: ## Build Go backend (bin/hostapp)
 
 operator-build: ## Build operator manager binary (reuses hostapp for now if integrated later)
 	@echo "(placeholder) operator shares hostapp binary in prototype"
+
+# Build and (optionally) load operator image into kind nodes for local testing
+.PHONY: operator-image-build operator-image-load operator-build-load
+operator-image-build: build-backend ## Build a container image for the operator from bin/hostapp
+	@echo "Building operator image $(OPERATOR_IMAGE) ..."
+	docker build -f scripts/Dockerfile.operator -t $(OPERATOR_IMAGE) .
+
+operator-image-load: operator-image-build ## Load the operator image into the current kind cluster (KIND_CLUSTER_NAME)
+	@echo "Loading operator image into kind (if kind present)"
+	if command -v kind >/dev/null 2>&1; then \
+		if [ -z "${KIND_CLUSTER_NAME:-}" ]; then echo "KIND_CLUSTER_NAME not set; skipping kind load"; else \
+			kind load docker-image $(OPERATOR_IMAGE) --name "${KIND_CLUSTER_NAME}"; \
+		fi; \
+	else \
+		echo "kind not found; skipping kind image load"; \
+	fi
+
+operator-build-load: operator-image-load ## Convenience target to build and load operator image
+	@echo "operator image build+load complete"
 
 build-ui: ## Build UI (Vite)
 	cd ui && npm ci && npm run build
@@ -208,7 +230,10 @@ deploy-k8s-addons: ## Install MetalLB (pool from .env), CRDs, imagePullSecret, D
 	bash ./scripts/k8s-setup-registry-secret.sh || true
 	bash ./scripts/rethinkdb-setup.sh || true
 
-deploy-operator: ## Deploy operator (placeholder manifests)
+deploy-operator: ## Deploy operator (build+load image into kind if USE_KIND=1, then apply manifests)
+	@if [ "${USE_KIND:-0}" = "1" ]; then \
+		$(MAKE) operator-build-load; \
+	fi
 	bash ./scripts/deploy-operator.sh
 
 deploy-hostapp: ## Run hostapp locally (or deploy in cluster if configured)

@@ -87,6 +87,7 @@ spec:
       containers:
       - name: operator
         image: ${IMAGE}
+        imagePullPolicy: IfNotPresent
         command: ["/usr/local/bin/hostapp"]
         args: ["operator"]
         env:
@@ -130,3 +131,10 @@ YAML
 fi
 
 echo "Operator deployment applied in namespace ${NAMESPACE}"
+
+# If running in a local kind cluster and the image is the placeholder GHCR name, warn the user
+if [ "${IMAGE}" = "ghcr.io/your/module/hostapp:latest" ]; then
+  if command -v kind >/dev/null 2>&1 && [ "${USE_KIND:-0}" = "1" ]; then
+    echo "[operator] NOTE: operator image is the GHCR placeholder; run 'make operator-build-load' to build+load it into kind or set OPERATOR_IMAGE to a reachable image"
+  fi
+fi
