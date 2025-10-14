@@ -159,6 +159,56 @@ else
   fi
 fi
 
+# If we're running in a disposable kind cluster, build+load the operator image into kind
+# and deploy the operator into the cluster so the operator's API is available for test runs.
+if [ "$USE_KIND" = "1" ]; then
+  echolog "USE_KIND=1: building+loading operator image into kind and deploying operator"
+  # Build and load operator image (non-fatal if kind or docker not present)
+  (cd "$ROOT" && env KIND_CLUSTER_NAME="$CLUSTER_NAME" MAKEFLAGS= make operator-build-load) 2>&1 | tee -a "$LOGFILE" || echolog "operator build/load may have failed (continuing)"
+  # Deploy the operator manifests into the cluster
+  bash "$ROOT/scripts/deploy-operator.sh" 2>&1 | tee -a "$LOGFILE" || echolog "deploy-operator failed (continuing)"
+fi
+
+# Ensure CRDs from the repository are applied into the test cluster so the operator can register types
+if [ -d "$ROOT/config/crd" ]; then
+  echolog "Applying local CRDs from $ROOT/config/crd"
+  for f in "$ROOT"/config/crd/*.yaml; do
+    echo "kubectl apply -f $f" >> "$LOGFILE"
+    kubectl apply -f "$f" >/dev/null 2>&1 || echolog "Failed to apply CRD $f (continuing)"
+  done
+fi
+
+# Wait for operator deployment and CRD discovery to avoid races where the hostapp
+# attempts to create Workspaces before the operator has registered the API.
+echolog "Waiting for workspace operator and CRD to become available (timeout 120s)"
+OPERATOR_NS=${OPERATOR_NS:-guildnet-system}
+OPERATOR_DEPLOY=${OPERATOR_DEPLOY:-workspace-operator}
+CRD_NAME=${CRD_NAME:-workspaces.guildnet.io}
+start_ts=$(date +%s)
+until kubectl -n "$OPERATOR_NS" get deploy "$OPERATOR_DEPLOY" >/dev/null 2>&1; do
+  if [ $(( $(date +%s) - start_ts )) -gt 120 ]; then
+    echolog "Operator deployment $OPERATOR_NS/$OPERATOR_DEPLOY not found after timeout"
+    break
+  fi
+  sleep 1
+done
+# Wait for deployment to be available
+kubectl -n "$OPERATOR_NS" wait --for=condition=available deployment/"$OPERATOR_DEPLOY" --timeout=120s >/dev/null 2>&1 || echolog "Operator deployment did not become available within timeout"
+
+# Wait for CRD to show up in API discovery
+start_ts=$(date +%s)
+while :; do
+  if kubectl get crd "$CRD_NAME" >/dev/null 2>&1; then
+    echolog "CRD $CRD_NAME available"
+    break
+  fi
+  if [ $(( $(date +%s) - start_ts )) -gt 120 ]; then
+    echolog "CRD $CRD_NAME not available after timeout"
+    break
+  fi
+  sleep 1
+done
+
 echolog "Step: deploy RethinkDB StatefulSet (apply with --validate=false for compatibility)"
 # Some Kubernetes API servers reject server-side validation (openapi) for CRDs or when API aggregation is limited.
 # Use --validate=false to avoid failing apply on such clusters.
