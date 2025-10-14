@@ -58,7 +58,8 @@ need bash
 need curl
 need jq
 need kubectl
-need kind
+
+# 'kind' is only required when USE_KIND=1; check later when needed
 
 # NO_DELETE: when set to 1, do not delete clusters at the end (useful for debugging)
 NO_DELETE=${NO_DELETE:-0}
@@ -112,6 +113,9 @@ echolog "Logfile: $LOGFILE"
 
 if [ "$USE_KIND" = "1" ]; then
   echolog "Step: create kind cluster"
+  if ! command -v kind >/dev/null 2>&1; then
+    echolog "ERROR: 'kind' not found in PATH but USE_KIND=1. Install kind or unset USE_KIND."; exit 2
+  fi
   if ! bash "$ROOT/scripts/kind-setup.sh" 2>&1 | tee -a "$LOGFILE"; then
     echolog "kind-setup failed"; exit 3
   fi
@@ -122,8 +126,79 @@ if [ "$USE_KIND" = "1" ]; then
 else
   # Use existing kubeconfig from environment if present, otherwise default location
   KUBECONFIG_OUT=${KUBECONFIG_OUT:-${GN_KUBECONFIG:-${KUBECONFIG:-$HOME/.kube/config}}}
+  # If the kubeconfig file is missing, try to create one from env vars or attempt to start a local cluster
   if [ ! -f "$KUBECONFIG_OUT" ]; then
-    echolog "No kubeconfig found at $KUBECONFIG_OUT; set KUBECONFIG or USE_KIND=1 to create a kind cluster"; exit 4
+    echolog "No kubeconfig found at $KUBECONFIG_OUT; attempting to generate or start a local cluster"
+    # Try to generate kubeconfig from environment variables (KUBE_API_SERVER,KUBE_TOKEN,KUBE_CA_DATA)
+    if [ -n "${KUBE_API_SERVER:-}" ] && [ -n "${KUBE_TOKEN:-}" ]; then
+      echolog "Generating kubeconfig from KUBE_API_SERVER and KUBE_TOKEN environment variables"
+      mkdir -p "$(dirname "$KUBECONFIG_OUT")"
+      cat > "$KUBECONFIG_OUT" <<EOF
+apiVersion: v1
+clusters:
+- cluster:
+    server: ${KUBE_API_SERVER}
+    certificate-authority-data: ${KUBE_CA_DATA:-}
+  name: generated-cluster
+contexts:
+- context:
+    cluster: generated-cluster
+    user: generated-user
+  name: generated-context
+current-context: generated-context
+kind: Config
+preferences: {}
+users:
+- name: generated-user
+  user:
+    token: ${KUBE_TOKEN}
+EOF
+      echolog "Wrote generated kubeconfig to $KUBECONFIG_OUT"
+    else
+      # Try to start a local cluster using minikube, microk8s, k3d in that order
+      started=0
+      if command -v minikube >/dev/null 2>&1; then
+        echolog "Attempting to start minikube cluster (this may take a few minutes)"
+        if minikube start >/dev/null 2>&1; then
+          started=1
+          KUBECONFIG_OUT="$(minikube kubeconfig)"
+        else
+          echolog "minikube start failed"
+        fi
+      fi
+      if [ $started -eq 0 ] && [ -x "$ROOT/scripts/microk8s-setup.sh" ]; then
+        echolog "Invoking scripts/microk8s-setup.sh to provision microk8s (will auto-install if needed) and emit kubeconfig"
+        if OUT=$(bash "$ROOT/scripts/microk8s-setup.sh" "$KUBECONFIG_OUT" 2>&1 | tee -a "$LOGFILE"); then
+          # microk8s-setup prints the kubeconfig path as its last line; use that if non-empty
+          LAST_LINE=$(echo "$OUT" | tail -n1)
+          if [ -f "$LAST_LINE" ]; then
+            KUBECONFIG_OUT="$LAST_LINE"
+          else
+            # fallback: microk8s config output
+            if [ -f "$KUBECONFIG_OUT" ]; then
+              echolog "microk8s setup wrote kubeconfig to $KUBECONFIG_OUT"
+            else
+              echolog "microk8s setup did not produce kubeconfig at $KUBECONFIG_OUT";
+            fi
+          fi
+          started=1
+        else
+          echolog "microk8s setup script failed"
+        fi
+      fi
+      if [ $started -eq 0 ] && command -v k3d >/dev/null 2>&1; then
+        echolog "Attempting to create a k3d cluster 'guildnet-k3d'"
+        if k3d cluster list | grep -q guildnet-k3d || k3d cluster create guildnet-k3d >/dev/null 2>&1; then
+          started=1
+          KUBECONFIG_OUT=$(k3d kubeconfig get guildnet-k3d)
+        else
+          echolog "k3d create failed"
+        fi
+      fi
+      if [ $started -eq 0 ]; then
+        echolog "Unable to generate kubeconfig from env and no local cluster provider succeeded. Set KUBECONFIG or run with USE_KIND=1 to create a kind cluster"; exit 4
+      fi
+    fi
   fi
 fi
 
@@ -135,6 +210,23 @@ if ! kubectl --request-timeout=5s get --raw='/readyz' >/dev/null 2>&1; then
   echolog "Kubernetes API not reachable using kubeconfig $KUBECONFIG_OUT."
   echolog "Set KUBECONFIG to a reachable cluster or run with USE_KIND=1 to create a local kind cluster.";
   exit 4
+fi
+
+# If microk8s is present, build+load the operator image into microk8s so the operator pod can use the local image
+if command -v microk8s >/dev/null 2>&1 || grep -q "microk8s" <<< "${KUBECONFIG_OUT}" 2>/dev/null; then
+  echolog "Detected microk8s kubeconfig/environment: building+loading operator image into microk8s"
+  (cd "$ROOT" && MAKEFLAGS= make operator-build-load) 2>&1 | tee -a "$LOGFILE" || echolog "operator build/load may have failed (continuing)"
+fi
+
+# For non-kind clusters (microk8s, minikube, k3d, or real clusters) deploy the operator
+# so the operator's API types (CRDs) and controller become available for the test run.
+# We avoid doing this for the disposable-kind path because the kind flow deploys the
+# operator later when USE_KIND=1.
+if [ "${USE_KIND:-0}" != "1" ]; then
+  echolog "Deploying operator into target cluster (non-kind path)"
+  export OPERATOR_IMAGE="${OPERATOR_IMAGE:-guildnet/hostapp:local}"
+  echolog "Using OPERATOR_IMAGE=$OPERATOR_IMAGE for operator deployment"
+  bash "$ROOT/scripts/deploy-operator.sh" 2>&1 | tee -a "$LOGFILE" || echolog "deploy-operator failed (continuing)"
 fi
 
 echolog "Step: generate guildnet.config (join file)"
@@ -166,6 +258,8 @@ if [ "$USE_KIND" = "1" ]; then
   # Build and load operator image (non-fatal if kind or docker not present)
   (cd "$ROOT" && env KIND_CLUSTER_NAME="$CLUSTER_NAME" MAKEFLAGS= make operator-build-load) 2>&1 | tee -a "$LOGFILE" || echolog "operator build/load may have failed (continuing)"
   # Deploy the operator manifests into the cluster
+  export OPERATOR_IMAGE="${OPERATOR_IMAGE:-guildnet/hostapp:local}"
+  echolog "Using OPERATOR_IMAGE=$OPERATOR_IMAGE for operator deployment"
   bash "$ROOT/scripts/deploy-operator.sh" 2>&1 | tee -a "$LOGFILE" || echolog "deploy-operator failed (continuing)"
 fi
 

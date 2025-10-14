@@ -1,8 +1,8 @@
 BINARY := hostapp
 PKG := ./...
 
-# Operator image (can be overridden)
-OPERATOR_IMAGE ?= ghcr.io/your/module/hostapp:latest
+# Operator image (use a local tag by default; can be overridden)
+OPERATOR_IMAGE ?= guildnet/hostapp:local
 
 # Defaults (override as needed)
 LISTEN_LOCAL ?= 127.0.0.1:8090
@@ -87,13 +87,9 @@ operator-image-build: build-backend ## Build a container image for the operator 
 
 operator-image-load: operator-image-build ## Load the operator image into the current kind cluster (KIND_CLUSTER_NAME)
 	@echo "Loading operator image into kind (if kind present)"
-	if command -v kind >/dev/null 2>&1; then \
-		if [ -z "${KIND_CLUSTER_NAME:-}" ]; then echo "KIND_CLUSTER_NAME not set; skipping kind load"; else \
-			kind load docker-image $(OPERATOR_IMAGE) --name "${KIND_CLUSTER_NAME}"; \
-		fi; \
-	else \
-		echo "kind not found; skipping kind image load"; \
-	fi
+	@# Prefer kind if available, otherwise try microk8s (ctr) import
+	# Delegate to helper script which handles kind or microk8s image load
+	@bash ./scripts/load-operator-image.sh $(OPERATOR_IMAGE) "${KIND_CLUSTER_NAME:-}" || echo "operator image load helper failed"
 
 operator-build-load: operator-image-load ## Convenience target to build and load operator image
 	@echo "operator image build+load complete"
