@@ -123,8 +123,6 @@ type PreAuthKey struct {
 	LastUsedAt  *string `json:"lastUsedAt,omitempty"`
 }
 
-// (Talos types removed)
-
 type Credential struct {
 	ID        string `json:"id"`
 	ScopeType string `json:"scopeType"`

@@ -47,8 +47,6 @@ setup-headscale: ## Setup Headscale (Docker) and bootstrap preauth
 setup-tailscale: ## Setup Tailscale router (enable forwarding, up, approve routes)
 	bash ./scripts/setup-tailscale.sh
 
-## (Talos flow removed) Use existing Kubernetes and per-cluster router.
-
 setup-all: ## One-command: Headscale up -> LAN sync -> ensure Kubernetes (kind) -> Headscale namespace -> router DS -> addons -> operator -> hostapp -> verify
 	@CL=$${CLUSTER:-$${GN_CLUSTER_NAME:-default}}; \
 	echo "[setup-all] Using cluster: $$CL"; \
@@ -212,8 +210,6 @@ local-overlay-up: ## Bring up local Headscale on LAN + router; prepares a workin
 headscale-approve-routes: ## Approve tailscale routes for the router in Headscale
 	bash ./scripts/headscale-approve-routes.sh
 
-## (Talos helpers removed)
-
 # Export KUBECONFIG for kubectl invocations that run via Make targets
 export KUBECONFIG := $(GN_KUBECONFIG)
 
@@ -243,8 +239,6 @@ verify-e2e: ## Verify router, routes, kube API, DB
 diag-router: ## Show tailscale status and headscale routes
 	$(MAKE) router-status || true
 	docker ps --format '{{.Names}}' | grep -q '^guildnet-headscale$$' && docker exec -i guildnet-headscale headscale routes list || true
-
-## (Talos diagnostics removed)
 
 diag-k8s: ## Show kube API status and nodes
 	kubectl --request-timeout=5s get --raw='/readyz?verbose' || true

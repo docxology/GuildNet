@@ -7,7 +7,7 @@ GuildNet is a private self-hostable stack that puts human-in-the-loop with agent
 ### Distributed private network cluster
 
 - **Host App**: A local server that runs on all machines and exposes the UI to the network via tsnet as well as reverse-proxies traffic into Kubernetes.
-- **Kubernetes Cluster**: Your existing real-node Kubernetes (or Talos). Each cluster can have its own Tailnet and router.
+- **Kubernetes Cluster**: Your existing real-node Kubernetes. Each cluster can have its own Tailnet and router.
 - **Tailscale/Headscale**: Used for secure networking. Each cluster can use a per‑cluster embedded tsnet connector and an in-cluster subnet router.
 - **UI**: A web interface for users to interact with the system, manage clusters, and access code servers.
 - **Image Registry**: A private Docker image registry running within the cluster to store and manage container images.
