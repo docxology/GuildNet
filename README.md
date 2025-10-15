@@ -93,17 +93,17 @@ Notes:
 - You can also use `sudo make setup-tailscale` to run the end-to-end router setup (enables IP forwarding, brings Tailscale up, attempts route approval).
 - Route examples commonly include cluster/service/pod CIDRs (e.g., `10.96.0.0/12`, `10.244.0.0/16`) plus any node CIDRs.
 
-## 3) Kubernetes (use existing)
+## 3) Kubernetes
 
-Use existing Kubernetes:
+Two simple options to get a cluster for the quickstart:
 
-- Ensure you have a valid kubeconfig for the target cluster. Put it at `~/.guildnet/kubeconfig` (default used by Makefile/scripts) or export `KUBECONFIG` accordingly.
-- Ensure your Tailnet has routes to the cluster (via subnet router) if accessing from outside the cluster’s network.
+- Local cluster (quick, developer):
+  - `make kind-up` — creates a local kind cluster and writes the kubeconfig to `$(GN_KUBECONFIG)`.
 
-Add-ons (optional, but recommended for the full demo):
+- Full setup (one-command full demo stack):
+  - `make setup-all` — runs the full provisioning flow (Headscale, router, cluster setup, addons, operator, hostapp, verify).
 
-- Apply CRDs, install MetalLB, create imagePullSecret, and bring up the example DB
-  - `make deploy-k8s-addons`
+After running either command ensure the kubeconfig is available to the scripts (set `KUBECONFIG` or leave it at `~/.guildnet/kubeconfig`).
 
 ## 4) Server (Host App + UI)
 
