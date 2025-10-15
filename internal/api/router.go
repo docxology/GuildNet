@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -947,16 +948,42 @@ func Router(deps Deps) *http.ServeMux {
 							dyn = d
 							log.Printf("cluster: built dynamic client from main kubeconfig for id=%s", clusterID)
 						}
+						// If initial health check times out, try enabling local kube-proxy fallback
+						// and rebuild clients once.
+						if cli == nil || dyn == nil {
+							// attempt to detect a timeout on the initial client creation/health
+							// and enable proxy fallback once to recover.
+							if isLocalKubeProxyAvailable() {
+								if ensureProxyFallbackOnTimeout(setMgrLocal, clusterID) {
+									// Re-apply proxy settings and try to rebuild clients using local proxy
+									applyClusterAPIProxy(cfg2, setMgrLocal, clusterID)
+									if c2, e2 := kubernetes.NewForConfig(cfg2); e2 == nil {
+										cli = c2
+										log.Printf("cluster: rebuilt kubernetes client after enabling proxy fallback for id=%s", clusterID)
+									}
+									if d2, e2 := dynamic.NewForConfig(cfg2); e2 == nil {
+										dyn = d2
+										log.Printf("cluster: rebuilt dynamic client after enabling proxy fallback for id=%s", clusterID)
+									}
+								}
+							}
+						}
 					}
 				}
 			}
 		}
-		// If we still don't have clients, be tolerant and return an empty list
-		// rather than a hard 5xx. This keeps the API usable when clusters are
-		// imported but not yet fully initialized or when the registry isn't
-		// ready.
+		// If we still don't have clients, be tolerant for read-only endpoints
+		// but for mutating operations (workspace create) return an explicit
+		// error so callers know to attach a kubeconfig or wait.
 		if cli == nil || dyn == nil {
-			httpx.JSON(w, http.StatusOK, []any{})
+			// For GET/list/servers endpoints we return an empty list (keeps UI usable).
+			if r.Method == http.MethodGet {
+				httpx.JSON(w, http.StatusOK, []any{})
+				return
+			}
+			// For mutating requests return 503 with a helpful message
+			httpx.JSONError(w, http.StatusServiceUnavailable, "kubernetes clients not available for cluster; attach kubeconfig or wait for cluster initialization", "no_k8s_clients", "kube clients not available for cluster id")
+			log.Printf("cluster: mutating request but kube clients missing for id=%s", clusterID)
 			return
 		}
 		// Fetch per-cluster settings to derive default namespace using (possibly) per-cluster DB
@@ -1365,16 +1392,34 @@ func kubeconfigFrom(kc string) (*rest.Config, error) {
 
 func healthyCluster(cfg *rest.Config) error {
 	cfg.Timeout = 3 * time.Second
+	// Try a lightweight HTTP GET to /version using the kube transport so we can
+	// enforce a client-side timeout reliably.
+	tr, err := rest.TransportFor(cfg)
+	if err == nil {
+		httpClient := &http.Client{Transport: tr, Timeout: 3 * time.Second}
+		// Build version URL from cfg.Host (may include scheme)
+		host := cfg.Host
+		if !strings.HasPrefix(host, "http://") && !strings.HasPrefix(host, "https://") {
+			host = "https://" + strings.TrimPrefix(host, "//")
+		}
+		verURL := strings.TrimRight(host, "/") + "/version"
+		req, _ := http.NewRequestWithContext(context.Background(), "GET", verURL, nil)
+		if resp, err := httpClient.Do(req); err == nil {
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				_ = resp.Body.Close()
+				return nil
+			}
+			_ = resp.Body.Close()
+		}
+	}
+	// Fallback: try list namespaces with a short context timeout using client-go
 	cli, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		return err
 	}
-	_, err = cli.ServerVersion()
-	if err == nil {
-		return nil
-	}
-	// fallback quick list namespaces
-	_, err = cli.CoreV1().Namespaces().List(context.Background(), metav1.ListOptions{Limit: 1})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, err = cli.CoreV1().Namespaces().List(ctx, metav1.ListOptions{Limit: 1})
 	return err
 }
 
@@ -1440,7 +1485,20 @@ func headscaleHealth(endpoint string) (string, error) {
 
 // isLocalKubeProxyAvailable returns true if a kubectl proxy is listening on 127.0.0.1:8001.
 func isLocalKubeProxyAvailable() bool {
-	c, err := net.DialTimeout("tcp", "127.0.0.1:8001", 500*time.Millisecond)
+	addr := "127.0.0.1:8001"
+	if v := strings.TrimSpace(os.Getenv("KUBE_PROXY_ADDR")); v != "" {
+		// Accept either host:port or URL. If URL, extract host:port
+		if strings.HasPrefix(v, "http://") || strings.HasPrefix(v, "https://") {
+			if u, err := url.Parse(v); err == nil {
+				addr = u.Host
+			} else {
+				addr = v
+			}
+		} else {
+			addr = v
+		}
+	}
+	c, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
 	if err == nil {
 		_ = c.Close()
 		return true
@@ -1476,8 +1534,17 @@ func ensureProxyFallbackOnTimeout(setMgr settings.Manager, clusterID string) boo
 		return false
 	}
 	host := strings.TrimSpace(cs.APIProxyURL)
-	if host == "" || !strings.EqualFold(host, "http://127.0.0.1:8001") {
-		cs.APIProxyURL = "http://127.0.0.1:8001"
+	if host == "" {
+		if v := strings.TrimSpace(os.Getenv("KUBE_PROXY_ADDR")); v != "" {
+			// If env var is host:port, prefix with http:// for APIProxyURL
+			if strings.HasPrefix(v, "http://") || strings.HasPrefix(v, "https://") {
+				cs.APIProxyURL = v
+			} else {
+				cs.APIProxyURL = "http://" + v
+			}
+		} else {
+			cs.APIProxyURL = "http://127.0.0.1:8001"
+		}
 		if !cs.APIProxyForceHTTP {
 			cs.APIProxyForceHTTP = true
 		}

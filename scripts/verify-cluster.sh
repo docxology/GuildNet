@@ -236,6 +236,45 @@ if ! bash "$ROOT/scripts/create_join_info.sh" --kubeconfig "$KUBECONFIG_OUT" --n
 fi
 echolog "Join file created: $JOIN_OUT"
 
+# Register cluster with local HostApp (create cluster record and attach kubeconfig)
+attach_kubeconfig_to_hostapp() {
+  if [ ! -f "$JOIN_OUT" ]; then
+    echolog "No join file at $JOIN_OUT; skipping attach to HostApp"
+    return 0
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    echolog "curl not available; cannot attach kubeconfig to HostApp"
+    return 1
+  fi
+  # Read kubeconfig embedded in join file
+  KC=$(jq -r '.cluster.kubeconfig // empty' "$JOIN_OUT" 2>/dev/null || true)
+  if [ -z "$KC" ]; then
+    echolog "No kubeconfig embedded in $JOIN_OUT; skipping attach"
+    return 0
+  fi
+  # Create cluster record in HostApp (if not exists) and attach kubeconfig
+  HOSTAPP_API="$HOSTAPP_URL/api/deploy/clusters"
+  echolog "Registering cluster '$CLUSTER_NAME' with HostApp"
+  CREATE_RESP=$(printf '{"name": "%s"}' "${CLUSTER_NAME:-${KUBECONFIG_OUT##*/}}" | curl -k -sS -X POST -H 'Content-Type: application/json' -d @- "$HOSTAPP_API" || true)
+  CLUSTER_ID=$(echo "$CREATE_RESP" | jq -r '.id // empty' 2>/dev/null || true)
+  if [ -z "$CLUSTER_ID" ]; then
+    # try to find an existing cluster with same name
+    LIST=$(curl -k -sS "$HOSTAPP_API" || true)
+    CLUSTER_ID=$(echo "$LIST" | jq -r --arg name "${CLUSTER_NAME}" '.[] | select(.name==$name) | .id' 2>/dev/null || true)
+  fi
+  if [ -z "$CLUSTER_ID" ]; then
+    echolog "Failed to obtain cluster id from HostApp; cluster registration may have failed: resp=$CREATE_RESP"
+    return 1
+  fi
+  echolog "Attaching kubeconfig to HostApp cluster id=$CLUSTER_ID"
+  # JSON-encode the kubeconfig safely
+  PAYLOAD=$(printf '%s' "$KC" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+  ATTACH_PAYLOAD="{\"kubeconfig\":$PAYLOAD}"
+  curl -k -sS -X POST "$HOSTAPP_API/$CLUSTER_ID?action=attach-kubeconfig" -H 'Content-Type: application/json' -d "$ATTACH_PAYLOAD" -o /dev/null -w "%{http_code}" | { read code; echolog "HostApp attach-kubeconfig HTTP=$code"; }
+}
+
+attach_kubeconfig_to_hostapp || echolog "attach_kubeconfig_to_hostapp returned non-zero"
+
 echolog "Step: preflight checks for target Kubernetes cluster"
 if ! bash "$ROOT/scripts/verify-cluster-preflight.sh" 2>&1 | tee -a "$LOGFILE"; then
   echolog "Preflight checks failed; aborting"; exit 5

@@ -141,6 +141,44 @@ TLS note:
 
 Either path ends with the same UI, where you can create workspaces and access them from any Tailnet device.
 
+## Developer Quickstart (one-machine)
+
+These steps are the quickest path to get a fully functional local development environment (microk8s or existing kubeconfig). The scripts automate registering the cluster with the Host App and attaching the kubeconfig so the UI can control Workspaces without manual DB edits.
+
+1) Prepare (ensure tools installed): docker, kubectl, microk8s (or kind), jq, curl, python3
+2) Provision or point to a cluster and run the verify flow:
+
+```bash
+# create or use existing kubeconfig; the script will try microk8s/minikube/k3d/kind
+./scripts/verify-cluster.sh
+```
+
+This script will:
+- create or reuse a local cluster (depending on environment and USE_KIND)
+- build and load the operator image into microk8s/kind when needed
+- deploy CRDs, operator, and RethinkDB
+- generate `guildnet.config` and auto-attach the kubeconfig to the Host App
+- start the Host App locally (if not already running)
+
+3) Create and verify a workspace via helper:
+
+```bash
+# usage: scripts/verify-workspace.sh <cluster-id> <workspace-name> [image] [password]
+CLUSTER_ID=$(curl -k https://127.0.0.1:8090/api/deploy/clusters | jq -r '.[] | select(.name=="microk8s-local") | .id')
+./scripts/verify-workspace.sh "$CLUSTER_ID" verify-cs-local
+```
+
+If everything succeeded, you'll see the workspace reach Running, code-server logs, and the helper will probe the proxied root through the Host App.
+
+Troubleshooting notes:
+- If Host App returns empty lists for per-cluster endpoints, ensure `guildnet.config` was created and that the script attached the kubeconfig. You can attach manually:
+
+```bash
+curl -k -X POST "https://127.0.0.1:8090/api/deploy/clusters/<id>?action=attach-kubeconfig" -H 'Content-Type: application/json' -d '{"kubeconfig":"<base kubeconfig content here>"}'
+```
+
+- If `curl` fails with TLS read errors when probing the proxy, try --http1.1 or use a browser; the Host App terminates TLS locally and proxying large streaming responses can sometimes trigger client-side TLS library quirks in curl.
+
 ## Troubleshooting (quick)
 
 - UI not reachable on another device:

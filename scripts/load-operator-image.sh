@@ -38,19 +38,23 @@ if command -v microk8s >/dev/null 2>&1; then
 
   echo "Importing saved image into microk8s (this may require sudo)"
   # Retry a few times in case containerd is temporarily busy
-  for attempt in 1 2 3; do
+  max_attempts=6
+  backoff=1
+  for attempt in $(seq 1 $max_attempts); do
+    echolog() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
+    echolog "microk8s ctr import attempt $attempt/$max_attempts"
     if sudo microk8s ctr images import "$TMP"; then
-      echo "operator image loaded into microk8s (attempt $attempt)"
+      echolog "operator image loaded into microk8s (attempt $attempt)"
       rm -f "$TMP"
       trap - EXIT
       exit 0
-    else
-      echo "microk8s ctr import failed (attempt $attempt); retrying..."
-      sleep 1
     fi
+    echolog "microk8s ctr import failed (attempt $attempt); backing off $backoff s"
+    sleep $backoff
+    backoff=$((backoff * 2))
   done
 
-  echo "microk8s ctr import failed after retries" >&2
+  echolog "microk8s ctr import failed after $max_attempts attempts" >&2
   rm -f "$TMP"
   exit 1
 fi
