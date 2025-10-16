@@ -1,0 +1,13 @@
+apiVersion: guildnet.io/v1alpha1
+kind: Workspace
+metadata:
+  name: {{NAME}}
+  namespace: {{NAMESPACE}}
+spec:
+  image: {{IMAGE}}
+  ports:
+    - name: http
+      containerPort: {{PORT}}
+  env:
+    - name: PASSWORD
+      value: {{PASSWORD}}
