@@ -51,8 +51,8 @@ done
 CLIENT_PORT=$(kubectl get svc "$SERVICE_NAME" -n "$NAMESPACE" -o jsonpath='{range .spec.ports[*]}{.port}{" "}{.name}{"\n"}{end}' | awk '$2=="client"{print $1; found=1} END{if(!found) print "28015"}')
 
 if [ -n "$LB_HOST" ]; then
-  echo "RethinkDB reachable at: ${LB_HOST}:${CLIENT_PORT}"
-  echo "export RETHINKDB_ADDR=${LB_HOST}:${CLIENT_PORT}"
+  echo "RethinkDB LoadBalancer reachable at: ${LB_HOST}:${CLIENT_PORT}"
+  echo "Note: RethinkDB must be consumed via in-cluster service '${SERVICE_NAME}' in namespace '${NAMESPACE}'."
   exit 0
 fi
 
@@ -74,8 +74,8 @@ if [ "${NODEPORT_FALLBACK}" = "true" ] || [ "${NODEPORT_FALLBACK}" = "1" ]; then
     echo "Failed to determine NodePort address" >&2
     exit 2
   fi
-  echo "RethinkDB reachable at: ${NODE_IP}:${NODE_PORT}"
-  echo "export RETHINKDB_ADDR=${NODE_IP}:${NODE_PORT}"
+  echo "RethinkDB NodePort reachable at: ${NODE_IP}:${NODE_PORT}"
+  echo "Note: RethinkDB must be consumed via in-cluster service '${SERVICE_NAME}' in namespace '${NAMESPACE}'."
   exit 0
 else
   echo "NODEPORT_FALLBACK disabled and no LB available; cannot provide external address." >&2

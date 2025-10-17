@@ -1,8 +1,11 @@
 BINARY := hostapp
 PKG := ./...
 
+# Operator image (use a local tag by default; can be overridden)
+OPERATOR_IMAGE ?= guildnet/hostapp:local
+
 # Defaults (override as needed)
-LISTEN_LOCAL ?= 127.0.0.1:8080
+LISTEN_LOCAL ?= 127.0.0.1:8090
 
 # User-scoped kubeconfig location (used by scripts and docs)
 GN_KUBECONFIG ?= $(HOME)/.guildnet/kubeconfig
@@ -15,12 +18,12 @@ PROVIDER ?= lan
 	run \
 	test lint tidy clean setup ui-setup \
 	health tls-check-backend regen-certs stop-all \
-	talos-fresh talos-upgrade agent-build \
+	agent-build \
 	crd-apply operator-run operator-build db-health \
-	setup-headscale setup-tailscale setup-talos setup-all \
-	bootstrap-sudo setup-all-provision talos-provision-vm \
+	setup-headscale setup-tailscale setup-all \
+	kind-up \
 	deploy-k8s-addons deploy-operator deploy-hostapp verify-e2e \
-	diag-router diag-talos diag-k8s diag-db headscale-approve-routes
+	diag-router diag-k8s diag-db headscale-approve-routes
 
 
 all: build ## Build backend and UI
@@ -44,20 +47,25 @@ setup-headscale: ## Setup Headscale (Docker) and bootstrap preauth
 setup-tailscale: ## Setup Tailscale router (enable forwarding, up, approve routes)
 	bash ./scripts/setup-tailscale.sh
 
-setup-talos: ## Fresh deploy Talos and validate
-	bash ./scripts/setup-talos.sh
-
-setup-all: ## Run Headscale, Tailscale, and Talos setup in order
-	$(MAKE) setup-headscale
-	$(MAKE) setup-tailscale
-	@if [ "$(PROVIDER)" = "vm" ]; then \
-		$(MAKE) talos-provision-vm; \
-	else \
-		$(MAKE) setup-talos; \
-	fi
-	$(MAKE) deploy-k8s-addons
-	$(MAKE) deploy-operator || true
-	$(MAKE) deploy-hostapp || true
+setup-all: ## One-command: Headscale up -> LAN sync -> ensure Kubernetes (kind) -> Headscale namespace -> router DS -> addons -> operator -> hostapp -> verify
+	@CL=$${CLUSTER:-$${GN_CLUSTER_NAME:-default}}; \
+	echo "[setup-all] Using cluster: $$CL"; \
+	$(MAKE) headscale-up; \
+	$(MAKE) env-sync-lan; \
+	# Ensure Kubernetes is reachable; if not, bring up a local kind cluster and export kubeconfig
+	ok=1; kubectl --request-timeout=3s get --raw=/readyz >/dev/null 2>&1 || ok=0; \
+	if [ $$ok -eq 0 ]; then \
+		if [ "$${USE_KIND:-0}" = "1" ]; then \
+			$(MAKE) kind-up; \
+		else \
+			echo "Kubernetes API not reachable and USE_KIND!=1; please configure KUBECONFIG or set USE_KIND=1 to auto-create a kind cluster"; exit 2; \
+		fi; \
+	fi; \
+	CLUSTER=$$CL $(MAKE) headscale-namespace; \
+	CLUSTER=$$CL $(MAKE) router-ensure || true; \
+	$(MAKE) deploy-k8s-addons || true; \
+	$(MAKE) deploy-operator || true; \
+	$(MAKE) deploy-hostapp || true; \
 	$(MAKE) verify-e2e || true
 
 # ---------- Build ----------
@@ -69,12 +77,30 @@ build-backend: ## Build Go backend (bin/hostapp)
 operator-build: ## Build operator manager binary (reuses hostapp for now if integrated later)
 	@echo "(placeholder) operator shares hostapp binary in prototype"
 
+# Build and (optionally) load operator image into kind nodes for local testing
+.PHONY: operator-image-build operator-image-load operator-build-load
+operator-image-build: build-backend ## Build a container image for the operator from bin/hostapp
+	@echo "Building operator image $(OPERATOR_IMAGE) ..."
+	docker build -f scripts/Dockerfile.operator -t $(OPERATOR_IMAGE) .
+
+operator-image-load: operator-image-build ## Load the operator image into the current kind cluster (KIND_CLUSTER_NAME)
+	@echo "Loading operator image into kind (if kind present)"
+	@# Prefer kind if available, otherwise try microk8s (ctr) import
+	# Delegate to helper script which handles kind or microk8s image load
+	@bash ./scripts/load-operator-image.sh $(OPERATOR_IMAGE) "${KIND_CLUSTER_NAME:-}" || echo "operator image load helper failed"
+
+operator-build-load: operator-image-load ## Convenience target to build and load operator image
+	@echo "operator image build+load complete"
+
 build-ui: ## Build UI (Vite)
 	cd ui && npm ci && npm run build
 
 # ---------- Run ----------
-run: build ## Build all (backend+UI) and run backend (serve)
+run: build stop-hostapp ## Build all (backend+UI), stop any existing hostapp, then run backend (serve)
 	bash ./scripts/run-hostapp.sh
+
+stop-hostapp: ## Stop any hostapp instances listening on $(LISTEN_LOCAL) (safe: only kills hostapp processes)
+	LISTEN_LOCAL=$(LISTEN_LOCAL) bash ./scripts/stop-hostapp.sh
 
 # ---------- DB / Health ----------
 db-health: ## Check backend health summary
@@ -99,20 +125,26 @@ clean: ## Remove build artifacts
 health: ## Check backend health endpoint
 	curl -k https://$(LISTEN_LOCAL)/healthz || true
 
-tls-check-backend: ## Show TLS info for backend :8080
-	echo | openssl s_client -connect 127.0.0.1:8080 -servername localhost -tls1_2 2>/dev/null | head -n 20
+tls-check-backend: ## Show TLS info for backend :8090
+	echo | openssl s_client -connect 127.0.0.1:8090 -servername localhost -tls1_2 2>/dev/null | head -n 20
 
 stop-all: ## Stop all managed workloads via admin API
-	@curl -sk -X POST https://127.0.0.1:8080/api/admin/stop-all || curl -sk -X POST https://127.0.0.1:8080/api/stop-all || true
+	@curl -sk -X POST https://127.0.0.1:8090/api/admin/stop-all || curl -sk -X POST https://127.0.0.1:8090/api/stop-all || true
 
 # ---------- CRD / Operator helpers ----------
 CRD_DIR ?= config/crd
 crd-apply: ## Apply (or update) GuildNet CRDs into current kube-context
 	@[ -d $(CRD_DIR) ] || { echo "CRD dir $(CRD_DIR) missing"; exit 1; }
-	@for f in $(CRD_DIR)/*.yaml; do \
-		echo "kubectl apply -f $$f"; \
-		KUBECONFIG=$(GN_KUBECONFIG) kubectl apply -f $$f >/dev/null || exit 1; \
-	done; echo "CRDs applied"
+	@ok=1; kubectl --request-timeout=3s get --raw=/readyz >/dev/null 2>&1 || ok=0; \
+	if [ $$ok -eq 0 ]; then \
+		echo "[crd-apply] Kubernetes API not reachable or kubeconfig invalid; skipping"; \
+	else \
+		for f in $(CRD_DIR)/*.yaml; do \
+			echo "kubectl apply -f $$f"; \
+			KUBECONFIG=$(GN_KUBECONFIG) kubectl apply -f $$f >/dev/null || exit 1; \
+		done; \
+		echo "CRDs applied"; \
+	fi
 
 operator-run: ## Run workspace operator (controller-runtime manager) locally
 	go run ./cmd/hostapp --mode operator 2>&1 | sed 's/^/[operator] /'
@@ -178,19 +210,11 @@ local-overlay-up: ## Bring up local Headscale on LAN + router; prepares a workin
 headscale-approve-routes: ## Approve tailscale routes for the router in Headscale
 	bash ./scripts/headscale-approve-routes.sh
 
-# ---------- Talos helpers ----------
-# Examples:
-#   make talos-fresh FRESH_ARGS="--cluster myc --endpoint https://10.0.0.10:6443 --cp 10.0.0.10 --workers 10.0.0.20"
-#   make talos-upgrade UPGRADE_ARGS="--image ghcr.io/siderolabs/installer:v1.7.0 --nodes 10.0.0.10,10.0.0.20 --k8s v1.30.2"
-
 # Export KUBECONFIG for kubectl invocations that run via Make targets
 export KUBECONFIG := $(GN_KUBECONFIG)
 
 # ---------- Provision / Addons / Deploy / Verify ----------
-.PHONY: talos-provision-vm deploy-k8s-addons deploy-operator deploy-hostapp verify-e2e diag-router diag-talos diag-k8s diag-db
-
-talos-provision-vm: ## Provision a local Talos dev cluster (VM/provider)
-	bash ./scripts/talos-vm-up.sh
+.PHONY: deploy-k8s-addons deploy-operator deploy-hostapp verify-e2e diag-router diag-k8s diag-db
 
 deploy-k8s-addons: ## Install MetalLB (pool from .env), CRDs, imagePullSecret, DB
 	bash ./scripts/deploy-metallb.sh
@@ -198,13 +222,19 @@ deploy-k8s-addons: ## Install MetalLB (pool from .env), CRDs, imagePullSecret, D
 	bash ./scripts/k8s-setup-registry-secret.sh || true
 	bash ./scripts/rethinkdb-setup.sh || true
 
-deploy-operator: ## Deploy operator (placeholder manifests)
+deploy-operator: ## Deploy operator (build+load image into kind if USE_KIND=1, then apply manifests)
+	@if [ "${USE_KIND:-0}" = "1" ]; then \
+		$(MAKE) operator-build-load; \
+	fi
 	bash ./scripts/deploy-operator.sh
 
 deploy-hostapp: ## Run hostapp locally (or deploy in cluster if configured)
 	$(MAKE) run
 
-verify-e2e: ## Verify router, routes, Talos reachability, kube API, DB
+generate-join-config: ## Generate join config JSON for the current machine/cluster (uses scripts/generate_join_config.sh)
+	bash ./scripts/generate_join_config.sh --out ${GN_JOIN_OUT:-guildnet.config}
+
+verify-e2e: ## Verify router, routes, kube API, DB
 	bash ./scripts/verify-e2e.sh
 
 # ---------- Diagnostics ----------
@@ -213,12 +243,103 @@ diag-router: ## Show tailscale status and headscale routes
 	$(MAKE) router-status || true
 	docker ps --format '{{.Names}}' | grep -q '^guildnet-headscale$$' && docker exec -i guildnet-headscale headscale routes list || true
 
-diag-talos: ## Show talosctl reachability for CP/WK nodes
-	bash -lc 'set -a; [ -f ./.env ] && . ./.env; for n in $${CP_NODES//,/ }; do echo "-- $$n"; done'
-
 diag-k8s: ## Show kube API status and nodes
 	kubectl --request-timeout=5s get --raw='/readyz?verbose' || true
 	kubectl get nodes -o wide || true
 
 diag-db: ## Print DB service details
 	bash ./scripts/rethinkdb-setup.sh || true
+
+# ---------- Network & Proxy ----------
+router-ensure-novalidate: ## Deploy Tailscale router without server-side schema validation (bootstrap when API unreachable)
+	TS_AUTHKEY=$${TS_AUTHKEY:-$${HEADSCALE_AUTHKEY:-}} kubectl apply --validate=false -f - <<'YAML'
+	apiVersion: apps/v1
+	kind: DaemonSet
+	metadata:
+	  name: tailscale-subnet-router
+	  namespace: kube-system
+	  labels: { app: tailscale-subnet-router }
+	spec:
+	  selector: { matchLabels: { app: tailscale-subnet-router } }
+	  template:
+	    metadata: { labels: { app: tailscale-subnet-router } }
+	    spec:
+	      hostNetwork: true
+	      dnsPolicy: ClusterFirstWithHostNet
+	      tolerations: [ { operator: Exists } ]
+	      containers:
+	      - name: tailscale
+	        image: tailscale/tailscale:stable
+	        securityContext: { capabilities: { add: [NET_ADMIN, NET_RAW] }, privileged: true }
+	        env:
+	        - { name: TS_AUTHKEY, value: "$${TS_AUTHKEY}" }
+	        - { name: TS_LOGIN_SERVER, value: "$${TS_LOGIN_SERVER:-https://login.tailscale.com}" }
+	        - { name: TS_ROUTES, value: "$${TS_ROUTES:-10.0.0.0/24,10.96.0.0/12,10.244.0.0/16}" }
+		- { name: TS_HOSTNAME, value: "$${TS_HOSTNAME:-subnet-router}" }
+	        volumeMounts: [ { name: state, mountPath: /var/lib/tailscale }, { name: tun, mountPath: /dev/net/tun } ]
+		args: [ /bin/sh, -c, "set -e; /usr/sbin/tailscaled --state=/var/lib/tailscale/tailscaled.state & sleep 2; tailscale up --authkey=\"$${TS_AUTHKEY}\" --login-server=\"$${TS_LOGIN_SERVER:-https://login.tailscale.com}\" --advertise-routes=\"$${TS_ROUTES:-10.0.0.0/24,10.96.0.0/12,10.244.0.0/16}\" --hostname=\"$${TS_HOSTNAME:-subnet-router}\" --accept-routes; tail -f /dev/null" ]
+	      volumes:
+	      - { name: state, emptyDir: {} }
+	      - { name: tun, hostPath: { path: /dev/net/tun, type: CharDevice } }
+	YAML
+
+set-cluster-proxy: ## Set per-cluster API proxy URL and force HTTP (usage: make set-cluster-proxy CLUSTER_ID=... PROXY=http://host:8001)
+	@[ -n "$(CLUSTER_ID)" ] || { echo "CLUSTER_ID required"; exit 2; }
+	@[ -n "$(PROXY)" ] || { echo "PROXY required (e.g., http://127.0.0.1:8001)"; exit 2; }
+	@curl -sk -X PUT https://$(LISTEN_LOCAL)/api/settings/cluster/$(CLUSTER_ID) \
+	  -H 'Content-Type: application/json' \
+	  -d '{"api_proxy_url":"'"$(PROXY)"'","api_proxy_force_http":true}'
+
+# New plain-K8S helpers
+headscale-namespace: ## Ensure Headscale namespace and emit keys (CLUSTER=...)
+	CLUSTER=$${CLUSTER:-$${GN_CLUSTER_NAME:-default}} bash ./scripts/headscale-namespace-and-keys.sh
+
+router-ensure: ## Deploy Tailscale subnet router DaemonSet (uses tmp/cluster-<id>-headscale.json when present)
+		@set -e; \
+		CL=$${CLUSTER:-$${GN_CLUSTER_NAME:-}}; \
+		if [ -z "$$CL" ]; then \
+			CNT=$$(ls -1 tmp/cluster-*-headscale.json 2>/dev/null | wc -l | tr -d ' '); \
+			if [ "$$CNT" = "1" ]; then \
+				J=$$(ls -1 tmp/cluster-*-headscale.json); \
+				CL=$$(basename "$$J" | sed -E 's/^cluster-(.+)-headscale\.json/\1/'); \
+			fi; \
+		fi; \
+		: $${CL:=$${GN_CLUSTER_NAME:-default}}; \
+		J=tmp/cluster-$$CL-headscale.json; \
+		if [ ! -f $$J ]; then \
+			CNT=$$(ls -1 tmp/cluster-*-headscale.json 2>/dev/null | wc -l | tr -d ' '); \
+			if [ "$$CNT" = "1" ]; then \
+				J=$$(ls -1 tmp/cluster-*-headscale.json); \
+				CL=$$(basename "$$J" | sed -E 's/^cluster-(.+)-headscale\.json/\1/'); \
+				echo "[router-ensure] Auto-detected cluster: $$CL"; \
+			else \
+				echo "Missing $$J; run: make headscale-namespace CLUSTER=$$CL"; exit 0; \
+			fi; \
+		fi; \
+		if [ ! -f "$(GN_KUBECONFIG)" ]; then \
+			echo "[router-ensure] No kubeconfig at $(GN_KUBECONFIG); skipping"; exit 0; \
+		fi; \
+		if ! kubectl version --request-timeout=3s >/dev/null 2>&1; then \
+			echo "[router-ensure] Kubernetes API not reachable; skipping"; exit 0; \
+		fi; \
+		TS_AUTHKEY=$$(jq -r '.routerAuthKey' $$J); \
+		TS_LOGIN_SERVER=$$(jq -r '.loginServer' $$J); \
+		: $${TS_ROUTES:=$${GN_TS_ROUTES:-10.96.0.0/12,10.244.0.0/16}}; \
+		: $${TS_HOSTNAME:=router-$$CL}; \
+		TS_AUTHKEY="$$TS_AUTHKEY" TS_LOGIN_SERVER="$$TS_LOGIN_SERVER" TS_ROUTES="$$TS_ROUTES" TS_HOSTNAME="$$TS_HOSTNAME" bash ./scripts/deploy-tailscale-router.sh
+
+plain-quickstart: ## Alias to setup-all for plain K8S flow
+	$(MAKE) setup-all
+
+# ---------- Kind (local Kubernetes) ----------
+kind-up: ## Create a local kind cluster and write kubeconfig to $(GN_KUBECONFIG)
+	bash ./scripts/kind-setup.sh
+
+.PHONY: deploy-networkpolicies
+deploy-networkpolicies: ## Apply recommended network policies for workspace isolation
+	@echo "Applying networkpolicies..."
+	@if kubectl version --request-timeout=3s >/dev/null 2>&1; then \
+		kubectl apply -f k8s/networkpolicies/ || true; \
+	else \
+		echo "Kubernetes API not reachable; skipping networkpolicies"; \
+	fi

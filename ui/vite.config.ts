@@ -17,7 +17,20 @@ export default defineConfig({
         } as any
       }
       return true // Last resort: Vite self-signed
-    })()
+    })(),
+    proxy: {
+      // Proxy API + SPA root to backend on 8090 for same-origin dev
+      '^/(api|sse|proxy|ws)': {
+        target: 'https://127.0.0.1:8090',
+        changeOrigin: true,
+        secure: false,
+      },
+      '^/$': {
+        target: 'https://127.0.0.1:8090',
+        changeOrigin: true,
+        secure: false,
+      }
+    }
   },
   build: {
     target: 'esnext'

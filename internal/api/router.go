@@ -10,12 +10,15 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"nhooyr.io/websocket"
 
+	"github.com/your/module/internal/cluster"
 	"github.com/your/module/internal/httpx"
 	"github.com/your/module/internal/jobs"
 	"github.com/your/module/internal/localdb"
@@ -23,12 +26,11 @@ import (
 	"github.com/your/module/internal/proxy"
 	"github.com/your/module/internal/secrets"
 
-	// Added for DB API delegation
-	"github.com/your/module/internal/db"
 	// New settings
 	"github.com/your/module/internal/settings"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -38,16 +40,31 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
+// publishedListener holds metadata for an on-demand published listener.
+type publishedListener struct {
+	clusterID string
+	service   string
+	addr      string // tsnet listener address (host:port or :port)
+	ln        net.Listener
+	addedAt   time.Time
+}
+
+var (
+	// publishedMap stores active published listeners keyed by clusterID+service
+	publishedMap   = map[string]*publishedListener{}
+	publishedMapMu sync.Mutex
+)
+
 // Deps are runtime dependencies for the orchestration API.
 type Deps struct {
 	DB      *localdb.DB
 	Secrets *secrets.Manager
 	Runner  *jobs.Runner
 	Token   string // optional bearer token for mutating endpoints
-	// Optional shared DB manager for database API; if nil, handlers will lazy-connect
-	DBMgr *db.Manager
 	// Optional callback to trigger host restart/reload when certain settings change
 	OnSettingsChanged func(kind string)
+	// Optional per-cluster registry for isolation
+	Registry *cluster.Registry
 }
 
 func (d Deps) ensure() Deps {
@@ -101,7 +118,7 @@ func Router(deps Deps) *http.ServeMux {
 	setMgr := settings.Manager{DB: deps.DB}
 
 	// Bootstrap endpoint: accept a subset of guildnet.config and persist.
-	mux.HandleFunc("/api/bootstrap", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/bootstrap", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
@@ -141,6 +158,46 @@ func Router(deps Deps) *http.ServeMux {
 			rec := map[string]any{"id": id, "name": name, "state": "imported"}
 			_ = deps.DB.Put("clusters", id, rec)
 			_ = deps.DB.Put("credentials", fmt.Sprintf("cl:%s:kubeconfig", id), map[string]any{"value": body.Cluster.Kubeconfig})
+			// Attempt to pre-warm per-cluster clients via registry (if available).
+			// If pre-warm fails, remove persisted records and return an error to the caller.
+			if deps.Registry != nil {
+				// Try to build an instance and do a lightweight connectivity check.
+				inst, err := deps.Registry.Get(r.Context(), id)
+				if err != nil {
+					// cleanup persisted data
+					_ = deps.DB.Delete("clusters", id)
+					_ = deps.DB.Delete("credentials", fmt.Sprintf("cl:%s:kubeconfig", id))
+					httpx.JSONError(w, http.StatusUnprocessableEntity, "cluster connect failed", "cluster_connect", err.Error())
+					return
+				}
+				// perform a quick API connectivity check (server version) with a short timeout
+				checkCtx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+				defer cancel()
+				if inst == nil || inst.K8s == nil || inst.K8s.K == nil {
+					// cleanup persisted data
+					_ = deps.DB.Delete("clusters", id)
+					_ = deps.DB.Delete("credentials", fmt.Sprintf("cl:%s:kubeconfig", id))
+					httpx.JSONError(w, http.StatusUnprocessableEntity, "cluster client initialization failed", "cluster_client", "client not initialized")
+					return
+				}
+				// quick API call to ensure cluster is reachable: list namespaces with limit=1
+				if _, err := inst.K8s.K.CoreV1().Namespaces().List(checkCtx, metav1.ListOptions{Limit: 1}); err != nil {
+					_ = deps.DB.Delete("clusters", id)
+					_ = deps.DB.Delete("credentials", fmt.Sprintf("cl:%s:kubeconfig", id))
+					httpx.JSONError(w, http.StatusUnprocessableEntity, "cluster connect failed", "cluster_connect", err.Error())
+					return
+				}
+				// Attempt to pre-warm RethinkDB (cluster DB) so DB endpoints respond quickly.
+				// Use a short timeout so bootstrap fails fast if the cluster DB is unreachable.
+				rdbCtx, rdbCancel := context.WithTimeout(r.Context(), 10*time.Second)
+				defer rdbCancel()
+				if err := inst.EnsureRDB(rdbCtx, "", "", ""); err != nil {
+					_ = deps.DB.Delete("clusters", id)
+					_ = deps.DB.Delete("credentials", fmt.Sprintf("cl:%s:kubeconfig", id))
+					httpx.JSONError(w, http.StatusUnprocessableEntity, "cluster rdb connect failed", "cluster_rdb", err.Error())
+					return
+				}
+			}
 			// Persist per-cluster settings if provided
 			cs := settings.Cluster{
 				Name:               body.Cluster.Name,
@@ -167,7 +224,7 @@ func Router(deps Deps) *http.ServeMux {
 	})
 
 	// Settings CRUD (tailscale, database)
-	mux.HandleFunc("/api/settings/tailscale", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/settings/tailscale", func(w http.ResponseWriter, r *http.Request) {
 		if deps.DB == nil {
 			httpx.JSON(w, http.StatusServiceUnavailable, map[string]string{"error": "unavailable"})
 			return
@@ -190,7 +247,9 @@ func Router(deps Deps) *http.ServeMux {
 		}
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	})
-	mux.HandleFunc("/api/settings/database", func(w http.ResponseWriter, r *http.Request) {
+
+	// (published-services handling merged into per-cluster handler below)
+	mux.HandleFunc("/settings/database", func(w http.ResponseWriter, r *http.Request) {
 		if deps.DB == nil {
 			httpx.JSON(w, http.StatusServiceUnavailable, map[string]string{"error": "unavailable"})
 			return
@@ -208,10 +267,7 @@ func Router(deps Deps) *http.ServeMux {
 			if deps.OnSettingsChanged != nil {
 				deps.OnSettingsChanged("database")
 			}
-			// Reconnect shared DB manager if present
-			if deps.DBMgr != nil {
-				// no live reconnect here; hostapp will handle reload
-			}
+			// No-op: global DB manager removed in prototype
 			httpx.JSON(w, http.StatusOK, map[string]any{"ok": true})
 			return
 		}
@@ -219,7 +275,7 @@ func Router(deps Deps) *http.ServeMux {
 	})
 
 	// Global settings CRUD
-	mux.HandleFunc("/api/settings/global", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/settings/global", func(w http.ResponseWriter, r *http.Request) {
 		if deps.DB == nil {
 			httpx.JSON(w, http.StatusServiceUnavailable, map[string]string{"error": "unavailable"})
 			return
@@ -254,18 +310,48 @@ func Router(deps Deps) *http.ServeMux {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
+		// Always use per-cluster DB via registry
+		if deps.Registry == nil {
+			httpx.JSONError(w, http.StatusServiceUnavailable, "registry not available", "no_registry")
+			return
+		}
+		inst, err := deps.Registry.Get(r.Context(), id)
+		if err != nil || inst == nil {
+			httpx.JSONError(w, http.StatusNotFound, "cluster not found", "no_cluster")
+			return
+		}
+		sm := settings.Manager{DB: inst.DB}
 		if r.Method == http.MethodGet {
 			var cs settings.Cluster
-			_ = setMgr.GetCluster(id, &cs)
+			_ = sm.GetCluster(id, &cs)
 			_ = json.NewEncoder(w).Encode(cs)
 			return
 		}
 		if r.Method == http.MethodPut {
 			var cs settings.Cluster
 			_ = json.NewDecoder(r.Body).Decode(&cs)
-			_ = setMgr.PutCluster(id, cs)
+			_ = sm.PutCluster(id, cs)
+			// Persist cluster settings and notify runtime hooks
+			_ = sm.PutCluster(id, cs)
 			if deps.OnSettingsChanged != nil {
 				deps.OnSettingsChanged("cluster:" + id)
+			}
+			// Also write a cluster-scoped ConfigMap so in-cluster controllers (operator)
+			// can pick up runtime preferences without access to host localdb.
+			if inst.K8s != nil {
+				cm := map[string]string{"workspace_lb_enabled": fmt.Sprintf("%v", cs.WorkspaceLBEnabled)}
+				ns := "guildnet-system"
+				// Ensure namespace exists
+				_, _ = inst.K8s.K.CoreV1().Namespaces().Get(r.Context(), ns, metav1.GetOptions{})
+				cfg := &corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{Name: "guildnet-cluster-settings", Namespace: ns},
+					Data:       cm,
+				}
+				if _, err := inst.K8s.K.CoreV1().ConfigMaps(ns).Get(r.Context(), "guildnet-cluster-settings", metav1.GetOptions{}); err == nil {
+					_, _ = inst.K8s.K.CoreV1().ConfigMaps(ns).Update(r.Context(), cfg, metav1.UpdateOptions{})
+				} else {
+					_, _ = inst.K8s.K.CoreV1().ConfigMaps(ns).Create(r.Context(), cfg, metav1.CreateOptions{})
+				}
 			}
 			httpx.JSON(w, http.StatusOK, map[string]any{"ok": true})
 			return
@@ -417,33 +503,46 @@ func Router(deps Deps) *http.ServeMux {
 				if !ok {
 					st["code"] = "no_kubeconfig"
 				} else {
-					if cfg, err := kubeconfigFrom(kc); err == nil {
-						// Apply per-cluster overrides before probe
-						var cs settings.Cluster
-						_ = setMgr.GetCluster(id, &cs)
-						if strings.TrimSpace(cs.APIProxyURL) != "" {
-							cfg.Host = strings.TrimSpace(cs.APIProxyURL)
-							if strings.HasPrefix(strings.ToLower(cfg.Host), "http://") {
-								cfg.TLSClientConfig = rest.TLSClientConfig{}
+					// Prefer registry-provided client (tsnet Dial) if available
+					usedRegistry := false
+					if deps.Registry != nil {
+						if inst, err := deps.Registry.Get(r.Context(), id); err == nil && inst != nil && inst.K8s != nil {
+							cfg2 := inst.K8s.Config()
+							if err2 := healthyCluster(cfg2); err2 == nil {
+								st["status"] = "ok"
+								usedRegistry = true
 							}
 						}
-						if cs.APIProxyForceHTTP {
-							if u, err := url.Parse(cfg.Host); err == nil {
-								u.Scheme = "http"
-								cfg.Host = u.String()
+					}
+					if !usedRegistry {
+						if cfg, err := kubeconfigFrom(kc); err == nil {
+							// Apply per-cluster overrides and fallback to local proxy
+							applyClusterAPIProxy(cfg, setMgr, id)
+							if err := healthyCluster(cfg); err == nil {
+								st["status"] = "ok"
+							} else {
+								// Auto-heal: on timeout, try enabling local proxy fallback then retry once
+								if isTimeoutErr(err) && ensureProxyFallbackOnTimeout(setMgr, id) {
+									applyClusterAPIProxy(cfg, setMgr, id)
+									if err2 := healthyCluster(cfg); err2 == nil {
+										st["status"] = "ok"
+										st["note"] = "proxy_fallback_enabled"
+									} else {
+										st["status"] = "error"
+										st["code"] = "cluster_unreachable"
+										st["error"] = err2.Error()
+									}
+								} else {
+									st["status"] = "error"
+									st["code"] = "cluster_unreachable"
+									st["error"] = err.Error()
+								}
 							}
-						}
-						if err := healthyCluster(cfg); err == nil {
-							st["status"] = "ok"
 						} else {
 							st["status"] = "error"
-							st["code"] = "cluster_unreachable"
+							st["code"] = "bad_kubeconfig"
 							st["error"] = err.Error()
 						}
-					} else {
-						st["status"] = "error"
-						st["code"] = "bad_kubeconfig"
-						st["error"] = err.Error()
 					}
 				}
 				arrCL = append(arrCL, st)
@@ -736,46 +835,126 @@ func Router(deps Deps) *http.ServeMux {
 				_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 				return
 			}
+
+			if action == "join-config" {
+				// Build a join config JSON similar to scripts/generate_join_config.sh output.
+				out := map[string]any{}
+				out["version"] = 2
+				out["created_at"] = time.Now().UTC().Format(time.RFC3339)
+				out["creator"] = map[string]any{"host": r.Host, "user": ""}
+
+				// Hostapp/ui base URL: prefer X-Forwarded-Proto/Host if present, otherwise infer from request
+				scheme := "http"
+				if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+					scheme = "https"
+				}
+				host := r.Host
+				if host == "" {
+					host = "127.0.0.1:8090"
+				}
+				ui := map[string]any{"vite_api_base": fmt.Sprintf("%s://%s", scheme, host)}
+				out["ui"] = ui
+				out["hostapp"] = map[string]any{"url": fmt.Sprintf("%s://%s", scheme, host)}
+
+				// Include CAPem if available from repo certs/server.crt
+				if data, err := os.ReadFile("certs/server.crt"); err == nil {
+					out["ui"].(map[string]any)["ca_pem"] = string(data)
+					out["hostapp"].(map[string]any)["ca_pem"] = string(data)
+				}
+
+				// Cluster section
+				clusterRec := map[string]any{"name": "", "kubeconfig": "", "notes": ""}
+				if kc, ok := readClusterKubeconfig(deps.DB, deps.Secrets, id); ok {
+					clusterRec["kubeconfig"] = kc
+				}
+				// include per-cluster settings
+				var cs settings.Cluster
+				_ = setMgr.GetCluster(id, &cs)
+				if cs.Name != "" {
+					clusterRec["name"] = cs.Name
+				}
+				if cs.Namespace != "" {
+					clusterRec["namespace"] = cs.Namespace
+				}
+				if cs.APIProxyURL != "" {
+					clusterRec["api_proxy_url"] = cs.APIProxyURL
+				}
+				if cs.APIProxyForceHTTP {
+					clusterRec["api_proxy_force_http"] = true
+				}
+				if cs.DisableAPIProxy {
+					clusterRec["disable_api_proxy"] = true
+				}
+				if cs.PreferPodProxy {
+					clusterRec["prefer_pod_proxy"] = true
+				}
+				if cs.UsePortForward {
+					clusterRec["use_port_forward"] = true
+				}
+				if cs.IngressDomain != "" {
+					clusterRec["ingress_domain"] = cs.IngressDomain
+				}
+				if cs.IngressClassName != "" {
+					clusterRec["ingress_class_name"] = cs.IngressClassName
+				}
+				if cs.WorkspaceTLSSecret != "" {
+					clusterRec["workspace_tls_secret"] = cs.WorkspaceTLSSecret
+				}
+				if cs.CertManagerIssuer != "" {
+					clusterRec["cert_manager_issuer"] = cs.CertManagerIssuer
+				}
+				out["cluster"] = clusterRec
+
+				// Tailscale hints
+				var ts settings.Tailscale
+				_ = setMgr.GetTailscale(&ts)
+				tails := map[string]any{"login_server": ts.LoginServer, "preauth_key": ts.PreauthKey, "hostname": ts.Hostname}
+				// If per-cluster TS client auth key stored in credentials, include it
+				if deps.DB != nil {
+					var cred map[string]any
+					if deps.DB.Get("credentials", fmt.Sprintf("cl:%s:ts_client_auth", id), &cred) == nil {
+						if v, ok := cred["value"].(string); ok && strings.TrimSpace(v) != "" {
+							tails["preauth_key"] = v
+						}
+					}
+				}
+				out["tailscale"] = tails
+
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(out)
+				return
+			}
 			if action == "health" {
+				// Check and report reachability of this cluster
 				kc, ok := readClusterKubeconfig(deps.DB, deps.Secrets, id)
 				if !ok {
-					// No kubeconfig available
-					// Log for server diagnostics
-					log.Printf("cluster %s health: no kubeconfig", id)
 					_ = json.NewEncoder(w).Encode(map[string]any{"status": "unknown", "code": "no_kubeconfig"})
 					return
 				}
 				cfg, err := kubeconfigFrom(kc)
 				if err != nil {
-					// Kubeconfig present but invalid YAML/parse error
-					log.Printf("cluster %s health: bad kubeconfig: %v", id, err)
-					_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "code": "bad_kubeconfig", "error": err.Error()})
+					_ = json.NewEncoder(w).Encode(map[string]any{"status": "unknown", "code": "bad_kubeconfig", "error": err.Error()})
 					return
 				}
-				// Apply per-cluster overrides (proxy URL, force http)
-				var cs settings.Cluster
-				_ = setMgr.GetCluster(id, &cs)
-				if strings.TrimSpace(cs.APIProxyURL) != "" {
-					cfg.Host = strings.TrimSpace(cs.APIProxyURL)
-					if strings.HasPrefix(strings.ToLower(cfg.Host), "http://") {
-						cfg.TLSClientConfig = rest.TLSClientConfig{}
-					}
-				}
-				if cs.APIProxyForceHTTP {
-					if u, err := url.Parse(cfg.Host); err == nil {
-						u.Scheme = "http"
-						cfg.Host = u.String()
-					}
-				}
+				// Apply per-cluster overrides and fallback to local proxy
+				applyClusterAPIProxy(cfg, setMgr, id)
 				if err := healthyCluster(cfg); err == nil {
 					_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
 					return
-				} else {
-					// Cluster reachable check failed; include reason and log
-					log.Printf("cluster %s health: unreachable: %v", id, err)
-					_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "code": "cluster_unreachable", "error": err.Error()})
-					return
 				}
+				// Auto-heal: on timeout, try enabling local proxy fallback then retry once
+				if ensureProxyFallbackOnTimeout(setMgr, id) {
+					applyClusterAPIProxy(cfg, setMgr, id)
+					if err2 := healthyCluster(cfg); err2 == nil {
+						_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "note": "proxy_fallback_enabled"})
+						return
+					} else {
+						_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "code": "cluster_unreachable", "error": err2.Error()})
+						return
+					}
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "code": "cluster_unreachable"})
+				return
 			}
 			if action == "kubeconfig" {
 				kc, ok := readClusterKubeconfig(deps.DB, deps.Secrets, id)
@@ -798,7 +977,7 @@ func Router(deps Deps) *http.ServeMux {
 	})
 
 	// UI config for runtime overrides
-	mux.HandleFunc("/api/ui-config", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/ui-config", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
@@ -815,44 +994,168 @@ func Router(deps Deps) *http.ServeMux {
 			return
 		}
 		clusterID := parts[0]
-		// build clients for this cluster from stored kubeconfig
-		kc, ok := readClusterKubeconfig(deps.DB, deps.Secrets, clusterID)
-		if !ok || strings.TrimSpace(kc) == "" {
-			httpx.JSONError(w, http.StatusNotFound, "cluster kubeconfig not found", "no_kubeconfig")
+		// Special-case: published-services endpoints
+		if len(parts) >= 2 && parts[1] == "published-services" {
+			// GET /api/cluster/{id}/published-services
+			if r.Method == http.MethodGet && len(parts) == 2 {
+				var list []localdb.PublishedService
+				if deps.DB != nil {
+					if err := deps.DB.ListPublished(&list); err != nil {
+						log.Printf("api: list published services db error: %v", err)
+						httpx.JSONError(w, http.StatusInternalServerError, "db_error", "list_published", err.Error())
+						return
+					}
+				}
+				out := []localdb.PublishedService{}
+				for _, p := range list {
+					if p.ClusterID == clusterID {
+						out = append(out, p)
+					}
+				}
+				_ = json.NewEncoder(w).Encode(out)
+				return
+			}
+			// DELETE /api/cluster/{id}/published-services/{service}
+			if r.Method == http.MethodDelete && len(parts) >= 3 {
+				service := parts[2]
+				key := clusterID + ":" + service
+				publishedMapMu.Lock()
+				pl, ok := publishedMap[key]
+				if ok && pl != nil {
+					_ = pl.ln.Close()
+					publishedMapMu.Unlock()
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				publishedMapMu.Unlock()
+				if deps.DB != nil {
+					if err := deps.DB.DeletePublished(key); err != nil {
+						log.Printf("api: delete published db error key=%s err=%v", key, err)
+						httpx.JSONError(w, http.StatusInternalServerError, "db_error", "delete_published", err.Error())
+						return
+					}
+				}
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		cfg, err := kubeconfigFrom(kc)
-		if err != nil {
-			httpx.JSONError(w, http.StatusBadRequest, "invalid kubeconfig", "bad_kubeconfig", err.Error())
+		// Quick status endpoint for UI: /api/cluster/{id}/status
+		if len(parts) >= 2 && parts[1] == "status" && r.Method == http.MethodGet {
+			st, err := clusterLocalStatus(r.Context(), deps, clusterID)
+			if err != nil {
+				httpx.JSONError(w, http.StatusInternalServerError, "status error", "status_error", err.Error())
+				return
+			}
+			httpx.JSON(w, http.StatusOK, st)
 			return
 		}
-		// Apply cluster-scoped overrides
-		var cs settings.Cluster
-		_ = setMgr.GetCluster(clusterID, &cs)
-		if strings.TrimSpace(cs.APIProxyURL) != "" {
-			cfg.Host = strings.TrimSpace(cs.APIProxyURL)
-			if strings.HasPrefix(strings.ToLower(cfg.Host), "http://") {
-				cfg.TLSClientConfig = rest.TLSClientConfig{}
+		// Optionally resolve via per-cluster registry
+		var (
+			cfg         *rest.Config
+			cli         *kubernetes.Clientset
+			dyn         dynamic.Interface
+			cs          settings.Cluster
+			setMgrLocal settings.Manager
+			regInst     *cluster.Instance
+		)
+		setMgrLocal = setMgr
+		if deps.Registry != nil {
+			if inst, err := deps.Registry.Get(r.Context(), clusterID); err == nil && inst != nil {
+				// capture registry instance for possible port-forward / ts publish
+				regInst = inst
+				// Use per-cluster DB for settings
+				setMgrLocal = settings.Manager{DB: inst.DB}
+				// Build clients from instance
+				if inst.K8s != nil {
+					cfg = inst.K8s.Config()
+				}
+				// Apply proxy overrides
+				applyClusterAPIProxy(cfg, setMgrLocal, clusterID)
+				// Clients
+				var e error
+				// Reuse cached client if present
+				if inst.K8s != nil && inst.K8s.K != nil {
+					cli = inst.K8s.K
+				} else {
+					cli, e = kubernetes.NewForConfig(cfg)
+				}
+				if e != nil {
+					httpx.JSONError(w, http.StatusInternalServerError, "k8s client error", "k8s_client", e.Error())
+					return
+				}
+				// Reuse cached dynamic client if available
+				if inst.Dyn != nil {
+					dyn = inst.Dyn
+				} else {
+					dyn, e = dynamic.NewForConfig(cfg)
+				}
+				if e != nil {
+					httpx.JSONError(w, http.StatusInternalServerError, "dynamic client error", "dyn_client", e.Error())
+					return
+				}
 			}
 		}
-		if cs.APIProxyForceHTTP {
-			// force http scheme when host is loopback or override explicitly requested
-			if u, err := url.Parse(cfg.Host); err == nil {
-				u.Scheme = "http"
-				cfg.Host = u.String()
+		// If registry didn't provide clients, attempt a best-effort fallback by
+		// reading the kubeconfig from the main DB and building clients directly.
+		if cli == nil || dyn == nil {
+			log.Printf("cluster: clients not provided by registry for id=%s; attempting fallback", clusterID)
+			// Try main DB kubeconfig (legacy path)
+			if deps.DB != nil {
+				if kc, ok := readClusterKubeconfig(deps.DB, deps.Secrets, clusterID); ok {
+					log.Printf("cluster: found kubeconfig in main DB for id=%s; trying to build clients", clusterID)
+					if cfg2, err := kubeconfigFrom(kc); err == nil && cfg2 != nil {
+						// apply any per-cluster API proxy overrides (uses main DB for settings)
+						applyClusterAPIProxy(cfg2, setMgrLocal, clusterID)
+						if c, e := kubernetes.NewForConfig(cfg2); e == nil {
+							cli = c
+							log.Printf("cluster: built kubernetes client from main kubeconfig for id=%s", clusterID)
+						}
+						if d, e := dynamic.NewForConfig(cfg2); e == nil {
+							dyn = d
+							log.Printf("cluster: built dynamic client from main kubeconfig for id=%s", clusterID)
+						}
+						// If initial health check times out, try enabling local kube-proxy fallback
+						// and rebuild clients once.
+						if cli == nil || dyn == nil {
+							// attempt to detect a timeout on the initial client creation/health
+							// and enable proxy fallback once to recover.
+							if isLocalKubeProxyAvailable() {
+								if ensureProxyFallbackOnTimeout(setMgrLocal, clusterID) {
+									// Re-apply proxy settings and try to rebuild clients using local proxy
+									applyClusterAPIProxy(cfg2, setMgrLocal, clusterID)
+									if c2, e2 := kubernetes.NewForConfig(cfg2); e2 == nil {
+										cli = c2
+										log.Printf("cluster: rebuilt kubernetes client after enabling proxy fallback for id=%s", clusterID)
+									}
+									if d2, e2 := dynamic.NewForConfig(cfg2); e2 == nil {
+										dyn = d2
+										log.Printf("cluster: rebuilt dynamic client after enabling proxy fallback for id=%s", clusterID)
+									}
+								}
+							}
+						}
+					}
+				}
 			}
 		}
-		// Build clients
-		cli, err := kubernetes.NewForConfig(cfg)
-		if err != nil {
-			httpx.JSONError(w, http.StatusInternalServerError, "k8s client error", "k8s_client", err.Error())
+		// If we still don't have clients, be tolerant for read-only endpoints
+		// but for mutating operations (workspace create) return an explicit
+		// error so callers know to attach a kubeconfig or wait.
+		if cli == nil || dyn == nil {
+			// For GET/list/servers endpoints we return an empty list (keeps UI usable).
+			if r.Method == http.MethodGet {
+				httpx.JSON(w, http.StatusOK, []any{})
+				return
+			}
+			// For mutating requests return 503 with a helpful message
+			httpx.JSONError(w, http.StatusServiceUnavailable, "kubernetes clients not available for cluster; attach kubeconfig or wait for cluster initialization", "no_k8s_clients", "kube clients not available for cluster id")
+			log.Printf("cluster: mutating request but kube clients missing for id=%s", clusterID)
 			return
 		}
-		dyn, err := dynamic.NewForConfig(cfg)
-		if err != nil {
-			httpx.JSONError(w, http.StatusInternalServerError, "dynamic client error", "dyn_client", err.Error())
-			return
-		}
+		// Fetch per-cluster settings to derive default namespace using (possibly) per-cluster DB
+		_ = setMgrLocal.GetCluster(clusterID, &cs)
 		defaultNS := strings.TrimSpace(cs.Namespace)
 		if defaultNS == "" {
 			defaultNS = "default"
@@ -878,6 +1181,14 @@ func Router(deps Deps) *http.ServeMux {
 			if port == 0 {
 				port = 80
 			}
+			// Check endpoints to decide whether to prefer port-forward fallback
+			preferPF := cs.PreferPodProxy || cs.UsePortForward
+			endpointsMissing := false
+			if !preferPF {
+				if eps, err := cli.CoreV1().Endpoints(defaultNS).Get(r.Context(), name, metav1.GetOptions{}); err != nil || eps == nil || len(eps.Subsets) == 0 {
+					endpointsMissing = true
+				}
+			}
 			// Build API transport to kube-apiserver
 			rt, err := rest.TransportFor(cfg)
 			if err != nil {
@@ -885,8 +1196,174 @@ func Router(deps Deps) *http.ServeMux {
 				return
 			}
 			apihost, _ := url.Parse(cfg.Host)
+			// If endpoints are missing or cluster prefers pod proxy, try to port-forward and publish via tsnet
+			if (preferPF || endpointsMissing) && regInst != nil && regInst.PF != nil {
+				// If the kube API host is not reachable directly, but we have a tsnet connector,
+				// use a tsnet-backed transport so port-forward and pod listing work even when
+				// cfg.Host points at localhost or a non-routable address.
+				if cfg != nil && regInst.TS != nil {
+					// quick probe
+					host := strings.TrimPrefix(cfg.Host, "https://")
+					host = strings.TrimPrefix(host, "http://")
+					// strip path
+					if idx := strings.Index(host, "/"); idx >= 0 {
+						host = host[:idx]
+					}
+					dialer := func() error {
+						d := net.Dialer{Timeout: 1500 * time.Millisecond}
+						conn, err := d.DialContext(r.Context(), "tcp", host)
+						if err != nil {
+							return err
+						}
+						_ = conn.Close()
+						return nil
+					}
+					if err := dialer(); err != nil {
+						log.Printf("cluster: kube api host %s unreachable directly; using tsnet transport for cluster=%s", host, clusterID)
+						// create an http.Transport via tsnet connector for downstream use; replace rt if possible
+						if rt != nil {
+							if ht, ok := rt.(*http.Transport); ok {
+								// wrap transport with tsnet dial
+								tt := regInst.TS.HTTPTransport(ht)
+								rt = tt
+							} else {
+								// create a minimal transport
+								tt := regInst.TS.HTTPTransport(nil)
+								rt = tt
+							}
+						}
+					}
+				}
+				// Build a label selector from the Service's spec.selector if present
+				selector := ""
+				if svc, err := cli.CoreV1().Services(defaultNS).Get(r.Context(), name, metav1.GetOptions{}); err == nil {
+					if len(svc.Spec.Selector) > 0 {
+						// Build a comma-separated label selector
+						parts := []string{}
+						for k, v := range svc.Spec.Selector {
+							parts = append(parts, fmt.Sprintf("%s=%s", k, v))
+						}
+						selector = strings.Join(parts, ",")
+					}
+				}
+				if selector == "" {
+					// Fallback heuristic: try app=<serviceName>
+					selector = fmt.Sprintf("app=%s", name)
+				}
+				log.Printf("cluster: trying port-forward fallback cluster=%s service=%s selector=%s", clusterID, name, selector)
+				pods, err := cli.CoreV1().Pods(defaultNS).List(r.Context(), metav1.ListOptions{LabelSelector: selector})
+				if err == nil && len(pods.Items) > 0 {
+					// Prefer ready pods if possible
+					podName := pods.Items[0].Name
+					for _, p := range pods.Items {
+						for _, cs := range p.Status.ContainerStatuses {
+							if cs.Ready {
+								podName = p.Name
+								break
+							}
+						}
+					}
+					log.Printf("cluster: selected pod %s for service %s (cluster=%s)", podName, name, clusterID)
+					lp, err := regInst.PF.Ensure(r.Context(), defaultNS, podName, port)
+					if err == nil && lp > 0 {
+						log.Printf("cluster: started port-forward cluster=%s pod=%s localPort=%d", clusterID, podName, lp)
+						// If tsnet connector available, publish the local port so tailnet nodes can reach it
+						if regInst.TS != nil {
+							key := clusterID + ":" + name
+							publishedMapMu.Lock()
+							pl, exists := publishedMap[key]
+							if exists && pl != nil {
+								// already published; reuse
+								log.Printf("cluster: reuse existing published listener for cluster=%s service=%s", clusterID, name)
+							} else {
+								ln, lerr := regInst.TS.Listen("tcp", fmt.Sprintf(":%d", lp))
+								if lerr != nil {
+									publishedMapMu.Unlock()
+									log.Printf("cluster: ts publish listen failed cluster=%s port=%d err=%v", clusterID, lp, lerr)
+								} else {
+									pl = &publishedListener{clusterID: clusterID, service: name, addr: ln.Addr().String(), ln: ln, addedAt: time.Now()}
+									publishedMap[key] = pl
+									// persist mapping
+									if deps.DB != nil {
+										ps := localdb.PublishedService{ClusterID: clusterID, Service: name, Addr: pl.addr, AddedAt: pl.addedAt}
+										if err := deps.DB.SavePublished(key, ps); err != nil {
+											log.Printf("cluster: failed to persist published mapping key=%s err=%v", key, err)
+										}
+									}
+									publishedMapMu.Unlock()
+									log.Printf("cluster: published port %d via tsnet for cluster=%s service=%s addr=%s", lp, clusterID, name, pl.addr)
+									// accept loop
+									go func(pl *publishedListener, lp int) {
+										defer func() {
+											pl.ln.Close()
+											publishedMapMu.Lock()
+											delete(publishedMap, key)
+											publishedMapMu.Unlock()
+											// remove persisted mapping
+											if deps.DB != nil {
+												if err := deps.DB.DeletePublished(key); err != nil {
+													log.Printf("cluster: failed to delete persisted published mapping key=%s err=%v", key, err)
+												}
+											}
+											log.Printf("cluster: published listener closed cluster=%s service=%s", clusterID, name)
+										}()
+										for {
+											conn, err := pl.ln.Accept()
+											if err != nil {
+												log.Printf("cluster: tsnet accept error cluster=%s err=%v", clusterID, err)
+												return
+											}
+											// Proxy accepted tsnet connection to local loopback port
+											go func(c net.Conn, lp int) {
+												defer c.Close()
+												dst, dErr := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", lp))
+												if dErr != nil {
+													log.Printf("cluster: ts proxy dial failed lp=%d err=%v", lp, dErr)
+													return
+												}
+												defer dst.Close()
+												// bidirectional copy
+												go func() { _, _ = io.Copy(dst, c); _ = dst.Close() }()
+												_, _ = io.Copy(c, dst)
+											}(conn, lp)
+										}
+									}(pl, lp)
+								}
+							}
+							if exists {
+								publishedMapMu.Unlock()
+							}
+						}
+						// Rewrite target to local loopback address and skip API proxy
+						r2 := r.Clone(r.Context())
+						r2.URL = new(url.URL)
+						*r2.URL = *r.URL
+						r2.URL.Path = "/"
+						// Use direct local target
+						p2 := proxy.NewReverseProxy(proxy.Options{
+							Timeout: 60 * time.Second,
+							Dial: func(ctx context.Context, network, address string) (any, error) {
+								// Connect to local loopback
+								return net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", lp))
+							},
+						})
+						// Ensure forwarded prefix header remains so iframe rewriting works
+						if r2.Header == nil {
+							r2.Header = make(http.Header)
+						}
+						r2.Header.Set("X-Forwarded-Prefix", "/api/cluster/"+clusterID+"/proxy/server/"+name)
+						p2.ServeHTTP(w, r2)
+						return
+					}
+				} else {
+					log.Printf("cluster: no pods found for selector=%s service=%s cluster=%s err=%v", selector, name, clusterID, err)
+				}
+			}
+
 			rp := proxy.NewReverseProxy(proxy.Options{
 				Timeout: 60 * time.Second,
+				// Enable logging for cluster-scoped proxy so we can capture upstream headers and transport errors
+				Logger: httpx.Logger(),
 				ResolveServer: func(ctx context.Context, serverID string, subPath string) (string, string, string, error) {
 					// Explicitly include http: scheme segment for kube API service proxy
 					p := "/api/v1/namespaces/" + defaultNS + "/services/http:" + name + ":" + fmt.Sprintf("%d", port) + "/proxy" + subPath
@@ -1004,7 +1481,15 @@ func Router(deps Deps) *http.ServeMux {
 				var spec map[string]any
 				_ = json.NewDecoder(r.Body).Decode(&spec)
 				// expect { image, name?, env?, ports?, args?, resources?, labels? }
-				name := strings.TrimSpace(fmt.Sprint(spec["name"]))
+				// Avoid fmt.Sprint on nil which prints "<nil>"; only use string when present.
+				var name string
+				if v, ok := spec["name"]; ok && v != nil {
+					if s, ok := v.(string); ok {
+						name = strings.TrimSpace(s)
+					} else {
+						name = strings.TrimSpace(fmt.Sprint(v))
+					}
+				}
 				if name == "" {
 					name = fmt.Sprintf("ws-%s", uuid.NewString()[:8])
 				}
@@ -1022,7 +1507,16 @@ func Router(deps Deps) *http.ServeMux {
 					},
 				}
 				if _, err := dyn.Resource(gvr).Namespace(defaultNS).Create(r.Context(), &unstructured.Unstructured{Object: obj}, metav1.CreateOptions{}); err != nil {
-					httpx.JSONError(w, http.StatusInternalServerError, "workspace create failed", "create_failed", err.Error())
+					// If this is a Kubernetes StatusError (validation, etc), surface its structured
+					// details to the client so the UI can display helpful messages.
+					var details any = err.Error()
+					if se, ok := err.(*apierrors.StatusError); ok {
+						// Use the Status object if available; include message, reason and details.
+						s := se.ErrStatus
+						// Attempt to include the most useful fields.
+						details = map[string]any{"message": s.Message, "reason": string(s.Reason), "details": s.Details}
+					}
+					httpx.JSONError(w, http.StatusInternalServerError, "workspace create failed", "create_failed", details)
 					return
 				}
 				httpx.JSON(w, http.StatusAccepted, map[string]any{"id": name, "status": "pending"})
@@ -1070,6 +1564,39 @@ func Router(deps Deps) *http.ServeMux {
 					out = out[len(out)-limit:]
 				}
 				httpx.JSON(w, http.StatusOK, out)
+				return
+			}
+
+			// Health endpoint: /api/cluster/{id}/health
+			if len(parts) == 2 && parts[1] == "health" {
+				if r.Method != http.MethodGet {
+					w.WriteHeader(http.StatusMethodNotAllowed)
+					return
+				}
+				status := map[string]any{"k8s": map[string]any{"ok": false}, "rdb": map[string]any{"ok": false}}
+				// k8s connectivity
+				ctxc, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+				defer cancel()
+				if _, err := cli.CoreV1().Namespaces().List(ctxc, metav1.ListOptions{Limit: 1}); err == nil {
+					status["k8s"] = map[string]any{"ok": true}
+				} else {
+					status["k8s"] = map[string]any{"ok": false, "error": err.Error()}
+				}
+				// RethinkDB connectivity (if instance present and RDB initialized)
+				if deps.Registry != nil {
+					if present, err := deps.Registry.RDBPresent(clusterID); err == nil {
+						if present {
+							status["rdb"] = map[string]any{"ok": true}
+						} else {
+							status["rdb"] = map[string]any{"ok": false, "error": "rdb not initialized"}
+						}
+					} else {
+						status["rdb"] = map[string]any{"ok": false, "error": err.Error()}
+					}
+				} else {
+					status["rdb"] = map[string]any{"ok": false, "error": "no registry"}
+				}
+				httpx.JSON(w, http.StatusOK, status)
 				return
 			}
 			if len(parts) == 5 && parts[3] == "logs" && parts[4] == "stream" && r.Method == http.MethodGet {
@@ -1146,10 +1673,17 @@ func Router(deps Deps) *http.ServeMux {
 		// Per-cluster Databases API routes: delegate to httpx.DBAPI with OrgID=clusterID
 		if len(parts) >= 2 && parts[1] == "db" {
 			api := &httpx.DBAPI{Manager: func() httpx.DBManager {
-				if deps.DBMgr != nil {
-					return deps.DBMgr
+				// Prefer an already-initialized per-cluster RDB manager. Avoid
+				// attempting EnsureRDB during request handling because it can
+				// block with retries and produce noisy logs. Pre-warming should
+				// be done at bootstrap; handlers will return nil if RDB isn't ready.
+				if deps.Registry != nil {
+					if present, err := deps.Registry.RDBPresent(clusterID); err == nil && present {
+						if inst, err := deps.Registry.Get(r.Context(), clusterID); err == nil && inst != nil {
+							return inst.RDB
+						}
+					}
 				}
-				// nil -> lazy connect inside handler
 				return nil
 			}(), OrgID: clusterID, RBAC: httpx.NewRBACStore()}
 			mux2 := http.NewServeMux()
@@ -1180,8 +1714,14 @@ func Router(deps Deps) *http.ServeMux {
 		clusterID := parts[0]
 		if len(parts) >= 2 && parts[1] == "db" {
 			api := &httpx.DBAPI{Manager: func() httpx.DBManager {
-				if deps.DBMgr != nil {
-					return deps.DBMgr
+				// Use only an already-initialized RDB manager; do not attempt
+				// to Initialize here to avoid request-time retries.
+				if deps.Registry != nil {
+					if present, err := deps.Registry.RDBPresent(clusterID); err == nil && present {
+						if inst, err := deps.Registry.Get(r.Context(), clusterID); err == nil && inst != nil {
+							return inst.RDB
+						}
+					}
 				}
 				return nil
 			}(), OrgID: clusterID, RBAC: httpx.NewRBACStore()}
@@ -1201,22 +1741,128 @@ func Router(deps Deps) *http.ServeMux {
 	return mux
 }
 
+// RestorePublishedMappings reads persisted published services from host DB and
+// attempts to recreate tsnet listeners for them. This should be invoked after
+// the Registry and Router are initialized (for example, during hostapp startup).
+func RestorePublishedMappings(ctx context.Context, deps Deps) error {
+	if deps.DB == nil || deps.Registry == nil {
+		return nil
+	}
+	var list []localdb.PublishedService
+	if err := deps.DB.ListPublished(&list); err != nil {
+		return err
+	}
+	for _, p := range list {
+		// Attempt to ensure an instance exists for this cluster
+		inst, err := deps.Registry.Get(ctx, p.ClusterID)
+		if err != nil || inst == nil {
+			log.Printf("api: restore published: cannot get instance for cluster=%s err=%v", p.ClusterID, err)
+			continue
+		}
+		if inst.TS == nil {
+			log.Printf("api: restore published: ts connector missing for cluster=%s service=%s", p.ClusterID, p.Service)
+			continue
+		}
+		key := p.ClusterID + ":" + p.Service
+		publishedMapMu.Lock()
+		if _, ok := publishedMap[key]; ok {
+			publishedMapMu.Unlock()
+			continue
+		}
+		publishedMapMu.Unlock()
+
+		// Try to listen using stored addr; if that fails, try to extract port and bind to :port
+		ln, lerr := inst.TS.Listen("tcp", p.Addr)
+		if lerr != nil {
+			// attempt to parse port
+			_, portStr, perr := net.SplitHostPort(p.Addr)
+			if perr == nil {
+				ln, lerr = inst.TS.Listen("tcp", fmt.Sprintf(":%s", portStr))
+			}
+		}
+		if lerr != nil {
+			log.Printf("api: restore published: listen failed cluster=%s service=%s addr=%s err=%v", p.ClusterID, p.Service, p.Addr, lerr)
+			continue
+		}
+		pl := &publishedListener{clusterID: p.ClusterID, service: p.Service, addr: ln.Addr().String(), ln: ln, addedAt: p.AddedAt}
+		publishedMapMu.Lock()
+		publishedMap[key] = pl
+		publishedMapMu.Unlock()
+		log.Printf("api: restored published listener cluster=%s service=%s addr=%s", p.ClusterID, p.Service, pl.addr)
+
+		// Start accept-loop similar to the on-demand path
+		go func(pl *publishedListener, key string) {
+			defer func() {
+				pl.ln.Close()
+				publishedMapMu.Lock()
+				delete(publishedMap, key)
+				publishedMapMu.Unlock()
+				if deps.DB != nil {
+					if err := deps.DB.DeletePublished(key); err != nil {
+						log.Printf("api: restore published: failed delete persisted key=%s err=%v", key, err)
+					}
+				}
+				log.Printf("api: restored published listener closed cluster=%s service=%s", pl.clusterID, pl.service)
+			}()
+			for {
+				conn, err := pl.ln.Accept()
+				if err != nil {
+					log.Printf("api: restore published accept error cluster=%s err=%v", pl.clusterID, err)
+					return
+				}
+				go func(c net.Conn, lpAddr string) {
+					defer c.Close()
+					// Dial local loopback port by using original address's port
+					_, portStr, _ := net.SplitHostPort(lpAddr)
+					dst, dErr := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%s", portStr))
+					if dErr != nil {
+						log.Printf("api: restore published proxy dial failed addr=%s err=%v", lpAddr, dErr)
+						return
+					}
+					defer dst.Close()
+					go func() { _, _ = io.Copy(dst, c); _ = dst.Close() }()
+					_, _ = io.Copy(c, dst)
+				}(conn, pl.addr)
+			}
+		}(pl, key)
+	}
+	return nil
+}
+
 func kubeconfigFrom(kc string) (*rest.Config, error) {
 	return clientcmd.RESTConfigFromKubeConfig([]byte(kc))
 }
 
 func healthyCluster(cfg *rest.Config) error {
 	cfg.Timeout = 3 * time.Second
+	// Try a lightweight HTTP GET to /version using the kube transport so we can
+	// enforce a client-side timeout reliably.
+	tr, err := rest.TransportFor(cfg)
+	if err == nil {
+		httpClient := &http.Client{Transport: tr, Timeout: 3 * time.Second}
+		// Build version URL from cfg.Host (may include scheme)
+		host := cfg.Host
+		if !strings.HasPrefix(host, "http://") && !strings.HasPrefix(host, "https://") {
+			host = "https://" + strings.TrimPrefix(host, "//")
+		}
+		verURL := strings.TrimRight(host, "/") + "/version"
+		req, _ := http.NewRequestWithContext(context.Background(), "GET", verURL, nil)
+		if resp, err := httpClient.Do(req); err == nil {
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				_ = resp.Body.Close()
+				return nil
+			}
+			_ = resp.Body.Close()
+		}
+	}
+	// Fallback: try list namespaces with a short context timeout using client-go
 	cli, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		return err
 	}
-	_, err = cli.ServerVersion()
-	if err == nil {
-		return nil
-	}
-	// fallback quick list namespaces
-	_, err = cli.CoreV1().Namespaces().List(context.Background(), metav1.ListOptions{Limit: 1})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, err = cli.CoreV1().Namespaces().List(ctx, metav1.ListOptions{Limit: 1})
 	return err
 }
 
@@ -1278,4 +1924,106 @@ func headscaleHealth(endpoint string) (string, error) {
 		return "ok", nil
 	}
 	return "error", err
+}
+
+// isLocalKubeProxyAvailable returns true if a kubectl proxy is listening on 127.0.0.1:8001.
+func isLocalKubeProxyAvailable() bool {
+	addr := "127.0.0.1:8001"
+	if v := strings.TrimSpace(os.Getenv("KUBE_PROXY_ADDR")); v != "" {
+		// Accept either host:port or URL. If URL, extract host:port
+		if strings.HasPrefix(v, "http://") || strings.HasPrefix(v, "https://") {
+			if u, err := url.Parse(v); err == nil {
+				addr = u.Host
+			} else {
+				addr = v
+			}
+		} else {
+			addr = v
+		}
+	}
+	c, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+	if err == nil {
+		_ = c.Close()
+		return true
+	}
+	return false
+}
+
+// isTimeoutErr returns true if err looks like a client timeout/connection timeout to the API server.
+func isTimeoutErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	// net.Error with Timeout()
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "client.timeout exceeded") || strings.Contains(msg, "context deadline exceeded") || strings.Contains(msg, "i/o timeout") {
+		return true
+	}
+	return false
+}
+
+// ensureProxyFallbackOnTimeout will enable per-cluster local proxy fallback when a timeout is detected.
+// Returns true if it modified settings.
+func ensureProxyFallbackOnTimeout(setMgr settings.Manager, clusterID string) bool {
+	// Do not auto-enable local kubectl proxy fallback by default.
+	// Only enable when an explicit env override `KUBE_PROXY_ADDR` is set to a host:port or URL.
+	if strings.TrimSpace(os.Getenv("KUBE_PROXY_ADDR")) == "" {
+		return false
+	}
+	var cs settings.Cluster
+	_ = setMgr.GetCluster(clusterID, &cs)
+	if cs.DisableAPIProxy {
+		return false
+	}
+	host := strings.TrimSpace(cs.APIProxyURL)
+	if host == "" {
+		if v := strings.TrimSpace(os.Getenv("KUBE_PROXY_ADDR")); v != "" {
+			// If env var is host:port, prefix with http:// for APIProxyURL
+			if strings.HasPrefix(v, "http://") || strings.HasPrefix(v, "https://") {
+				cs.APIProxyURL = v
+			} else {
+				cs.APIProxyURL = "http://" + v
+			}
+		}
+		if !cs.APIProxyForceHTTP {
+			cs.APIProxyForceHTTP = true
+		}
+		_ = setMgr.PutCluster(clusterID, cs)
+		return true
+	}
+	return false
+}
+
+// applyClusterAPIProxy applies per-cluster proxy overrides and a local proxy fallback.
+// If DisableAPIProxy is false and no explicit APIProxyURL is configured, a local
+// kubectl proxy at http://127.0.0.1:8001 will be used when available.
+func applyClusterAPIProxy(cfg *rest.Config, setMgr settings.Manager, clusterID string) {
+	var cs settings.Cluster
+	_ = setMgr.GetCluster(clusterID, &cs)
+	host := strings.TrimSpace(cs.APIProxyURL)
+	// Only apply APIProxyURL if explicitly configured for this cluster or via KUBE_PROXY_ADDR env.
+	if host == "" && !cs.DisableAPIProxy {
+		if v := strings.TrimSpace(os.Getenv("KUBE_PROXY_ADDR")); v != "" {
+			if strings.HasPrefix(v, "http://") || strings.HasPrefix(v, "https://") {
+				host = v
+			} else {
+				host = "http://" + v
+			}
+		}
+	}
+	if host != "" {
+		cfg.Host = host
+		if strings.HasPrefix(strings.ToLower(host), "http://") {
+			cfg.TLSClientConfig = rest.TLSClientConfig{}
+		}
+	}
+	if cs.APIProxyForceHTTP {
+		if u, err := url.Parse(cfg.Host); err == nil {
+			u.Scheme = "http"
+			cfg.Host = u.String()
+		}
+	}
 }

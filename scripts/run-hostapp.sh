@@ -1,60 +1,145 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Load env file if present
-set -a
-if [ -f ".env" ]; then . ./.env; fi
-set +a
+# Simple launcher for GuildNet HostApp (no supervision, no DB lock handling)
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+BIN="${ROOT_DIR}/bin/hostapp"
 
-# Sanity-check TS_LOGIN_SERVER; if it's an invalid host like a bare IP missing scheme or malformed, default to local headscale if running or ask to run setup
-if [[ -n "${TS_LOGIN_SERVER:-}" ]]; then
-  if ! [[ "$TS_LOGIN_SERVER" =~ ^https?:// ]]; then
-    # auto-fix by assuming http:// for bare host/IP
-    TS_LOGIN_SERVER="http://${TS_LOGIN_SERVER}"
-    export TS_LOGIN_SERVER
-  fi
+# Do not auto-prefer per-repo kubeconfig in production mode.
+# For compatibility, set GN_USE_GUILDNET_KUBECONFIG=1 to preserve previous behavior.
+if [ "${GN_USE_GUILDNET_KUBECONFIG:-0}" = "1" ] && [ -f "$HOME/.guildnet/kubeconfig" ]; then
+  export KUBECONFIG="${KUBECONFIG:-$HOME/.guildnet/kubeconfig}"
 fi
 
-# Resolve kubeconfig
-GN_KUBECONFIG_DEFAULT="${GN_KUBECONFIG:-$HOME/.guildnet/kubeconfig}"
-if [ -z "${KUBECONFIG:-}" ]; then
-  export KUBECONFIG="$GN_KUBECONFIG_DEFAULT"
+# Determine listen address (must match server logic): env LISTEN_LOCAL or default 127.0.0.1:8090
+LISTEN_LOCAL="${LISTEN_LOCAL:-}"
+if [ -z "$LISTEN_LOCAL" ]; then
+  LISTEN_LOCAL="127.0.0.1:8090"
 fi
 
-# Default listen address may be overridden by caller
-LISTEN_LOCAL="${LISTEN_LOCAL:-127.0.0.1:8080}"
-export LISTEN_LOCAL
+# Extract port from LISTEN_LOCAL
+HOST_PART=${LISTEN_LOCAL%:*}
+PORT_PART=${LISTEN_LOCAL##*:}
+if ! [[ "$PORT_PART" =~ ^[0-9]+$ ]]; then
+  echo "Invalid LISTEN_LOCAL (expected host:port): $LISTEN_LOCAL" >&2
+  exit 2
+fi
 
-# Prefer using kubectl proxy for API server proxying unless explicitly overridden
-if [ -z "${HOSTAPP_API_PROXY_URL:-}" ]; then
-  if command -v kubectl >/dev/null 2>&1; then
-    # Start kubectl proxy on 127.0.0.1:8001 if not already listening
-    if ! (curl -sS --max-time 1 http://127.0.0.1:8001/version >/dev/null 2>&1); then
-      ( KUBECONFIG="${KUBECONFIG}" nohup kubectl proxy --port=8001 >/dev/null 2>&1 & ) || true
-      # wait briefly for it to come up
-      for i in {1..20}; do
-        if curl -sS --max-time 1 http://127.0.0.1:8001/version >/dev/null 2>&1; then break; fi
-        sleep 0.3
-      done
+# If an existing hostapp is listening on this port (v4 or v6), terminate it first
+existing_pids=()
+# Prefer ss on Linux; fall back to lsof/ps which are more portable (macOS has no /proc)
+if command -v ss >/dev/null 2>&1; then
+  # Linux path: parse ss output for PIDs
+  while read -r line; do
+    pid=$(echo "$line" | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' | head -n1)
+    [ -n "$pid" ] && existing_pids+=("$pid")
+  done < <(ss -ltnp 2>/dev/null | awk '/LISTEN/ {print}' | grep -E ":${PORT_PART}\\b" || true)
+else
+  # Portable fallback: use lsof to find processes listening on the port
+  if command -v lsof >/dev/null 2>&1; then
+    while read -r pid; do
+      [ -n "$pid" ] && existing_pids+=("$pid")
+    done < <(lsof -nP -iTCP:${PORT_PART} -sTCP:LISTEN -t 2>/dev/null || true)
+  else
+    # Last resort: use netstat+ps parsing (very portable but brittle)
+    if command -v netstat >/dev/null 2>&1; then
+      while read -r line; do
+        pid=$(echo "$line" | awk '{print $NF}' | sed -E 's#/.*##' | tr -d '()')
+        [ -n "$pid" ] && existing_pids+=("$pid")
+      done < <(netstat -anv 2>/dev/null | grep LISTEN | grep ".${PORT_PART} " || true)
     fi
-    export HOSTAPP_API_PROXY_URL="http://127.0.0.1:8001"
-    export HOSTAPP_API_PROXY_FORCE_HTTP="1"
   fi
 fi
 
-# Database discovery hints (let the server resolve via Kubernetes API using kubeconfig)
-: "${RETHINKDB_SERVICE_NAME:=rethinkdb}"
-# Allow RETHINKDB_NAMESPACE to be set via .env or fall back to K8S_NAMESPACE or "default"
-RETHINKDB_NAMESPACE="${RETHINKDB_NAMESPACE:-${K8S_NAMESPACE:-default}}"
-export RETHINKDB_SERVICE_NAME RETHINKDB_NAMESPACE
+# De-dup PIDs (avoid mapfile/readarray for macOS bash compatibility)
+if [ "${#existing_pids[@]:-0}" -gt 0 ]; then
+  tmp=$(printf "%s\n" "${existing_pids[@]:-}" | awk 'NF' | sort -u || true)
+  existing_pids=()
+  if [ -n "$tmp" ]; then
+    while IFS= read -r l; do
+      existing_pids+=("$l")
+    done <<< "$tmp"
+  fi
+fi
 
-# Force reliable IDE access via local port-forward fallback unless user overrides
-: "${HOSTAPP_USE_PORT_FORWARD:=1}"
-export HOSTAPP_USE_PORT_FORWARD
+kill_count=0
+  for pid in "${existing_pids[@]:-}"; do
+    # Detect platform and inspect process command in a portable way
+    is_hostapp=0
+    if [ -d "/proc/$pid" ]; then
+      exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+      if echo "$exe" | grep -q "/hostapp$"; then
+        is_hostapp=1
+      else
+        if tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "hostapp"; then
+          is_hostapp=1
+        fi
+      fi
+    else
+      # macOS / BSD: use ps to get the command line
+      cmdline=$(ps -p "$pid" -o command= 2>/dev/null || true)
+      if echo "$cmdline" | grep -q "hostapp"; then
+        is_hostapp=1
+      fi
+    fi
+    if [ "$is_hostapp" -eq 1 ]; then
+      echo "Stopping existing hostapp (pid=$pid) on port $PORT_PART..."
+      kill "$pid" 2>/dev/null || true
+      kill_count=$((kill_count+1))
+    fi
+  done
 
-# Ensure the embedded operator runs so Workspaces reconcile locally
-: "${HOSTAPP_EMBED_OPERATOR:=1}"
-export HOSTAPP_EMBED_OPERATOR
+if [ "$kill_count" -gt 0 ]; then
+  # Wait briefly for processes to exit; force kill if needed
+  end=$((SECONDS + 5))
+  while [ $SECONDS -lt $end ]; do
+    alive=0
+    for pid in "${existing_pids[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then alive=1; fi
+    done
+    [ $alive -eq 0 ] && break
+    sleep 0.2
+  done
+  for pid in "${existing_pids[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "Force killing hostapp (pid=$pid)"
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  done
+fi
 
-# Run hostapp
-exec ./bin/hostapp serve
+# As a safeguard, if a non-hostapp process is still listening on the port, abort
+# As a safeguard, if a non-hostapp process is still listening on the port, abort
+listener_check_cmd=""
+listeners_cmd=""
+if command -v ss >/dev/null 2>&1; then
+  listener_check_cmd="ss -ltnp 2>/dev/null | awk '/LISTEN/ {print}' | grep -E ":${PORT_PART}\\b""
+  listeners_cmd="ss -ltnp 2>/dev/null | awk '/LISTEN/ {print}' | grep -E ":${PORT_PART}\\b" | sed -n 's/.*pid=\\([0-9]\\+\\).*/\\1/p' | sort -u"
+elif command -v lsof >/dev/null 2>&1; then
+  listener_check_cmd="lsof -nP -iTCP:${PORT_PART} -sTCP:LISTEN 2>/dev/null"
+  listeners_cmd="lsof -nP -iTCP:${PORT_PART} -sTCP:LISTEN -t 2>/dev/null | sort -u"
+else
+  listener_check_cmd="netstat -anv 2>/dev/null | grep LISTEN | grep ".${PORT_PART} ""
+  listeners_cmd="netstat -anv 2>/dev/null | grep LISTEN | grep ".${PORT_PART} " | awk '{print \$NF}' | sed -E 's#/.*##' | tr -d '()' | sort -u"
+fi
+
+if [ -n "$listener_check_cmd" ] && eval "$listener_check_cmd" >/dev/null 2>&1; then
+  listeners=$(eval "$listeners_cmd" || true)
+  ours=0
+  for pid in $listeners; do
+    exe=""
+    if [ -d "/proc/$pid" ]; then
+      exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+    else
+      exe=$(ps -p "$pid" -o command= 2>/dev/null || true)
+    fi
+    if echo "$exe" | grep -q "/hostapp$\|hostapp"; then ours=1; fi
+  done
+  if [ "$ours" -eq 0 ]; then
+    echo "Port ${PORT_PART} is in use by another process; aborting." >&2
+    eval "$listener_check_cmd" || true
+    exit 1
+  fi
+fi
+
+exec "$BIN" serve

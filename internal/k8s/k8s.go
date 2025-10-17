@@ -3,6 +3,7 @@ package k8s
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -31,17 +32,7 @@ func kubeconfigDefault() string {
 	if v := os.Getenv("KUBECONFIG"); v != "" {
 		return v
 	}
-	// Project standard: GN_KUBECONFIG or ~/.guildnet/kubeconfig if present
-	if v := os.Getenv("GN_KUBECONFIG"); v != "" {
-		return v
-	}
-	if h, err := os.UserHomeDir(); err == nil {
-		gn := filepath.Join(h, ".guildnet", "kubeconfig")
-		if fi, err := os.Stat(gn); err == nil && !fi.IsDir() {
-			return gn
-		}
-	}
-	// Fallback to default kubeconfig
+	// Fallback: use the user's standard kubeconfig (~/.kube/config)
 	if h, err := os.UserHomeDir(); err == nil {
 		return filepath.Join(h, ".kube", "config")
 	}
@@ -51,25 +42,16 @@ func kubeconfigDefault() string {
 func New(ctx context.Context) (*Client, error) {
 	var cfg *rest.Config
 	var err error
-	// Prefer explicit proxy URL if provided (e.g., started by run-hostapp)
-	if proxy := strings.TrimSpace(os.Getenv("HOSTAPP_API_PROXY_URL")); proxy != "" {
-		cfg = &rest.Config{Host: proxy}
-		// For HTTP proxy, no TLS; for HTTPS, allow insecure if forced by env
-		if strings.HasPrefix(proxy, "https://") {
-			cfg.TLSClientConfig = rest.TLSClientConfig{Insecure: strings.TrimSpace(os.Getenv("HOSTAPP_API_PROXY_FORCE_HTTP")) == "1"}
+	// Try in-cluster first, then fallback to kubeconfig on disk
+	cfg, err = rest.InClusterConfig()
+	if err != nil {
+		kc := kubeconfigDefault()
+		if kc == "" {
+			return nil, fmt.Errorf("no in-cluster config and no kubeconfig")
 		}
-	} else {
-		cfg, err = rest.InClusterConfig()
+		cfg, err = clientcmd.BuildConfigFromFlags("", kc)
 		if err != nil {
-			// fallback to kubeconfig
-			kc := kubeconfigDefault()
-			if kc == "" {
-				return nil, fmt.Errorf("no in-cluster config and no kubeconfig")
-			}
-			cfg, err = clientcmd.BuildConfigFromFlags("", kc)
-			if err != nil {
-				return nil, err
-			}
+			return nil, err
 		}
 	}
 	cs, err := kubernetes.NewForConfig(cfg)
@@ -83,6 +65,7 @@ func New(ctx context.Context) (*Client, error) {
 func NewFromKubeconfig(ctx context.Context, kubeconfigYAML string, opts struct {
 	APIProxyURL string
 	ForceHTTP   bool
+	Dial        func(ctx context.Context, network, addr string) (net.Conn, error)
 }) (*Client, error) {
 	if strings.TrimSpace(kubeconfigYAML) == "" {
 		return nil, fmt.Errorf("empty kubeconfig")
@@ -102,6 +85,10 @@ func NewFromKubeconfig(ctx context.Context, kubeconfigYAML string, opts struct {
 			u.Scheme = "http"
 			cfg.Host = u.String()
 		}
+	}
+	// Optional custom dialer (e.g., tsnet per-cluster)
+	if opts.Dial != nil {
+		cfg.Dial = opts.Dial
 	}
 	cs, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
@@ -145,6 +132,16 @@ func dns1123Name(s string) string {
 type EnsureOpts struct {
 	Namespace string
 	ID        string // stable id label
+	// New: runtime options from per-cluster settings
+	ImagePullSecret   string
+	LBEnabled         bool
+	LBPool            string
+	IngressDomain     string
+	IngressTLSSecret  string
+	IngressClassName  string
+	CertManagerIssuer string
+	IngressAuthURL    string
+	IngressAuthSignin string
 }
 
 // EnsureDeploymentAndService creates or updates a Deployment and Service for the job spec.
@@ -205,13 +202,9 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 	if strings.TrimSpace(spec.Env["PORT"]) == "" {
 		spec.Env["PORT"] = "8080"
 	}
-	// Ensure PASSWORD for code-server (dev default); can be overridden by spec.Env["PASSWORD"]
+	// Ensure PASSWORD for code-server; default fallback if not provided in spec
 	if strings.TrimSpace(spec.Env["PASSWORD"]) == "" {
-		if pw := os.Getenv("AGENT_DEFAULT_PASSWORD"); strings.TrimSpace(pw) != "" {
-			spec.Env["PASSWORD"] = pw
-		} else {
-			spec.Env["PASSWORD"] = "changeme"
-		}
+		spec.Env["PASSWORD"] = "changeme"
 	}
 	for k, v := range spec.Env {
 		env = append(env, corev1.EnvVar{Name: k, Value: v})
@@ -221,7 +214,7 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 	// Deployment
 	replicas := int32(1)
 	// Optional imagePullSecret name
-	imgPullSecret := strings.TrimSpace(os.Getenv("K8S_IMAGE_PULL_SECRET"))
+	imgPullSecret := strings.TrimSpace(opt.ImagePullSecret)
 	// Do not inject a default image; the API layer validates image is provided.
 
 	// Add explicit args for code-server so it binds correctly under our reverse proxy base path.
@@ -326,8 +319,7 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 
 	// Service type: default ClusterIP; when WORKSPACE_LB is set, expose as LoadBalancer (MetalLB expected)
 	svcType := corev1.ServiceTypeClusterIP
-	if strings.EqualFold(strings.TrimSpace(os.Getenv("WORKSPACE_LB")), "1") ||
-		strings.EqualFold(strings.TrimSpace(os.Getenv("WORKSPACE_LB")), "true") {
+	if opt.LBEnabled {
 		svcType = corev1.ServiceTypeLoadBalancer
 	}
 
@@ -338,9 +330,9 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 			Labels:    labels,
 			Annotations: func() map[string]string {
 				m := map[string]string{}
-				if pool := strings.TrimSpace(os.Getenv("WORKSPACE_LB_POOL")); pool != "" {
+				if opt.LBPool != "" {
 					// MetalLB pool selection
-					m["metallb.universe.tf/address-pool"] = pool
+					m["metallb.universe.tf/address-pool"] = opt.LBPool
 				}
 				return m
 			}(),
@@ -362,12 +354,11 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 		}
 	}
 	// Optionally ensure an Ingress per workspace if domain is configured and LoadBalancer exposure is not requested
-	if strings.TrimSpace(os.Getenv("WORKSPACE_DOMAIN")) != "" &&
-		!(strings.EqualFold(strings.TrimSpace(os.Getenv("WORKSPACE_LB")), "1") || strings.EqualFold(strings.TrimSpace(os.Getenv("WORKSPACE_LB")), "true")) {
-		dom := strings.TrimSpace(os.Getenv("WORKSPACE_DOMAIN"))
+	if strings.TrimSpace(opt.IngressDomain) != "" && !opt.LBEnabled {
+		dom := strings.TrimSpace(opt.IngressDomain)
 		host := fmt.Sprintf("%s.%s", id, dom)
-		tlsSec := strings.TrimSpace(os.Getenv("WORKSPACE_TLS_SECRET"))
-		iclass := strings.TrimSpace(os.Getenv("INGRESS_CLASS_NAME"))
+		tlsSec := strings.TrimSpace(opt.IngressTLSSecret)
+		iclass := strings.TrimSpace(opt.IngressClassName)
 		anns := map[string]string{
 			"nginx.ingress.kubernetes.io/enable-websocket":   "true",
 			"nginx.ingress.kubernetes.io/proxy-read-timeout": "3600",
@@ -375,14 +366,14 @@ func (c *Client) EnsureDeploymentAndService(ctx context.Context, spec model.JobS
 			"nginx.ingress.kubernetes.io/backend-protocol":   "HTTP",
 		}
 		// If a cert-manager issuer is provided, request a per-host cert
-		if iss := strings.TrimSpace(os.Getenv("CERT_MANAGER_ISSUER")); iss != "" && tlsSec == "" {
+		if iss := strings.TrimSpace(opt.CertManagerIssuer); iss != "" && tlsSec == "" {
 			anns["cert-manager.io/cluster-issuer"] = iss
 			tlsSec = fmt.Sprintf("workspace-%s-tls", id)
 		}
-		if v := strings.TrimSpace(os.Getenv("INGRESS_AUTH_URL")); v != "" {
+		if v := strings.TrimSpace(opt.IngressAuthURL); v != "" {
 			anns["nginx.ingress.kubernetes.io/auth-url"] = v
 		}
-		if v := strings.TrimSpace(os.Getenv("INGRESS_AUTH_SIGNIN")); v != "" {
+		if v := strings.TrimSpace(opt.IngressAuthSignin); v != "" {
 			anns["nginx.ingress.kubernetes.io/auth-signin"] = v
 		}
 		// OwnerRef to the Deployment
@@ -554,8 +545,8 @@ func (c *Client) ListServers(ctx context.Context, ns string) ([]*model.Server, e
 				}
 				s.URL = fmt.Sprintf("%s://%s:%d/", scheme, ip, p)
 			}
-		} else if dom := strings.TrimSpace(os.Getenv("WORKSPACE_DOMAIN")); dom != "" {
-			s.URL = fmt.Sprintf("https://%s.%s/", id, dom)
+		} else if true { // do not depend on WORKSPACE_DOMAIN env; prefer ingress discovery only
+			// leave URL empty when not LB; UI constructs proxy URL
 		}
 		out = append(out, s)
 	}

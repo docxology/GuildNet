@@ -24,8 +24,11 @@ type Database struct {
 // Global holds global runtime settings not tied to a specific cluster.
 // Example: default Org ID for new nodes, UI CORS origin overrides, etc.
 type Global struct {
-	OrgID          string `json:"org_id"`
-	FrontendOrigin string `json:"frontend_origin,omitempty"`
+	OrgID            string `json:"org_id"`
+	FrontendOrigin   string `json:"frontend_origin,omitempty"`
+	EmbedOperator    bool   `json:"embed_operator,omitempty"`
+	DefaultNamespace string `json:"default_namespace,omitempty"`
+	ListenLocal      string `json:"listen_local,omitempty"`
 }
 
 // Cluster holds per-cluster runtime settings that affect connectivity and proxying.
@@ -57,8 +60,18 @@ type Cluster struct {
 	IngressAuthSignin  string `json:"ingress_auth_signin,omitempty"`
 	ImagePullSecret    string `json:"image_pull_secret,omitempty"`
 
+	// Default to expose workspaces as LoadBalancer when not specified per-workspace
+	WorkspaceLBEnabled bool `json:"workspace_lb_enabled,omitempty"`
+
 	// Optional org scope if multi-tenant DB is used per cluster scope
 	OrgID string `json:"org_id,omitempty"`
+
+	// Tailscale per-cluster connector (plain K8S multi-tailnet)
+	TSLoginServer   string `json:"ts_login_server,omitempty"`
+	TSClientAuthKey string `json:"-"` // never echo back
+	TSRoutes        string `json:"ts_routes,omitempty"`
+	TSStatePath     string `json:"ts_state_path,omitempty"`
+	HeadscaleNS     string `json:"headscale_namespace,omitempty"`
 }
 
 // Manager wraps localdb for typed settings.
@@ -125,13 +138,22 @@ func (m Manager) GetGlobal(out *Global) error {
 	}
 	out.OrgID = strings.TrimSpace(asString(tmp["org_id"]))
 	out.FrontendOrigin = strings.TrimSpace(asString(tmp["frontend_origin"]))
+	out.EmbedOperator = asBool(tmp["embed_operator"])
+	out.DefaultNamespace = strings.TrimSpace(asString(tmp["default_namespace"]))
+	out.ListenLocal = strings.TrimSpace(asString(tmp["listen_local"]))
+	if out.ListenLocal == "" {
+		out.ListenLocal = "127.0.0.1:8090"
+	}
 	return nil
 }
 
 func (m Manager) PutGlobal(g Global) error {
 	rec := map[string]any{
-		"org_id":          strings.TrimSpace(g.OrgID),
-		"frontend_origin": strings.TrimSpace(g.FrontendOrigin),
+		"org_id":            strings.TrimSpace(g.OrgID),
+		"frontend_origin":   strings.TrimSpace(g.FrontendOrigin),
+		"embed_operator":    g.EmbedOperator,
+		"default_namespace": strings.TrimSpace(g.DefaultNamespace),
+		"listen_local":      strings.TrimSpace(g.ListenLocal),
 	}
 	return m.DB.Put(bucket, keyGlobal, rec)
 }
@@ -160,7 +182,13 @@ func (m Manager) GetCluster(clusterID string, out *Cluster) error {
 	out.IngressAuthURL = strings.TrimSpace(asString(tmp["ingress_auth_url"]))
 	out.IngressAuthSignin = strings.TrimSpace(asString(tmp["ingress_auth_signin"]))
 	out.ImagePullSecret = strings.TrimSpace(asString(tmp["image_pull_secret"]))
+	out.WorkspaceLBEnabled = asBool(tmp["workspace_lb_enabled"])
 	out.OrgID = strings.TrimSpace(asString(tmp["org_id"]))
+	// TS fields; client auth key intentionally omitted from GET
+	out.TSLoginServer = strings.TrimSpace(asString(tmp["ts_login_server"]))
+	out.TSRoutes = strings.TrimSpace(asString(tmp["ts_routes"]))
+	out.TSStatePath = strings.TrimSpace(asString(tmp["ts_state_path"]))
+	out.HeadscaleNS = strings.TrimSpace(asString(tmp["headscale_namespace"]))
 	return nil
 }
 
@@ -183,7 +211,16 @@ func (m Manager) PutCluster(clusterID string, cs Cluster) error {
 		"ingress_auth_url":     strings.TrimSpace(cs.IngressAuthURL),
 		"ingress_auth_signin":  strings.TrimSpace(cs.IngressAuthSignin),
 		"image_pull_secret":    strings.TrimSpace(cs.ImagePullSecret),
+		"workspace_lb_enabled": cs.WorkspaceLBEnabled,
 		"org_id":               strings.TrimSpace(cs.OrgID),
+		"ts_login_server":      strings.TrimSpace(cs.TSLoginServer),
+		"ts_routes":            strings.TrimSpace(cs.TSRoutes),
+		"ts_state_path":        strings.TrimSpace(cs.TSStatePath),
+		"headscale_namespace":  strings.TrimSpace(cs.HeadscaleNS),
+	}
+	// Store client auth key in credentials bucket to avoid accidental echo
+	if strings.TrimSpace(cs.TSClientAuthKey) != "" && m.DB != nil {
+		_ = m.DB.Put("credentials", fmt.Sprintf("cl:%s:ts_client_auth", clusterID), map[string]any{"value": cs.TSClientAuthKey, "encrypted": false})
 	}
 	return m.DB.Put(bucketClusters, clusterID, rec)
 }

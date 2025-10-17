@@ -3,23 +3,20 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"log"
-	"math/big"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -30,7 +27,6 @@ import (
 	crlog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	"github.com/your/module/internal/db"
 	"github.com/your/module/internal/httpx"
 	"github.com/your/module/internal/k8s"
 	"github.com/your/module/internal/metrics"
@@ -58,9 +54,39 @@ import (
 
 	// New imports
 	"github.com/your/module/internal/api"
+	"github.com/your/module/internal/cluster"
 	"github.com/your/module/internal/localdb"
 	"github.com/your/module/internal/secrets"
 )
+
+// kubeconfigResolver implements cluster.Resolver backed by localdb credentials.
+type kubeconfigResolver struct {
+	DB  *localdb.DB
+	Sec *secrets.Manager
+}
+
+func (r kubeconfigResolver) KubeconfigYAML(clusterID string) (string, error) {
+	if r.DB == nil {
+		return "", fmt.Errorf("no db")
+	}
+	var cred map[string]any
+	key := fmt.Sprintf("cl:%s:kubeconfig", clusterID)
+	if err := r.DB.Get("credentials", key, &cred); err != nil {
+		return "", err
+	}
+	val := fmt.Sprint(cred["value"])
+	if enc, _ := cred["encrypted"].(bool); enc {
+		if r.Sec == nil {
+			return "", fmt.Errorf("encrypted but no secrets manager")
+		}
+		s, err := r.Sec.Decrypt(val)
+		if err != nil {
+			return "", err
+		}
+		return s, nil
+	}
+	return val, nil
+}
 
 // startOperator boots a controller-runtime manager that reconciles Workspace CRDs.
 func startOperator(ctx context.Context, restCfg *rest.Config) error {
@@ -94,54 +120,13 @@ func startOperator(ctx context.Context, restCfg *rest.Config) error {
 
 // ensureSelfSigned creates a minimal self-signed certificate if not present.
 func ensureSelfSigned(dir, certPath, keyPath string) error {
+	// Production mode: do not generate self-signed certificates. Require valid cert and key to exist.
 	if _, err := os.Stat(certPath); err == nil {
 		if _, err2 := os.Stat(keyPath); err2 == nil {
 			return nil
 		}
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	// build a tiny self-signed cert
-	// NOTE: This is for development only.
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return err
-	}
-	tmpl := x509.Certificate{
-		SerialNumber:          big.NewInt(time.Now().UnixNano()),
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-		DNSNames:              []string{"localhost"},
-	}
-	// Add 127.0.0.1 to IP SANs for dev UX
-	if ip := net.ParseIP("127.0.0.1"); ip != nil {
-		tmpl.IPAddresses = append(tmpl.IPAddresses, ip)
-	}
-	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
-	if err != nil {
-		return err
-	}
-	cf, err := os.Create(certPath)
-	if err != nil {
-		return err
-	}
-	defer cf.Close()
-	if err := pem.Encode(cf, &pem.Block{Type: "CERTIFICATE", Bytes: der}); err != nil {
-		return err
-	}
-	kf, err := os.Create(keyPath)
-	if err != nil {
-		return err
-	}
-	defer kf.Close()
-	if err := pem.Encode(kf, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)}); err != nil {
-		return err
-	}
-	return nil
+	return fmt.Errorf("tls cert or key not found: %s and %s; place valid certs in ./certs/ or %s", certPath, keyPath, dir)
 }
 
 // dns1123Name converts an arbitrary string into a DNS-1123 compliant name:
@@ -222,7 +207,8 @@ func main() {
 		return
 	case "operator":
 		// Run only the operator manager (no tsnet or HTTP server)
-		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		// Terminate on INT/TERM/HUP/QUIT to match typical terminal behavior (close window, Ctrl+C)
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 		defer stop()
 		kcli, err := k8s.New(ctx)
 		if err != nil || kcli == nil || kcli.Rest == nil {
@@ -243,16 +229,18 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
-	if v := os.Getenv("LISTEN_LOCAL"); v != "" {
-		cfg.ListenLocal = v
-	}
 	if err := cfg.Validate(); err != nil {
 		log.Fatalf("invalid config: %v", err)
 	}
 
-	// Create cancellation context for the serve lifecycle
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	// Create cancellation context for the serve lifecycle; include HUP/QUIT so closing the terminal also stops the server
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 	defer stop()
+
+	// On Linux, ask the kernel to send us SIGTERM if the parent dies (e.g., terminal closed).
+	if strings.ToLower(strings.TrimSpace(os.Getenv("GN_DISABLE_PDEATHSIG"))) != "1" {
+		_ = setParentDeathSignal(syscall.SIGTERM)
+	}
 
 	// Server-first runtime: open local DB and secrets manager
 	stateDir := config.StateDir()
@@ -281,6 +269,65 @@ func main() {
 		tsSet = settings.Tailscale{LoginServer: cfg.LoginServer, PreauthKey: cfg.AuthKey, Hostname: cfg.Hostname}
 		_ = setMgr.PutTailscale(tsSet)
 	}
+	// Global: migrate defaults on first run
+	var gset settings.Global
+	_ = setMgr.GetGlobal(&gset)
+	changed := false
+	if strings.TrimSpace(gset.DefaultNamespace) == "" {
+		gset.DefaultNamespace = "default"
+		changed = true
+	}
+	if strings.TrimSpace(gset.ListenLocal) == "" {
+		gset.ListenLocal = cfg.ListenLocal
+		changed = true
+	}
+	if strings.TrimSpace(gset.FrontendOrigin) == "" {
+		// Seed a sensible default; single origin on 8090
+		gset.FrontendOrigin = "https://127.0.0.1:8090"
+		changed = true
+	}
+	// keep existing EmbedOperator value as-is
+	if changed {
+		_ = setMgr.PutGlobal(gset)
+	}
+
+	// Single-instance lock to avoid multiple hostapp processes interfering
+	lockPath := filepath.Join(config.StateDir(), "hostapp.lock")
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		log.Fatalf("unable to open lock file %s: %v", lockPath, err)
+	}
+	// Try to acquire exclusive lock non-blocking
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		// Could not acquire; try to read pid and report
+		data, _ := io.ReadAll(lockFile)
+		existing := strings.TrimSpace(string(data))
+		if existing == "" {
+			log.Fatalf("another hostapp appears to be running (lock held) and no pid in %s", lockPath)
+		}
+		if pid, perr := strconv.Atoi(existing); perr == nil {
+			// Check process existence
+			if err := syscall.Kill(pid, 0); err == nil {
+				log.Fatalf("another hostapp (pid=%d) is already running; aborting", pid)
+			}
+		}
+		// stale lock file: attempt to acquire again
+		if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			log.Fatalf("unable to acquire lock file %s: %v", lockPath, err)
+		}
+	}
+	// Write our pid into the lock file
+	_ = lockFile.Truncate(0)
+	_, _ = lockFile.Seek(0, 0)
+	_, _ = lockFile.WriteString(strconv.Itoa(os.Getpid()))
+	// Ensure lock file is cleaned on exit
+	defer func() {
+		// remove pid contents and unlock
+		_ = lockFile.Truncate(0)
+		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		_ = lockFile.Close()
+		_ = os.Remove(lockPath)
+	}()
 
 	// Start tsnet from settings
 	s, err := ts.StartServer(ctx, ts.Options{StateDir: config.StateDir(), Hostname: tsSet.Hostname, LoginURL: tsSet.LoginServer, AuthKey: tsSet.PreauthKey})
@@ -288,6 +335,10 @@ func main() {
 		log.Fatalf("tsnet start: %v", err)
 	}
 	tsServer := s
+	// Ensure tsnet server is closed on exit to avoid lingering background activity
+	defer func() {
+		_ = tsServer.Close()
+	}()
 
 	mux := http.NewServeMux()
 
@@ -307,26 +358,11 @@ func main() {
 		}
 	}()
 
-	// Initialize RethinkDB from settings if present
-	var dbMgr *db.Manager
-	var dbSet settings.Database
-	_ = setMgr.GetDatabase(&dbSet)
-	if strings.TrimSpace(dbSet.Addr) != "" {
-		if mgr, derr := db.ConnectWithOptions(ctx, dbSet.Addr, dbSet.User, dbSet.Pass); derr != nil {
-			log.Printf("rethinkdb connect failed (settings): %v", derr)
-		} else {
-			dbMgr = mgr
-		}
-	} else {
-		if mgr, derr := db.Connect(ctx); derr != nil {
-			log.Printf("rethinkdb connect failed (databases feature disabled): %v", derr)
-		} else {
-			dbMgr = mgr
-		}
-	}
+	// Per-cluster registry (always on in prototype)
+	reg := cluster.NewRegistry(cluster.Options{StateDir: stateDir, Resolver: kubeconfigResolver{DB: ldb, Sec: sec}})
 
 	// New orchestration API wired with dependencies and settings change hook
-	deps := api.Deps{DB: ldb, Secrets: sec, Runner: nil, DBMgr: dbMgr, OnSettingsChanged: func(kind string) {
+	deps := api.Deps{DB: ldb, Secrets: sec, Runner: nil, Registry: reg, OnSettingsChanged: func(kind string) {
 		log.Printf("settings updated: %s; restarting to apply", kind)
 		stop() // trigger graceful shutdown; external supervisor restarts process
 	}}
@@ -336,17 +372,46 @@ func main() {
 	mux.Handle("/api/jobs/", apiMux)
 	mux.Handle("/api/jobs-logs/", apiMux)
 	mux.Handle("/ws/jobs", apiMux)
+	// Mount API router for all /api/ paths so bootstrap and other endpoints are handled
+	mux.Handle("/api/", http.StripPrefix("/api", apiMux))
 	// Mount additional API groups served by router
 	mux.Handle("/api/cluster/", apiMux)
 	mux.Handle("/sse/cluster/", apiMux)
 	// Ensure core health endpoint is reachable
 	mux.Handle("/api/health", apiMux)
 
+	// Best-effort: restore persisted published mappings in background
+	go func() {
+		if err := api.RestorePublishedMappings(context.Background(), deps); err != nil {
+			log.Printf("api: restore published mappings failed: %v", err)
+		}
+	}()
+
 	// health check
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
+	})
+
+	// internal shutdown endpoint for graceful stop from local tooling
+	mux.HandleFunc("/internal/shutdown", func(w http.ResponseWriter, r *http.Request) {
+		// only accept local POST requests
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		host, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if host != "127.0.0.1" && host != "::1" && host != "localhost" {
+			httpx.JSONError(w, http.StatusForbidden, "shutdown allowed from localhost only", "forbidden")
+			return
+		}
+		go func() {
+			// give caller a moment to receive response
+			time.Sleep(50 * time.Millisecond)
+			stop()
+		}()
+		httpx.JSON(w, http.StatusOK, map[string]any{"status": "shutting down"})
 	})
 
 	// Registry endpoints (minimal)
@@ -406,10 +471,12 @@ func main() {
 		}{Snapshot: metrics.Export()})
 	})
 
-	// Kubernetes client (Talos cluster required; no local mode)
+	// Kubernetes client (use existing Kubernetes; no separate local dev mode)
 	kcli, err := k8s.New(ctx)
 	if err != nil {
-		log.Fatalf("k8s client: %v", err)
+		// Be tolerant in dev/first run: continue without k8s features
+		log.Printf("k8s client unavailable: %v (continuing without Kubernetes features)", err)
+		kcli = nil
 	}
 	var dyn dynamic.Interface
 	// Optional: local port-forward manager for pods (fallback when API server service/pod proxy is unreliable)
@@ -423,12 +490,20 @@ func main() {
 		}
 		pfMgr = k8s.NewPortForwardManager(kcli.Rest, "default")
 	}
-	log.Printf("Workspace CRD mode active (legacy paths removed)")
-
-	// Start operator (controller-runtime) in-process so status of Workspaces is managed.
+	// Debug: log resolved API host for visibility
 	if kcli != nil && kcli.Rest != nil {
-		if strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_EMBED_OPERATOR")), "1") ||
-			strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_EMBED_OPERATOR")), "true") {
+		log.Printf("k8s: REST host resolved to %s", kcli.Rest.Host)
+	}
+	if kcli != nil && kcli.Rest != nil {
+		log.Printf("Workspace CRD mode active (legacy paths removed)")
+	} else {
+		log.Printf("Kubernetes not available; CRD/operator features disabled")
+	}
+
+	// Start operator (controller-runtime) in-process only when explicitly enabled.
+	// Production default: embedded operator is disabled. Enable via GN_EMBED_OPERATOR=1 environment variable.
+	if kcli != nil && kcli.Rest != nil {
+		if strings.TrimSpace(os.Getenv("GN_EMBED_OPERATOR")) == "1" {
 			go func() {
 				if err := startOperator(ctx, kcli.Rest); err != nil {
 					log.Printf("operator start failed: %v", err)
@@ -442,15 +517,16 @@ func main() {
 	if dyn != nil {
 		permCache = permission.NewCache(dyn, "default", 10*time.Second)
 	}
-	defaultNS := strings.TrimSpace(os.Getenv("K8S_NAMESPACE"))
-	if defaultNS == "" {
-		defaultNS = "default"
-	}
+	defaultNS := func() string {
+		var g settings.Global
+		_ = setMgr.GetGlobal(&g)
+		if strings.TrimSpace(g.DefaultNamespace) != "" {
+			return strings.TrimSpace(g.DefaultNamespace)
+		}
+		return "default"
+	}()
 
-	// Default workspace ingress knobs for dev: don't force a domain; use UI internal proxy unless explicitly configured.
-	if os.Getenv("INGRESS_CLASS_NAME") == "" {
-		os.Setenv("INGRESS_CLASS_NAME", "nginx")
-	}
+	// Default workspace ingress knobs: no implicit ingress class via env; use cluster settings per cluster when creating resources.
 
 	// UI config (optional)
 	mux.HandleFunc("/api/ui-config", func(w http.ResponseWriter, r *http.Request) {
@@ -462,10 +538,10 @@ func main() {
 		info, _ := ts.Info(ctx, tsServer)
 		rec := &model.AgentRecord{
 			ID:       cfg.Hostname,
-			Org:      os.Getenv("ORG_ID"),
+			Org:      "", // deprecated; tenants handled per-cluster
 			Hostname: cfg.Hostname,
-			IP:       "", // fill with tsnet IP if available
-			Ports:    map[string]int{"ui": 8080},
+			IP:       "",
+			Ports:    map[string]int{"ui": 8090},
 			Version:  "hostapp",
 		}
 		if info != nil && info.IP != "" {
@@ -1176,11 +1252,7 @@ func main() {
 			return sch, fmt.Sprintf("%s:%d", host, port), subPath, nil
 		},
 		APIProxy: func() (http.RoundTripper, func(req *http.Request, scheme, hostport, subPath string), bool) {
-			// Allow disabling API proxy fully
-			if strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_DISABLE_API_PROXY")), "1") ||
-				strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_DISABLE_API_PROXY")), "true") {
-				return nil, nil, false
-			}
+			// API proxy availability is determined by k8s client config already built; no HOSTAPP_* env checks here.
 			cfg := kcli.Config()
 			if cfg == nil {
 				return nil, nil, false
@@ -1190,75 +1262,25 @@ func main() {
 				return nil, nil, false
 			}
 			set := func(req *http.Request, scheme, hostport, subPath string) {
-				// If we’re targeting a local PF set earlier (host is 127.0.0.1), do not rewrite to API proxy
+				// If targeting local PF (127.0.0.1), do not rewrite to API proxy
 				hn := req.URL.Hostname()
 				if hn == "127.0.0.1" || strings.EqualFold(hn, "localhost") {
 					return
 				}
-				// Determine base URL: env override > kube config
-				baseURL, baseFromEnv := func() (*url.URL, bool) {
-					if v := strings.TrimSpace(os.Getenv("HOSTAPP_API_PROXY_URL")); v != "" {
-						if u, err := url.Parse(v); err == nil {
-							return u, true
-						}
-					}
-					if u, err := url.Parse(cfg.Host); err == nil && u != nil {
-						return u, false
-					}
-					return &url.URL{Scheme: "https"}, false
-				}()
+				baseURL, _ := url.Parse(cfg.Host)
+				if baseURL == nil {
+					baseURL = &url.URL{Scheme: "https"}
+				}
 				if baseURL.Scheme == "" {
 					baseURL.Scheme = "https"
-				}
-				// Only force HTTP when:
-				// - explicitly requested via HOSTAPP_API_PROXY_FORCE_HTTP, or
-				// - kubeconfig host is loopback (localhost/127.0.0.1) and not overridden by env
-				if strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_API_PROXY_FORCE_HTTP")), "1") ||
-					strings.EqualFold(strings.TrimSpace(os.Getenv("HOSTAPP_API_PROXY_FORCE_HTTP")), "true") {
-					baseURL.Scheme = "http"
-				} else if !baseFromEnv {
-					hn := baseURL.Hostname()
-					if hn == "localhost" || hn == "127.0.0.1" {
-						baseURL.Scheme = "http"
-					}
-				}
-
-				// If using a loopback base and it appears unreachable, prefer kubectl proxy on 127.0.0.1:8001 when open.
-				if !baseFromEnv {
-					hn := baseURL.Hostname()
-					if hn == "localhost" || hn == "127.0.0.1" {
-						// quick probe current base
-						probeAddr := baseURL.Host
-						if !strings.Contains(probeAddr, ":") {
-							if baseURL.Scheme == "https" {
-								probeAddr = net.JoinHostPort(baseURL.Host, "443")
-							} else {
-								probeAddr = net.JoinHostPort(baseURL.Host, "80")
-							}
-						}
-						c, err := net.DialTimeout("tcp", probeAddr, 250*time.Millisecond)
-						if err != nil {
-							// try kubectl proxy default
-							if c2, err2 := net.DialTimeout("tcp", "127.0.0.1:8001", 250*time.Millisecond); err2 == nil {
-								_ = c2.Close()
-								baseURL.Scheme = "http"
-								baseURL.Host = "127.0.0.1:8001"
-							}
-						} else {
-							_ = c.Close()
-						}
-					}
 				}
 				req.URL.Scheme = baseURL.Scheme
 				req.URL.Host = baseURL.Host
 				req.Host = req.URL.Host
-				basePrefix := strings.TrimSuffix(baseURL.Path, "/")
-
-				// Extract service name (Workspace ID) and port from inputs
+				// Extract service ID and port
 				sid := strings.TrimSpace(req.Header.Get("X-Guild-Server-ID"))
 				_, portStr, err := net.SplitHostPort(hostport)
 				if err != nil || portStr == "" {
-					// best-effort parse if hostport is not in host:port form
 					parts := strings.Split(hostport, ":")
 					if len(parts) > 1 {
 						portStr = parts[len(parts)-1]
@@ -1266,8 +1288,7 @@ func main() {
 						portStr = "80"
 					}
 				}
-
-				// Pre-resolve ClusterIP:port for direct fallback when PF fails
+				// Pre-resolve ClusterIP:port for fallback if PF fails
 				fallbackHost := ""
 				fallbackScheme := "http"
 				if sid != "" {
@@ -1280,21 +1301,11 @@ func main() {
 						}
 					}
 				}
-
-				// Choose proxy style: service by default; pod only if explicitly requested by header or HOSTAPP_PREFER_POD_PROXY/USE_PORT_FORWARD
+				// Prefer pod proxy when header provided
 				preferPod := strings.TrimSpace(req.Header.Get("X-Guild-Prefer-Pod")) != ""
-				if !preferPod {
-					if v := strings.TrimSpace(os.Getenv("HOSTAPP_PREFER_POD_PROXY")); v == "1" || strings.EqualFold(v, "true") {
-						preferPod = true
-					}
-				}
-				usePF := false
-				if v := strings.TrimSpace(os.Getenv("HOSTAPP_USE_PORT_FORWARD")); v == "1" || strings.EqualFold(v, "true") {
-					usePF = true
-					preferPod = true
-				}
+				usePF := strings.TrimSpace(req.Header.Get("X-Guild-Use-PortForward")) != ""
 				if preferPod && sid != "" {
-					// Discover any running pod (even if not Ready) behind the service named by sid
+					// Discover pod behind service
 					ns := defaultNS
 					podName := ""
 					if svc, err := kcli.K.CoreV1().Services(ns).Get(context.Background(), sid, metav1.GetOptions{}); err == nil && svc != nil && len(svc.Spec.Selector) > 0 {
@@ -1304,7 +1315,6 @@ func main() {
 						}
 						selector := strings.Join(selParts, ",")
 						if pods, err := kcli.K.CoreV1().Pods(ns).List(context.Background(), metav1.ListOptions{LabelSelector: selector}); err == nil && len(pods.Items) > 0 {
-							// prefer Ready pod, else take first Running, else any
 							pick := -1
 							for i, pod := range pods.Items {
 								if pod.Status.Phase == corev1.PodRunning {
@@ -1335,17 +1345,8 @@ func main() {
 							podName = pods.Items[pick].Name
 						}
 					}
-					if podName == "" {
-						if sidHdr := req.Header.Get("X-Guild-Server-ID"); sidHdr != "" {
-							selector := fmt.Sprintf("guildnet.io/id=%s", sidHdr)
-							if pods, err := kcli.K.CoreV1().Pods(ns).List(context.Background(), metav1.ListOptions{LabelSelector: selector}); err == nil && len(pods.Items) > 0 {
-								podName = pods.Items[0].Name
-							}
-						}
-					}
 					if podName != "" {
 						if usePF && pfMgr != nil {
-							// Use local port-forward to the pod first
 							pnum := 80
 							if n, err := fmt.Sscanf(portStr, "%d", &pnum); n == 0 || err != nil {
 								pnum = 8080
@@ -1356,20 +1357,16 @@ func main() {
 								req.URL.Scheme = "http"
 								req.URL.Host = fmt.Sprintf("127.0.0.1:%d", lp)
 								req.Host = req.URL.Host
-								// Provide a fallback target for the transport if PF fails mid-flight (use ClusterIP if available)
 								if fallbackHost != "" {
 									req.Header.Set("X-Guild-Fallback-Hostport", fallbackHost)
 									req.Header.Set("X-Guild-Fallback-Scheme", fallbackScheme)
 								}
-								// Clear X-Guild-Server-ID so API proxy layer doesn't try to rewrite
 								req.Header.Del("X-Guild-Server-ID")
 								req.URL.Path = singleJoiningSlash("", subPath)
 								return
 							}
 							log.Printf("proxy: port-forward failed, falling back to pod proxy ns=%s pod=%s err=%v", defaultNS, podName, err)
-							// fallthrough to pods proxy if Ensure fails
 						}
-						// If PF was requested but failed, try direct service ClusterIP via tsnet/overlay before API pod proxy
 						if usePF && fallbackHost != "" {
 							log.Printf("proxy: PF unavailable; trying direct ClusterIP %s for sid=%s", fallbackHost, sid)
 							req.URL.Scheme = fallbackScheme
@@ -1378,27 +1375,23 @@ func main() {
 							req.URL.Path = singleJoiningSlash("", subPath)
 							return
 						}
-						// Build pods proxy path: /api/v1/namespaces/{ns}/pods/{scheme}:{pod}:{port}/proxy
 						proto := "http"
 						if strings.EqualFold(scheme, "https") {
 							proto = "https"
 						}
 						basePath := fmt.Sprintf("/api/v1/namespaces/%s/pods/%s:%s:%s/proxy", defaultNS, proto, podName, portStr)
-						fullBase := singleJoiningSlash(basePrefix, basePath)
+						fullBase := singleJoiningSlash(strings.TrimSuffix(baseURL.Path, "/"), basePath)
 						req.URL.Path = singleJoiningSlash("", fullBase) + subPath
 						return
 					}
 				}
-				// Service proxy (respect scheme) with explicit scheme prefix to avoid ambiguity
+				// Service proxy
 				if strings.EqualFold(scheme, "https") {
 					req.URL.Path = "/api/v1/namespaces/" + defaultNS + "/services/https:" + sid + ":" + portStr + "/proxy"
 				} else {
-					// explicitly use http: prefix
 					req.URL.Path = "/api/v1/namespaces/" + defaultNS + "/services/http:" + sid + ":" + portStr + "/proxy"
 				}
 				req.URL.Path = singleJoiningSlash("", req.URL.Path) + subPath
-				// return is redundant at end of function literal; removing to avoid linter/compile complaint
-				// return
 			}
 			return rt, set, true
 		},
@@ -1421,19 +1414,37 @@ func main() {
 	mux.Handle("/proxy", proxyHandler)
 	mux.Handle("/proxy/", proxyHandler)
 
+	// Resolve listen address: LISTEN_LOCAL env > settings.Global.ListenLocal > default
+	listenAddr := strings.TrimSpace(os.Getenv("LISTEN_LOCAL"))
+	if listenAddr == "" {
+		var g settings.Global
+		_ = setMgr.GetGlobal(&g)
+		if v := strings.TrimSpace(g.ListenLocal); v != "" {
+			listenAddr = v
+		}
+	}
+	if listenAddr == "" {
+		listenAddr = "127.0.0.1:8090"
+	}
+
 	// Wrap with middleware (logging, request id, CORS)
-	corsOrigin := ""
-	{
+	corsOrigin := func() string {
 		var g settings.Global
 		_ = setMgr.GetGlobal(&g)
 		if strings.TrimSpace(g.FrontendOrigin) != "" {
-			corsOrigin = strings.TrimSpace(g.FrontendOrigin)
-		} else if v := os.Getenv("FRONTEND_ORIGIN"); v != "" {
-			corsOrigin = v
-		} else {
-			corsOrigin = "https://localhost:5173"
+			return strings.TrimSpace(g.FrontendOrigin)
 		}
-	}
+		// Default dev origin follows listen address
+		host, port, err := net.SplitHostPort(listenAddr)
+		if err == nil {
+			// When bound to localhost or 127.0.0.1, use that; otherwise use host:port directly
+			if host == "" {
+				host = "127.0.0.1"
+			}
+			return "https://" + net.JoinHostPort(host, port)
+		}
+		return "https://127.0.0.1:8090"
+	}()
 	handler := httpx.RequestID(httpx.Logging(httpx.CORS(corsOrigin)(mux)))
 
 	// Certs: prefer repo CA-signed ./certs/server.crt|server.key, then ./certs/dev.crt|dev.key; else use ~/.guildnet/state/certs
@@ -1455,31 +1466,26 @@ func main() {
 		}
 	}
 
-	// local server (TLS only) - also try an IPv6 localhost listener if applicable
+	// local server (TLS only)
 	localSrv := &http.Server{
-		Addr:         cfg.ListenLocal,
+		Addr:         listenAddr,
 		Handler:      handler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
+	// Force HTTP/1.1 on the local listener to avoid HTTP/2 related TLS/internal errors
+	// which have been observed in development when clients and the server disagree
+	// on ALPN or when intermediates mishandle h2 framing. This keeps local dev
+	// interactions (curl, scripts) stable while still allowing tsnet :443 to
+	// serve with its default ALPN behavior.
+	localSrv.TLSConfig = &tls.Config{NextProtos: []string{"http/1.1"}}
 	var v6Srv *http.Server
-	// Pre-bind local listener and fall back if the preferred port is unavailable.
-	bindAddr := cfg.ListenLocal
+	// Pre-bind local listener and hard-fail if unavailable (no fallback)
+	bindAddr := listenAddr
 	lnLocal, err := net.Listen("tcp", bindAddr)
 	if err != nil {
-		candidates := []string{"127.0.0.1:9443", "127.0.0.1:8080", "127.0.0.1:8081", "127.0.0.1:8443"}
-		for _, a := range candidates {
-			if l, e := net.Listen("tcp", a); e == nil {
-				lnLocal = l
-				bindAddr = a
-				localSrv.Addr = bindAddr
-				break
-			}
-		}
-		if lnLocal == nil {
-			log.Fatalf("local listen failed: %v", err)
-		}
+		log.Fatalf("local listen failed on %s: %v", bindAddr, err)
 	}
 	// Also prepare an IPv6 loopback listener on the same port when using localhost/127.0.0.1
 	var lnLocalV6 net.Listener
@@ -1498,7 +1504,7 @@ func main() {
 		}
 	}
 
-	// tsnet listener server
+	// tsnet server remains on :443
 	var tsSrv *http.Server
 	var ln net.Listener
 	{
@@ -1507,7 +1513,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("tsnet listen: %v", err)
 		}
-		defer ln.Close()
+		// do not defer ln.Close() here; close explicitly on shutdown to guarantee timely teardown
 		tsSrv = &http.Server{
 			Handler:      handler,
 			ReadTimeout:  10 * time.Second,
@@ -1526,13 +1532,37 @@ func main() {
 
 	select {
 	case <-ctx.Done():
+		log.Printf("shutdown: signal received, closing listeners and servers")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = localSrv.Shutdown(shutdownCtx)
-		if v6Srv != nil {
-			_ = v6Srv.Shutdown(shutdownCtx)
+		// First, stop accepting new connections by closing listeners
+		_ = lnLocal.Close()
+		if lnLocalV6 != nil {
+			_ = lnLocalV6.Close()
 		}
-		_ = tsSrv.Shutdown(shutdownCtx)
+		// then attempt graceful shutdown of HTTP servers
+		if err := localSrv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("localSrv.Shutdown error: %v", err)
+		}
+		if v6Srv != nil {
+			if err := v6Srv.Shutdown(shutdownCtx); err != nil {
+				log.Printf("v6Srv.Shutdown error: %v", err)
+			}
+		}
+		if err := tsSrv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("tsSrv.Shutdown error: %v", err)
+		}
+		// Close tsnet server explicitly and the ts listener
+		if err := tsServer.Close(); err != nil {
+			log.Printf("tsServer.Close error: %v", err)
+		}
+		if ln != nil {
+			_ = ln.Close()
+		}
+		// Give a small grace period to let goroutines exit, then force exit to avoid lingering backgrounds
+		time.Sleep(200 * time.Millisecond)
+		log.Printf("shutdown: complete, exiting")
+		os.Exit(0)
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("server error: %v", err)

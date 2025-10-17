@@ -10,6 +10,7 @@ import {
 import Toaster, { pushToast } from './components/Toaster'
 import { listClusters, createClusterRecord, attachClusterKubeconfig, getHealthSummary, clusterHealth } from './lib/api'
 import Modal from './components/Modal'
+import { apiUrl } from './lib/config'
 
 const Servers = lazy(() => import('./routes/Servers'))
 const ServerDetail = lazy(() => import('./routes/ServerDetail'))
@@ -243,6 +244,19 @@ function ClusterShell(props: RouteSectionProps) {
   const cid = () => params.clusterId || ''
   const enc = (s: string) => encodeURIComponent(s || '')
 
+  // Fetch per-host cluster status to gate UI features when cluster not configured
+  const fetchStatus = async (id: string) => {
+    if (!id) return null
+    try {
+      const res = await fetch(apiUrl(`/api/cluster/${encodeURIComponent(id)}/status`), { cache: 'no-store' })
+      if (!res.ok) return null
+      return await res.json()
+    } catch (e) {
+      return null
+    }
+  }
+  const [status] = createResource(() => cid(), fetchStatus)
+
   return (
     <div class="min-h-screen flex flex-col">
       <header class="border-b sticky top-0 z-10 bg-white/70 dark:bg-neutral-900/70 backdrop-blur">
@@ -250,10 +264,15 @@ function ClusterShell(props: RouteSectionProps) {
           <A href="/" class="font-semibold">GuildNet</A>
           <Show when={!!cid()}>
             <nav class="flex items-center gap-3 text-sm">
-              <A href={`/c/${enc(cid())}/servers`} activeClass="text-brand-600" class="hover:underline">Servers</A>
-              <A href={`/c/${enc(cid())}/launch`} activeClass="text-brand-600" class="hover:underline">Launch</A>
-              <A href={`/c/${enc(cid())}/databases`} activeClass="text-brand-600" class="hover:underline">Databases</A>
-              <A href={`/c/${enc(cid())}/settings`} activeClass="text-brand-600" class="hover:underline">Settings</A>
+              {/* Only show Servers/Launch/Databases when cluster status indicates kube is reachable or kubeconfig present+valid. Otherwise show only Settings. */}
+              <Show when={status() && (status().k8sReachable === true || (status().kubeconfigPresent && status().kubeconfigValid))} fallback={<A href={`/c/${enc(cid())}/settings`} activeClass="text-brand-600" class="hover:underline">Settings</A>}>
+                <>
+                  <A href={`/c/${enc(cid())}/servers`} activeClass="text-brand-600" class="hover:underline">Servers</A>
+                  <A href={`/c/${enc(cid())}/launch`} activeClass="text-brand-600" class="hover:underline">Launch</A>
+                  <A href={`/c/${enc(cid())}/databases`} activeClass="text-brand-600" class="hover:underline">Databases</A>
+                  <A href={`/c/${enc(cid())}/settings`} activeClass="text-brand-600" class="hover:underline">Settings</A>
+                </>
+              </Show>
             </nav>
           </Show>
         </div>

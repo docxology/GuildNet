@@ -17,16 +17,24 @@ func TestPingHandler(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/ping", func(w http.ResponseWriter, r *http.Request) {
 		addr := r.URL.Query().Get("addr")
-		if addr == "" { httpx.JSONError(w, http.StatusBadRequest, "missing addr"); return }
-		if !al.AllowedAddr(addr) { httpx.JSONError(w, http.StatusForbidden, "addr not allowlisted"); return }
-	start := time.Now()
-	// simulate dial with timeout context
-	ctx, cancel := context.WithTimeout(r.Context(), 50*time.Millisecond)
-	_ = ctx
-	defer cancel()
+		if addr == "" {
+			httpx.JSONError(w, http.StatusBadRequest, "missing addr")
+			return
+		}
+		if !al.AllowedAddr(addr) {
+			httpx.JSONError(w, http.StatusForbidden, "addr not allowlisted")
+			return
+		}
+		start := time.Now()
+		// simulate dial with timeout context
+		ctx, cancel := context.WithTimeout(r.Context(), 50*time.Millisecond)
+		_ = ctx
+		defer cancel()
 		// fake dial: success only for 127.0.0.1:6553
 		var err error
-		if addr != "127.0.0.1:6553" { err = context.DeadlineExceeded }
+		if addr != "127.0.0.1:6553" {
+			err = context.DeadlineExceeded
+		}
 		if err != nil {
 			httpx.JSON(w, http.StatusBadGateway, map[string]any{"addr": addr, "ok": false, "error": err.Error(), "rtt_ms": int(time.Since(start).Milliseconds())})
 			return
@@ -38,13 +46,21 @@ func TestPingHandler(t *testing.T) {
 
 	// success
 	resp, err := http.Get(srv.URL + "/api/ping?addr=127.0.0.1:6553")
-	if err != nil { t.Fatal(err) }
-	if resp.StatusCode != 200 { t.Fatalf("status=%d", resp.StatusCode) }
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
 	_ = resp.Body.Close()
 
 	// forbidden
 	resp2, err := http.Get(srv.URL + "/api/ping?addr=127.0.0.1:80")
-	if err != nil { t.Fatal(err) }
-	if resp2.StatusCode != http.StatusForbidden { t.Fatalf("status=%d", resp2.StatusCode) }
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp2.StatusCode != http.StatusForbidden {
+		t.Fatalf("status=%d", resp2.StatusCode)
+	}
 	_ = resp2.Body.Close()
 }

@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
-	"net"
 	"os"
 	"strings"
 	"sync"
@@ -26,8 +24,6 @@ type Manager struct {
 	mu   sync.RWMutex
 	// simple sequence generator for changefeed cursor tokens (monotonic per manager)
 	seq uint64
-	// keep a port-forward manager alive if we had to establish a PF to reach DB
-	pfm *k8sclient.PortForwardManager
 }
 
 // Connect creates a Manager using Settings (preferred) then env/discovery.
@@ -45,11 +41,14 @@ func Connect(ctx context.Context) (*Manager, error) {
 		// We cannot open localdb here without a path; keep as TODO for injected deps.
 		_ = sd
 	}
-	// Fallback to existing autodiscovery/env
+	// Discover address from in-cluster service only. Fail if not running in-cluster
 	if addr == "" {
 		addr = AutoDiscoverAddr()
+		if addr == "" {
+			return nil, fmt.Errorf("rethinkdb: no in-cluster address discovered; RethinkDB must run inside the Kubernetes cluster")
+		}
 	}
-	opts := r.ConnectOpts{Address: addr, InitialCap: 5, MaxOpen: 20, Timeout: 5 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second}
+	opts := r.ConnectOpts{Address: addr, InitialCap: 2, MaxOpen: 10, Timeout: 3 * time.Second, ReadTimeout: 3 * time.Second, WriteTimeout: 3 * time.Second}
 	if u := os.Getenv("RETHINKDB_USER"); u != "" {
 		user = u
 	}
@@ -73,9 +72,10 @@ func Connect(ctx context.Context) (*Manager, error) {
 func ConnectWithOptions(ctx context.Context, address, user, pass string) (*Manager, error) {
 	addr := strings.TrimSpace(address)
 	if addr == "" {
-		addr = AutoDiscoverAddr()
+		// Require explicit address when calling ConnectWithOptions; do not fall back to localhost.
+		return nil, fmt.Errorf("rethinkdb: explicit address required; RethinkDB must run inside the Kubernetes cluster")
 	}
-	opts := r.ConnectOpts{Address: addr, InitialCap: 5, MaxOpen: 20, Timeout: 5 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second}
+	opts := r.ConnectOpts{Address: addr, InitialCap: 2, MaxOpen: 10, Timeout: 3 * time.Second, ReadTimeout: 3 * time.Second, WriteTimeout: 3 * time.Second}
 	if strings.TrimSpace(user) != "" {
 		opts.Username = strings.TrimSpace(user)
 	}
@@ -89,25 +89,47 @@ func ConnectWithOptions(ctx context.Context, address, user, pass string) (*Manag
 	return &Manager{sess: sess}, nil
 }
 
+// ConnectWithSettings prefers explicit addr/user/pass and does not read envs.
+func ConnectWithSettings(ctx context.Context, addr, user, pass string) (*Manager, error) {
+	address := strings.TrimSpace(addr)
+	if address == "" {
+		return nil, fmt.Errorf("rethinkdb: explicit address required; RethinkDB must run inside the Kubernetes cluster")
+	}
+	opts := r.ConnectOpts{Address: address, InitialCap: 2, MaxOpen: 10, Timeout: 3 * time.Second, ReadTimeout: 3 * time.Second, WriteTimeout: 3 * time.Second}
+	if strings.TrimSpace(user) != "" {
+		opts.Username = strings.TrimSpace(user)
+	}
+	if strings.TrimSpace(pass) != "" {
+		opts.Password = strings.TrimSpace(pass)
+	}
+	sess, err := r.Connect(opts)
+	if err != nil {
+		return nil, fmt.Errorf("rethinkdb connect failed addr=%s: %w", address, err)
+	}
+	return &Manager{sess: sess}, nil
+}
+
 // AutoDiscoverAddr returns the best-effort RethinkDB address (host:port).
-// Precedence:
-// 1) RETHINKDB_ADDR env if set
-// 2) In-cluster K8s service env vars RETHINKDB_SERVICE_HOST/PORT
-// 3) DNS name "<svc>.<ns>.svc.cluster.local:28015" using RETHINKDB_SERVICE_NAME and namespace hints
-// 4) If inside Kubernetes but no hints: rethinkdb:28015
-// 5) Outside Kubernetes: localhost:28015
+// Note: does not consider HOSTAPP_* envs anymore; proxying is handled by the API layer.
 func AutoDiscoverAddr() string {
+	// NOTE: For production-only behavior, do not use RETHINKDB_ADDR to point
+	// at a development DB outside the cluster. We only discover in-cluster
+	// addresses here. If an external address is required it must be reachable
+	// via cluster networking and configured accordingly (not via local loopback).
 	if v := strings.TrimSpace(os.Getenv("RETHINKDB_ADDR")); v != "" {
+		// Still allow explicit env var to be present, but we only accept it
+		// when it resolves to a non-loopback address. We perform a simple
+		// check: reject localhost/127.0.0.1 values to enforce in-cluster-only.
+		lv := strings.TrimSpace(v)
+		if lv == "127.0.0.1:28015" || strings.HasPrefix(lv, "127.") || strings.HasPrefix(lv, "localhost") {
+			return ""
+		}
 		return v
 	}
 	inCluster := strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_HOST")) != ""
 	if !inCluster {
-		// If a proxy URL to the API is provided, the k8s client will honor it
-		if proxy := strings.TrimSpace(os.Getenv("HOSTAPP_API_PROXY_URL")); proxy != "" {
-			_ = proxy // presence hints that discovery via API should work even without direct apiserver access
-		}
 		// Prefer Kubernetes API service discovery via kubeconfig first
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		if kc, err := k8sclient.New(ctx); err == nil && kc != nil && kc.K != nil {
 			svcName := strings.TrimSpace(os.Getenv("RETHINKDB_SERVICE_NAME"))
@@ -115,9 +137,6 @@ func AutoDiscoverAddr() string {
 				svcName = "rethinkdb"
 			}
 			ns := strings.TrimSpace(os.Getenv("RETHINKDB_NAMESPACE"))
-			if ns == "" {
-				ns = strings.TrimSpace(os.Getenv("K8S_NAMESPACE"))
-			}
 			if ns == "" {
 				ns = "default"
 			}
@@ -153,25 +172,14 @@ func AutoDiscoverAddr() string {
 					}
 					if nodePort > 0 {
 						if nodes, err := kc.K.CoreV1().Nodes().List(ctx, metav1.ListOptions{}); err == nil {
-							pickIP := func(n corev1.Node) string {
-								extIP := ""
-								intIP := ""
-								for _, addr := range n.Status.Addresses {
-									if addr.Type == corev1.NodeExternalIP && extIP == "" && strings.TrimSpace(addr.Address) != "" {
-										extIP = addr.Address
-									}
-									if addr.Type == corev1.NodeInternalIP && intIP == "" && strings.TrimSpace(addr.Address) != "" {
-										intIP = addr.Address
-									}
-								}
-								if extIP != "" {
-									return extIP
-								}
-								return intIP
-							}
 							for _, n := range nodes.Items {
-								if h := pickIP(n); strings.TrimSpace(h) != "" {
-									return fmt.Sprintf("%s:%d", h, nodePort)
+								for _, addr := range n.Status.Addresses {
+									if addr.Type == corev1.NodeExternalIP && strings.TrimSpace(addr.Address) != "" {
+										return fmt.Sprintf("%s:%d", addr.Address, nodePort)
+									}
+									if addr.Type == corev1.NodeInternalIP && strings.TrimSpace(addr.Address) != "" {
+										return fmt.Sprintf("%s:%d", addr.Address, nodePort)
+									}
 								}
 							}
 						}
@@ -190,12 +198,13 @@ func AutoDiscoverAddr() string {
 				}
 			}
 		}
-		// As a last resort in dev, prefer local loopback if something is already listening (e.g., user port-forward)
-		if canDialFast("127.0.0.1:28015", 150*time.Millisecond) {
-			return "127.0.0.1:28015"
-		}
+		// If not in-cluster and we cannot discover via kubeconfig, return empty
+		// to indicate no in-cluster address discovered.
+		// This enforces that the Host App should be configured to run with
+		// an in-cluster reachable RethinkDB service.
+		return ""
 	}
-	// Direct service host/port envs (set automatically for Services)
+	// In-cluster service envs
 	host := strings.TrimSpace(os.Getenv("RETHINKDB_SERVICE_HOST"))
 	port := strings.TrimSpace(os.Getenv("RETHINKDB_SERVICE_PORT"))
 	if host != "" {
@@ -211,47 +220,18 @@ func AutoDiscoverAddr() string {
 		}
 		ns := strings.TrimSpace(os.Getenv("RETHINKDB_NAMESPACE"))
 		if ns == "" {
-			ns = strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
-		}
-		if ns == "" {
-			ns = strings.TrimSpace(os.Getenv("KUBERNETES_NAMESPACE"))
-		}
-		if ns == "" {
-			// Try well-known serviceaccount namespace file
-			// Only attempt if file exists and is readable
-			saNS := "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
-			if b, err := os.ReadFile(saNS); err == nil {
+			if b, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace"); err == nil {
 				ns = strings.TrimSpace(string(b))
-			} else if !errorsIsNotExist(err) {
-				// ignore other fs errors and continue
-				_ = err
 			}
 		}
 		if ns == "" {
-			// As a last resort inside cluster, use short service name
 			return svc + ":28015"
 		}
 		return fmt.Sprintf("%s.%s.svc.cluster.local:28015", svc, ns)
 	}
-	// Outside cluster fallback
-	return "127.0.0.1:28015"
-}
-
-func errorsIsNotExist(err error) bool {
-	if err == nil {
-		return false
-	}
-	// Use fs helpers to classify
-	return errors.Is(err, fs.ErrNotExist)
-}
-
-func canDialFast(addr string, d time.Duration) bool {
-	conn, err := net.DialTimeout("tcp", addr, d)
-	if err != nil {
-		return false
-	}
-	_ = conn.Close()
-	return true
+	// If we somehow reach here without in-cluster envs, return empty to
+	// indicate discovery failed.
+	return ""
 }
 
 // dbName returns the physical database name for an org+database.
@@ -341,6 +321,24 @@ func isTransientErr(err error) bool {
 		return true
 	}
 	return false
+}
+
+// ClassifyError returns a coarse classification for connector errors: transient, auth, schema, fatal.
+func ClassifyError(err error) string {
+	if err == nil {
+		return "none"
+	}
+	s := strings.ToLower(err.Error())
+	if isTransientErr(err) {
+		return "transient"
+	}
+	if strings.Contains(s, "auth") || strings.Contains(s, "unauthorized") || strings.Contains(s, "permission") {
+		return "auth"
+	}
+	if strings.Contains(s, "no such table") || strings.Contains(s, "no such database") || strings.Contains(s, "missing") {
+		return "schema"
+	}
+	return "fatal"
 }
 
 func retryTransient(attempts int, fn func() error) error {

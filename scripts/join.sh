@@ -73,7 +73,7 @@ GN_DIR="$HOME/.guildnet"
 mkdir -p "$GN_DIR/state/certs" || true
 OUT_CFG="$GN_DIR/config.json"
 
-LISTEN_LOCAL_DEFAULT="127.0.0.1:8080"
+LISTEN_LOCAL_DEFAULT="127.0.0.1:8090"
 if [ -n "$TS_LOGIN" ] && [ -n "$TS_KEY" ]; then
   # Choose a default hostname when not suggested
   if [ -z "$TS_HOSTNAME" ] || [ "$TS_HOSTNAME" = "null" ]; then

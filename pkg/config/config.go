@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 type Config struct {
@@ -16,7 +15,7 @@ type Config struct {
 	ListenLocal   string `json:"listen_local"`
 	DialTimeoutMS int    `json:"dial_timeout_ms"`
 	Name          string `json:"name,omitempty"`
-	// Optional: per-workspace ingress exposure
+	// Optional: per-workspace ingress exposure (legacy; moved to per-cluster settings)
 	WorkspaceDomain    string `json:"workspace_domain,omitempty"`
 	IngressClassName   string `json:"ingress_class_name,omitempty"`
 	WorkspaceTLSSecret string `json:"workspace_tls_secret,omitempty"`
@@ -46,22 +45,6 @@ func Load() (*Config, error) {
 	if err := json.Unmarshal(b, &c); err != nil {
 		return nil, err
 	}
-	// Environment overrides for convenience
-	if v := strings.TrimSpace(os.Getenv("WORKSPACE_DOMAIN")); v != "" {
-		c.WorkspaceDomain = v
-	}
-	if v := strings.TrimSpace(os.Getenv("INGRESS_CLASS_NAME")); v != "" {
-		c.IngressClassName = v
-	}
-	if v := strings.TrimSpace(os.Getenv("WORKSPACE_TLS_SECRET")); v != "" {
-		c.WorkspaceTLSSecret = v
-	}
-	if v := strings.TrimSpace(os.Getenv("INGRESS_AUTH_URL")); v != "" {
-		c.IngressAuthURL = v
-	}
-	if v := strings.TrimSpace(os.Getenv("INGRESS_AUTH_SIGNIN")); v != "" {
-		c.IngressAuthSignin = v
-	}
 	return &c, nil
 }
 
@@ -75,7 +58,7 @@ func Save(c *Config) error {
 
 func (c *Config) Validate() error {
 	// Always require Tailscale (tsnet) configuration
-	if !strings.HasPrefix(c.LoginServer, "http://") && !strings.HasPrefix(c.LoginServer, "https://") {
+	if c.LoginServer == "" {
 		return errors.New("login_server must be a URL")
 	}
 	if c.AuthKey == "" {

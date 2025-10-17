@@ -226,10 +226,14 @@ export async function createClusterWorkspace(
         body: JSON.stringify(payload)
       }
     )
-    if (!res.ok) return null
-    return (await res.json()) as { id: string; status: string }
-  } catch {
-    return null
+    // Use the shared handler so structured server errors (message/details)
+    // are parsed and converted to a thrown Error which the caller can show.
+    return await handle<{ id: string; status: string }>(res)
+  } catch (e) {
+    // Let the caller handle errors; returning null would swallow useful
+    // server-side validation messages. Preserve previous behaviour on
+    // unexpected failures by rethrowing the original error.
+    throw e
   }
 }
 
@@ -290,6 +294,16 @@ export async function getClusterKubeconfig(id: string): Promise<string | null> {
       apiUrl(`/api/deploy/clusters/${encodeURIComponent(id)}?action=kubeconfig`),
       { method: 'POST' }
     )
+    if (!res.ok) return null
+    return await res.text()
+  } catch {
+    return null
+  }
+}
+
+export async function getClusterJoinConfig(id: string): Promise<string | null> {
+  try {
+    const res = await fetch(apiUrl(`/api/deploy/clusters/${encodeURIComponent(id)}?action=join-config`), { method: 'POST' })
     if (!res.ok) return null
     return await res.text()
   } catch {
@@ -375,5 +389,27 @@ export async function getClusterWorkspaceLogs(
     return (await res.json()) as Array<{ t: string; msg: string }>
   } catch {
     return []
+  }
+}
+
+// Published services APIs
+export type PublishedService = { cluster_id: string; service: string; addr: string; added_at: string }
+
+export async function listPublishedServices(clusterId: string): Promise<PublishedService[]> {
+  try {
+    const res = await fetch(apiUrl(`/api/cluster/${encodeURIComponent(clusterId)}/published-services`))
+    if (!res.ok) return []
+    return (await res.json()) as PublishedService[]
+  } catch {
+    return []
+  }
+}
+
+export async function deletePublishedService(clusterId: string, service: string): Promise<boolean> {
+  try {
+    const res = await fetch(apiUrl(`/api/cluster/${encodeURIComponent(clusterId)}/published-services/${encodeURIComponent(service)}`), { method: 'DELETE' })
+    return res.ok
+  } catch {
+    return false
   }
 }

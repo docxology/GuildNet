@@ -27,7 +27,7 @@ func RunInitWizard(in *os.File, out *os.File) error {
 	login, _ := read("Login server URL (Headscale)", "https://headscale.example.com")
 	auth, _ := read("Pre-auth key", "tskey-abc123")
 	host, _ := read("Hostname", "host-app")
-	listen, _ := read("Listen local", "127.0.0.1:8080")
+	listen, _ := read("Listen local", "127.0.0.1:8090")
 	dialStr, _ := read("Dial timeout ms", "3000")
 	name, _ := read("Profile/cluster name (optional)", "")
 

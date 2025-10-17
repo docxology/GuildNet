@@ -219,6 +219,9 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, err error) {
 			if p.opts.Logger != nil {
 				p.opts.Logger.Printf("proxy error req_id=%s method=%s url=%s to=%s path=%s err=%v", reqID, req.Method, req.URL.String(), to, subPath, err)
+			} else {
+				// Fallback to standard logger so errors are visible in typical stdout/stderr logs
+				log.Printf("proxy error req_id=%s method=%s url=%s to=%s path=%s err=%v", reqID, req.Method, req.URL.String(), to, subPath, err)
 			}
 			http.Error(rw, fmt.Sprintf("upstream error: %v", err), http.StatusBadGateway)
 		},
@@ -228,6 +231,24 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Rewrite response headers for iframe/subpath compatibility (Location, Set-Cookie, CSP)
 	rp.ModifyResponse = func(resp *http.Response) error {
+		// Debug: log upstream headers that affect embedding so callers can trace why an
+		// iframe may be blocked (e.g., ingress reintroducing X-Frame-Options/CSP).
+		// Emit upstream header summary to configured logger or to standard logger as a fallback
+		hdrs := map[string]string{
+			"X-Frame-Options":              resp.Header.Get("X-Frame-Options"),
+			"Content-Security-Policy":      resp.Header.Get("Content-Security-Policy"),
+			"Location":                     resp.Header.Get("Location"),
+			"Cross-Origin-Embedder-Policy": resp.Header.Get("Cross-Origin-Embedder-Policy"),
+			"Cross-Origin-Opener-Policy":   resp.Header.Get("Cross-Origin-Opener-Policy"),
+		}
+		// Log Set-Cookie counts to avoid printing cookie values
+		sc := len(resp.Header.Values("Set-Cookie"))
+		msg := fmt.Sprintf("proxy: upstream resp for %s status=%d set-cookie-count=%d headers=%v", resp.Request.URL.String(), resp.StatusCode, sc, hdrs)
+		if p.opts.Logger != nil {
+			p.opts.Logger.Print(msg)
+		} else {
+			log.Print(msg)
+		}
 		// Determine baseHref from incoming path or forwarded prefix
 		base := resp.Request.Header.Get("X-Forwarded-Prefix")
 		if base == "" {

@@ -106,8 +106,8 @@ func TestAutoDiscoverAddr_OutsideCluster(t *testing.T) {
 		"RETHINKDB_SERVICE_HOST":  "",
 	}, func() {
 		got := AutoDiscoverAddr()
-		if got != "127.0.0.1:28015" {
-			t.Fatalf("expected 127.0.0.1 fallback, got %q", got)
+		if got != "" {
+			t.Fatalf("expected empty discovery (in-cluster only), got %q", got)
 		}
 	})
 }

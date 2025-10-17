@@ -71,12 +71,12 @@
       "group": "test"
     },
     {
-      "label": "TLS check: backend 8080",
+      "label": "TLS check: backend 8090",
       "type": "shell",
       "command": "make tls-check-backend",
       "group": "test"
     },
-    
+
     {
       "label": "Admin: stop all workloads",
       "type": "shell",
@@ -86,8 +86,22 @@
     {
       "label": "Generate join config (guildnet.config)",
       "type": "shell",
-      "command": "bash scripts/create_join_info.sh --kubeconfig \"${GN_KUBECONFIG:-${KUBECONFIG:-$HOME/.kube/config}}\" --name \"${GN_CLUSTER_NAME:-}\" --hostapp-url \"${GN_HOSTAPP_URL:-https://localhost:8080}\" --include-ca \"${GN_INCLUDE_CA:-}\" --login-server \"${GN_LOGIN_SERVER:-}\" --auth-key \"${GN_AUTH_KEY:-}\" --hostname \"${GN_HOSTNAME:-$(hostname)}\" --out \"${GN_JOIN_OUT:-guildnet.config}\"",
+      "command": "bash scripts/generate_join_config.sh --out \"${GN_JOIN_OUT:-guildnet.config}\"",
       "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Verify cluster (script)",
+      "type": "shell",
+      "command": "bash -lc 'bash scripts/verify-cluster.sh 2>&1 | tee /tmp/verify-cluster-$(date +%s).log'",
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": false,
+        "panel": "shared",
+        "showReuseMessage": true,
+        "clear": false
+      },
       "problemMatcher": []
     },
 
@@ -97,18 +111,21 @@
       "type": "shell",
       "command": "make agent-build",
       "group": "build"
-    },
+    }
+    ,
     {
-      "label": "Talos: fresh deploy",
+      "label": "Run server and tail logs",
       "type": "shell",
-      "command": "make talos-fresh",
-      "group": "build"
-    },
-    {
-      "label": "Talos: upgrade cluster",
-      "type": "shell",
-      "command": "make talos-upgrade",
-      "group": "build"
+      "command": "bash -lc './scripts/stop-hostapp.sh || true; sudo rm -f /tmp/hostapp.log || true; sudo touch /tmp/hostapp.log; sudo chown \"$(id -u):$(id -g)\" /tmp/hostapp.log; nohup ./scripts/run-hostapp.sh > /tmp/hostapp.log 2>&1 & sleep 1; ps aux | grep hostapp | grep -v grep || true; tail -n +1 -F /tmp/hostapp.log'",
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": true,
+        "panel": "shared",
+        "showReuseMessage": true,
+        "clear": false
+      },
+      "problemMatcher": []
     }
   ]
 }

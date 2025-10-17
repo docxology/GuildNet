@@ -6,11 +6,11 @@ GuildNet is a private self-hostable stack that puts human-in-the-loop with agent
 
 ### Distributed private network cluster
 
-- **Host App**: A local server that runs on all machines and exposes the UI to the network via tsnet as well as reverse-proxies traffic between the Talos cluster.
-- **Talos Cluster**: A Kubernetes cluster running on Talos OS, which hosts the code-server instances and other services.
-- **Tailscale/Headscale**: Used for secure networking, allowing devices to connect to the Host App and Talos cluster.
+- **Host App**: A local server that runs on all machines and exposes the UI to the network via tsnet as well as reverse-proxies traffic into Kubernetes.
+- **Kubernetes Cluster**: Your existing real-node Kubernetes. Each cluster can have its own Tailnet and router.
+- **Tailscale/Headscale**: Used for secure networking. Each cluster can use a per‑cluster embedded tsnet connector and an in-cluster subnet router.
 - **UI**: A web interface for users to interact with the system, manage clusters, and access code servers.
-- **Image Registry**: A private Docker image registry running within the Talos cluster to store and manage container images.
+- **Image Registry**: A private Docker image registry running within the cluster to store and manage container images.
 
 ## Services
 
@@ -32,14 +32,17 @@ GuildNet is a private self-hostable stack that puts human-in-the-loop with agent
 
 Choose your path:
 
-- Create everything on your machine:
-  1. Headscale → 2) Tailscale router → 3) Talos cluster → 4) Server
-- Join existing pieces (e.g., your team already runs Headscale/Talos):
-  - Connect your Tailscale to their Headscale, ensure routes to the cluster, acquire kubeconfig, then run the Server and open the UI.
+- Default path (Plain K8S with per-cluster Tailnets):
+  1) Headscale up → 2) Per‑cluster Headscale namespace/keys → 3) Deploy in‑cluster Tailscale router → 4) Deploy addons/operator → 5) Run the Host App → 6) Verify
+  - One command: `make setup-all`
+  - Health: `make verify-e2e`
+
+- Join existing pieces (e.g., your team already runs Headscale/Kubernetes):
+  - Connect your Tailscale to their Headscale, ensure routes or deploy the router into the target cluster, acquire kubeconfig, then run the Server and open the UI.
 
 When the Server is running:
 
-- Local UI: https://127.0.0.1:8080
+- Local UI: https://127.0.0.1:8090
 - Tailnet UI (from other devices): https://<ts-hostname-or-ip>:443
 
 Tip: `make help` lists the most useful targets.
@@ -66,18 +69,17 @@ Tear down:
 
 - `make headscale-down`
 
-## 2) Tailscale (router and clients)
+## 2) Tailscale (per‑cluster router and clients)
 
 Goal: connect machines to the Tailnet and ensure routes to the cluster subnets are available.
 
-Create (on the machine that can reach the cluster networks):
+Create (recommended, automated):
 
-- Install and bring up a subnet router that advertises the desired routes (from `.env` `TS_ROUTES`)
-  - `make router-install`
-  - `make router-up`
-  - `make router-status`
-- Approve advertised routes in Headscale (from the machine running Headscale)
-  - `make headscale-approve-routes`
+- Ensure per‑cluster Headscale namespace and keys
+  - `make headscale-namespace CLUSTER=<id>` → writes `tmp/cluster-<id>-headscale.json`
+- Deploy the in‑cluster Tailscale Subnet Router (privileged DaemonSet)
+  - `make router-ensure CLUSTER=<id>`
+- The Make default flow wires these steps for you: `make setup-all`
 
 Join existing (another device):
 
@@ -88,25 +90,20 @@ Join existing (another device):
 
 Notes:
 
-- You can also use `make setup-tailscale` to run the end-to-end router setup (enables IP forwarding, brings Tailscale up, attempts route approval).
+- You can also use `sudo make setup-tailscale` to run the end-to-end router setup (enables IP forwarding, brings Tailscale up, attempts route approval).
 - Route examples commonly include cluster/service/pod CIDRs (e.g., `10.96.0.0/12`, `10.244.0.0/16`) plus any node CIDRs.
 
-## 3) Talos (new cluster or use existing)
+## 3) Kubernetes
 
-Create a Talos dev cluster (scripts orchestrate config, apply, and waiting for API):
+Two simple options to get a cluster for the quickstart:
 
-- `make setup-talos`
-- This writes your kubeconfig to `~/.guildnet/kubeconfig` and waits until the Kubernetes API is reachable.
+- Local cluster (quick, developer):
+  - `make kind-up` — creates a local kind cluster and writes the kubeconfig to `$(GN_KUBECONFIG)`.
 
-Use existing Kubernetes:
+- Full setup (one-command full demo stack):
+  - `make setup-all` — runs the full provisioning flow (Headscale, router, cluster setup, addons, operator, hostapp, verify).
 
-- Ensure you have a valid kubeconfig for the target cluster. Put it at `~/.guildnet/kubeconfig` (default used by Makefile/scripts) or export `KUBECONFIG` accordingly.
-- Ensure your Tailnet has routes to the cluster (via subnet router) if accessing from outside the cluster’s network.
-
-Add-ons (optional, but recommended for the full demo):
-
-- Apply CRDs, install MetalLB, create imagePullSecret, and bring up the example DB
-  - `make deploy-k8s-addons`
+After running either command ensure the kubeconfig is available to the scripts (set `KUBECONFIG` or leave it at `~/.guildnet/kubeconfig`).
 
 ## 4) Server (Host App + UI)
 
@@ -118,7 +115,7 @@ One‑time local setup:
 Run the Server locally:
 
 - `make run`
-- Open https://127.0.0.1:8080
+- Open https://127.0.0.1:8090
 - From other Tailnet devices, open https://<ts-hostname-or-ip>:443
 
 What happens when running:
@@ -139,13 +136,48 @@ TLS note:
   2. Place your kubeconfig at `~/.guildnet/kubeconfig` (or set `KUBECONFIG`).
   3. `make setup` then `make run`, and open the UI.
 
-- If you’re starting fresh on a single machine:
-  1. `make headscale-up && make headscale-bootstrap`
-  2. `make router-install && make router-up && make headscale-approve-routes`
-  3. `make setup-talos`
-  4. `make setup && make run`
+-- If you’re starting fresh on a single machine:
+  - Use the default `make setup-all` which will: start Headscale, create per‑cluster keys, deploy the router DS, install addons/operator, run Host App, and verify.
 
 Either path ends with the same UI, where you can create workspaces and access them from any Tailnet device.
+
+## Developer Quickstart (one-machine)
+
+These steps are the quickest path to get a fully functional local development environment (microk8s or existing kubeconfig). The scripts automate registering the cluster with the Host App and attaching the kubeconfig so the UI can control Workspaces without manual DB edits.
+
+1) Prepare (ensure tools installed): docker, kubectl, microk8s (or kind), jq, curl, python3
+2) Provision or point to a cluster and run the verify flow:
+
+```bash
+# create or use existing kubeconfig; the script will try microk8s/minikube/k3d/kind
+./scripts/verify-cluster.sh
+```
+
+This script will:
+- create or reuse a local cluster (depending on environment and USE_KIND)
+- build and load the operator image into microk8s/kind when needed
+- deploy CRDs, operator, and RethinkDB
+- generate `guildnet.config` and auto-attach the kubeconfig to the Host App
+- start the Host App locally (if not already running)
+
+3) Create and verify a workspace via helper:
+
+```bash
+# usage: scripts/verify-workspace.sh <cluster-id> <workspace-name> [image] [password]
+CLUSTER_ID=$(curl -k https://127.0.0.1:8090/api/deploy/clusters | jq -r '.[] | select(.name=="microk8s-local") | .id')
+./scripts/verify-workspace.sh "$CLUSTER_ID" verify-cs-local
+```
+
+If everything succeeded, you'll see the workspace reach Running, code-server logs, and the helper will probe the proxied root through the Host App.
+
+Troubleshooting notes:
+- If Host App returns empty lists for per-cluster endpoints, ensure `guildnet.config` was created and that the script attached the kubeconfig. You can attach manually:
+
+```bash
+curl -k -X POST "https://127.0.0.1:8090/api/deploy/clusters/<id>?action=attach-kubeconfig" -H 'Content-Type: application/json' -d '{"kubeconfig":"<base kubeconfig content here>"}'
+```
+
+- If `curl` fails with TLS read errors when probing the proxy, try --http1.1 or use a browser; the Host App terminates TLS locally and proxying large streaming responses can sometimes trigger client-side TLS library quirks in curl.
 
 ## Troubleshooting (quick)
 
@@ -160,7 +192,9 @@ Either path ends with the same UI, where you can create workspaces and access th
 ## Useful commands
 
 - `make help` – show available targets
-- `make verify-e2e` – end-to-end checks for router, Talos reachability, kube API, DB
+- `make headscale-namespace` – create per‑cluster Headscale namespace and emit keys JSON
+- `make router-ensure` – deploy per‑cluster Tailscale router DS (reads the keys JSON)
+- `make verify-e2e` – end-to-end checks: headscale reachability, router DS readiness, kube API
 - `make clean` – remove build artifacts
 - `make stop-all` – delete managed workloads via the Server API
 
@@ -180,14 +214,14 @@ Prototype – license to be defined.
 # Progress
 
 - [x] Join/create Headscale/Tailscale network
-- [x] Create Talos cluster running Tailscale Tailnet
-- [x] Build & run code-server image inside Talos cluster
+ 
+ 
 - [x] Create dashboard server to run scripts and report status
 - [x] Create UI for dashboard server to join/create network, manage clusters and observe code servers
 - [ ] Ensure multi-user support with orgs/clusters
 - [ ] Automatic TLS certs for tailnet access
 - [ ] Fully generic and configurable docker deploys via subdomain on tailnet
-- [ ] Docker image registry inside Talos cluster
+ 
 - [ ] Run Ollama on host machine and OpenAI Codex inside code servers, opening terminal to interact with agent via web UI
 - [ ] Event bus for agent-host communication (e.g. notify users of PR created, code pushed, etc) with web UI
 - [ ] Add persistent storage to cluster via Longhorn, save code server data there

@@ -9,7 +9,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -811,9 +810,8 @@ func (a *DBAPI) handleChangefeed(w http.ResponseWriter, r *http.Request) {
 }
 
 // Helper to start DBAPI after manager creation.
-func InitAndRegisterDB(mux *http.ServeMux, mgr *db.Manager) {
-	org := strings.TrimSpace(os.Getenv("ORG_ID"))
-	if org == "" {
+func InitAndRegisterDB(mux *http.ServeMux, mgr *db.Manager, org string) {
+	if strings.TrimSpace(org) == "" {
 		org = "default"
 	}
 	// Important: do NOT wrap a nil *db.Manager into the DBManager interface, as that

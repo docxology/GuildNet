@@ -58,6 +58,11 @@ func JSONError(w http.ResponseWriter, httpStatus int, msg string, errCodeAndDeta
 	if details != nil {
 		payload.Details = details
 	}
+	// Log the structured error server-side for easier debugging in CI and scripts.
+	// This does not expose secrets but gives operators visibility into the error shape.
+	if logger := Logger(); logger != nil {
+		logger.Printf("httpx.JSONError code=%d errcode=%s msg=%s details=%v request_id=%s", httpStatus, payload.Code, payload.Message, payload.Details, payload.Request)
+	}
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
@@ -162,7 +167,7 @@ func genID() string {
 	return hex.EncodeToString(b[:])
 }
 
-// CORS middleware allowing a specific frontend origin (e.g., https://localhost:5173).
+// CORS middleware allowing a specific frontend origin (e.g., https://127.0.0.1:8090 in dev).
 // Preflights (OPTIONS) are short-circuited with 204.
 func CORS(allowedOrigin string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {

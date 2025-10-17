@@ -1,0 +1,40 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: workspace-isolation
+  namespace: default
+spec:
+  podSelector:
+    matchExpressions:
+      - key: guildnet.io/workspace
+        operator: Exists
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+      - podSelector:
+          matchExpressions:
+            - key: guildnet.io/workspace
+              operator: Exists
+      - namespaceSelector: {}
+      - podSelector:
+          matchLabels:
+            app: rethinkdb
+      - podSelector:
+          matchLabels:
+            app: workspace-operator
+      - ipBlock:
+          cidr: 127.0.0.1/32
+  egress:
+    - to:
+      - podSelector:
+          matchLabels:
+            app: rethinkdb
+      - podSelector:
+          matchExpressions:
+            - key: guildnet.io/workspace
+              operator: Exists
+      - namespaceSelector: {}
+      - ipBlock:
+          cidr: 0.0.0.0/0

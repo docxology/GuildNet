@@ -28,7 +28,7 @@ TS_LOGIN_SERVER=${login}
 TS_AUTHKEY=${auth}
 TS_HOSTNAME=${host}
 ROUTER_HOSTNAME=${ROUTER_HOSTNAME:-$router_host}
-# Default routes for Talos cluster and services
+# Default routes for k8s cluster and services
 TS_ROUTES=${TS_ROUTES:-10.0.0.0/24,10.96.0.0/12,10.244.0.0/16}
 # Optional Headscale aliases
 HEADSCALE_URL=${HEADSCALE_URL:-}
@@ -48,8 +48,7 @@ APPLY_RETRIES=${APPLY_RETRIES:-10}
 APPLY_RETRY_DELAY=${APPLY_RETRY_DELAY:-5}
 KUBE_READY_TRIES=${KUBE_READY_TRIES:-90}
 KUBE_READY_DELAY=${KUBE_READY_DELAY:-5}
-# DB setup toggle
-DB_SETUP=${DB_SETUP:-1}
+# RethinkDB (cluster-only) configuration
 RETHINKDB_SERVICE_NAME=${RETHINKDB_SERVICE_NAME:-rethinkdb}
 RETHINKDB_NAMESPACE=${RETHINKDB_NAMESPACE:-}
 ENV

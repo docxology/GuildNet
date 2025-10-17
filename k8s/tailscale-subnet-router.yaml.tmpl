@@ -46,7 +46,7 @@ spec:
           set -e
           /usr/sbin/tailscaled --state=/var/lib/tailscale/tailscaled.state &
           sleep 2
-          HOSTNAME_ARG="--hostname=${TS_HOSTNAME:-talos-subnet-router-$(hostname)}"
+          HOSTNAME_ARG="--hostname=${TS_HOSTNAME:-subnet-router-$(hostname)}"
           tailscale up --authkey="${TS_AUTHKEY}" --login-server="${TS_LOGIN_SERVER}" --advertise-routes="${TS_ROUTES}" $HOSTNAME_ARG --accept-routes
           tail -f /dev/null
       volumes:

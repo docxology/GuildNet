@@ -9,10 +9,12 @@ import (
 // Provides atomic counters per org/table/operation and gauge for active changefeed subscribers.
 
 type key struct{ org, table, op string }
+type keyC struct{ cluster, org, table, op string }
 
 var (
 	opCounts          syncMap[key, uint64]
 	activeChangefeeds atomic.Int64
+	opCountsC         syncMap[keyC, uint64]
 )
 
 // syncMap is a tiny generic wrapper using atomic.Value for copy-on-write maps.
@@ -31,17 +33,29 @@ func IncOp(org, table, op string, delta uint64) {
 	if delta == 0 {
 		delta = 1
 	}
-	for {
-		cur := opCounts.load()
-		next := make(map[key]uint64, len(cur)+1)
-		for k, v := range cur {
-			next[k] = v
-		}
-		k := key{org: org, table: table, op: op}
-		next[k] = next[k] + delta
-		opCounts.swap(next)
-		return
+	cur := opCounts.load()
+	next := make(map[key]uint64, len(cur)+1)
+	for k, v := range cur {
+		next[k] = v
 	}
+	k := key{org: org, table: table, op: op}
+	next[k] = next[k] + delta
+	opCounts.swap(next)
+}
+
+// IncOpCluster increments an operation counter labeled with cluster_id.
+func IncOpCluster(clusterID, org, table, op string, delta uint64) {
+	if delta == 0 {
+		delta = 1
+	}
+	cur := opCountsC.load()
+	next := make(map[keyC]uint64, len(cur)+1)
+	for k, v := range cur {
+		next[k] = v
+	}
+	k := keyC{cluster: clusterID, org: org, table: table, op: op}
+	next[k] = next[k] + delta
+	opCountsC.swap(next)
 }
 
 // ChangefeedInc increments active changefeed gauge.
@@ -62,6 +76,11 @@ func Export() Snapshot {
 	flat := make(map[string]uint64, len(cur))
 	for k, v := range cur {
 		flat[k.org+"/"+k.table+"/"+k.op] = v
+	}
+	// Merge per-cluster ops with a prefix
+	curC := opCountsC.load()
+	for k, v := range curC {
+		flat["cluster/"+k.cluster+"/"+k.org+"/"+k.table+"/"+k.op] = v
 	}
 	return Snapshot{Timestamp: time.Now(), Ops: flat, Changefeeds: activeChangefeeds.Load()}
 }
