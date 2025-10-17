@@ -377,3 +377,25 @@ export async function getClusterWorkspaceLogs(
     return []
   }
 }
+
+// Published services APIs
+export type PublishedService = { cluster_id: string; service: string; addr: string; added_at: string }
+
+export async function listPublishedServices(clusterId: string): Promise<PublishedService[]> {
+  try {
+    const res = await fetch(apiUrl(`/api/cluster/${encodeURIComponent(clusterId)}/published-services`))
+    if (!res.ok) return []
+    return (await res.json()) as PublishedService[]
+  } catch {
+    return []
+  }
+}
+
+export async function deletePublishedService(clusterId: string, service: string): Promise<boolean> {
+  try {
+    const res = await fetch(apiUrl(`/api/cluster/${encodeURIComponent(clusterId)}/published-services/${encodeURIComponent(service)}`), { method: 'DELETE' })
+    return res.ok
+  } catch {
+    return false
+  }
+}

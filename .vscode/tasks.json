@@ -112,5 +112,20 @@
       "command": "make agent-build",
       "group": "build"
     }
+    ,
+    {
+      "label": "Run server and tail logs",
+      "type": "shell",
+      "command": "bash -lc './scripts/stop-hostapp.sh || true; sudo rm -f /tmp/hostapp.log || true; sudo touch /tmp/hostapp.log; sudo chown \"$(id -u):$(id -g)\" /tmp/hostapp.log; nohup ./scripts/run-hostapp.sh > /tmp/hostapp.log 2>&1 & sleep 1; ps aux | grep hostapp | grep -v grep || true; tail -n +1 -F /tmp/hostapp.log'",
+      "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": true,
+        "panel": "shared",
+        "showReuseMessage": true,
+        "clear": false
+      },
+      "problemMatcher": []
+    }
   ]
 }

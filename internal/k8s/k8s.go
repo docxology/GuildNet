@@ -32,7 +32,7 @@ func kubeconfigDefault() string {
 	if v := os.Getenv("KUBECONFIG"); v != "" {
 		return v
 	}
-	// Fallback to default kubeconfig
+	// Fallback: use the user's standard kubeconfig (~/.kube/config)
 	if h, err := os.UserHomeDir(); err == nil {
 		return filepath.Join(h, ".kube", "config")
 	}

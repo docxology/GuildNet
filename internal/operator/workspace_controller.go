@@ -112,6 +112,20 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		RunAsNonRoot:             defTrue,
 		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 	}
+	// Special-case: nginx images historically required running as root to bind
+	// to port 80. Prefer using the unprivileged nginx image variant which runs
+	// as uid 101 (nginx) and avoids granting root capabilities. For nginx
+	// images, set conservative non-root defaults here; later we will switch
+	// the image to the unprivileged variant and set pod-level non-root
+	// PodSecurityContext to ensure the container runs as uid/gid 101.
+	if strings.Contains(imgLower, "nginx") {
+		// conservative container-level security context: require non-root
+		secCtx = &corev1.SecurityContext{
+			AllowPrivilegeEscalation: defFalse,
+			RunAsNonRoot:             defTrue,
+			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+		}
+	}
 	// Relax for code-server to allow SUID fixuid to run (no_new_privs must be disabled)
 	if strings.Contains(imgLower, "codercom/code-server") || strings.Contains(imgLower, "code-server") {
 		secCtx = &corev1.SecurityContext{
@@ -121,41 +135,312 @@ func (r *WorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 	}
 
-	// Reconcile Deployment via CreateOrUpdate (handles conflicts) with retry on conflict
-	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: depName, Namespace: ws.Namespace}}
-	if err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		// Use fresh object each try
-		dep.ObjectMeta = metav1.ObjectMeta{Name: depName, Namespace: ws.Namespace}
-		_, err := controllerutil.CreateOrUpdate(ctx, r.Client, dep, func() error {
-			dep.Labels = map[string]string{"guildnet.io/workspace": ws.Name}
-			replicas := int32(1)
-			dep.Spec.Replicas = &replicas
-			dep.Spec.Selector = &metav1.LabelSelector{MatchLabels: map[string]string{"guildnet.io/workspace": ws.Name}}
-			dep.Spec.Template.ObjectMeta.Labels = map[string]string{"guildnet.io/workspace": ws.Name}
-			dep.Spec.Template.Spec.Containers = []corev1.Container{{
-				Name:            "workspace",
-				Image:           ws.Spec.Image,
-				Env:             env,
-				Command:         command,
-				Args:            args,
-				Ports:           ports,
-				SecurityContext: secCtx,
-				ReadinessProbe:  readiness,
-				LivenessProbe:   liveness,
-			}}
-			dep.Spec.Template.Spec.SecurityContext = &corev1.PodSecurityContext{
-				RunAsUser:      func() *int64 { v := int64(1000); return &v }(),
-				RunAsGroup:     func() *int64 { v := int64(1000); return &v }(),
-				FSGroup:        func() *int64 { v := int64(1000); return &v }(),
-				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
-			}
-			dep.Spec.Template.Spec.Tolerations = []corev1.Toleration{{Key: "node-role.kubernetes.io/control-plane", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule}}
-			return controllerutil.SetControllerReference(ws, dep, r.Scheme)
-		})
-		return err
-	}); err != nil {
-		logger.Error(err, "reconcile deployment failed")
+	// Reconcile Deployment via server-side apply so the operator can take
+	// field ownership of podTemplate fields (initContainers, securityContext,
+	// volumes). This avoids strategic-merge surprises from other actors.
+	// For server-side apply the object must have its TypeMeta (APIVersion/Kind)
+	// populated so the API server can interpret the apply request. Set it
+	// explicitly here to avoid runtime errors when using client.Apply.
+	desired := &appsv1.Deployment{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
+		ObjectMeta: metav1.ObjectMeta{Namespace: ws.Namespace, Name: depName},
+	}
+
+	// Build PodTemplateSpec (same as before)
+	init := corev1.Container{
+		Name:            "workspace-init",
+		Image:           "busybox:1.35.0",
+		Command:         []string{"sh", "-c", "chown -R 101:101 /var/cache/nginx || true; ls -ld /var/cache/nginx || true"},
+		SecurityContext: &corev1.SecurityContext{RunAsUser: func() *int64 { v := int64(0); return &v }()},
+		VolumeMounts:    []corev1.VolumeMount{{Name: "nginx-cache", MountPath: "/var/cache/nginx"}},
+	}
+
+	workspaceContainer := corev1.Container{
+		Name:            "workspace",
+		Image:           ws.Spec.Image,
+		Env:             env,
+		Command:         command,
+		Args:            args,
+		Ports:           ports,
+		SecurityContext: secCtx,
+		ReadinessProbe:  readiness,
+		LivenessProbe:   liveness,
+		VolumeMounts:    []corev1.VolumeMount{{Name: "nginx-cache", MountPath: "/var/cache/nginx"}},
+	}
+
+	podSpec := corev1.PodSpec{
+		Containers:     []corev1.Container{workspaceContainer},
+		InitContainers: []corev1.Container{init},
+		Volumes:        []corev1.Volume{{Name: "nginx-cache", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}},
+		Tolerations:    []corev1.Toleration{{Key: "node-role.kubernetes.io/control-plane", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule}},
+	}
+	if strings.Contains(imgLower, "nginx") {
+		// Use non-root pod-level securityContext for the unprivileged nginx
+		// image so the container runs as uid/gid 101 and can use the
+		// initContainer-chown pattern safely.
+		podSpec.SecurityContext = &corev1.PodSecurityContext{
+			RunAsUser:      func() *int64 { v := int64(101); return &v }(),
+			RunAsGroup:     func() *int64 { v := int64(101); return &v }(),
+			FSGroup:        func() *int64 { v := int64(101); return &v }(),
+			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+		}
+		// If the workspace image looked like nginx, prefer the unprivileged
+		// variant unless the user already explicitly set an unprivileged
+		// image. We will override the container image below when constructing
+		// the pod template.
+	} else {
+		podSpec.SecurityContext = &corev1.PodSecurityContext{
+			RunAsUser:      func() *int64 { v := int64(1000); return &v }(),
+			RunAsGroup:     func() *int64 { v := int64(1000); return &v }(),
+			FSGroup:        func() *int64 { v := int64(1000); return &v }(),
+			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+		}
+	}
+
+	// If the original image looked like nginx, prefer the unprivileged
+	// nginx image so the pod can run without granting additional
+	// capabilities. If the user already provided a custom image that
+	// contains "unprivileged" we leave it alone.
+	if strings.Contains(imgLower, "nginx") {
+		if !strings.Contains(strings.ToLower(ws.Spec.Image), "unprivileged") {
+			workspaceContainer.Image = "nginxinc/nginx-unprivileged:1.25"
+		}
+		// Ensure the container-level securityContext does not force running
+		// as root; the pod-level PodSecurityContext above will enforce uid/gid.
+		workspaceContainer.SecurityContext = nil
+	}
+
+	podTemplate := corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"guildnet.io/workspace": ws.Name}}, Spec: podSpec}
+
+	replicas := int32(1)
+	desired.Labels = map[string]string{"guildnet.io/workspace": ws.Name}
+	desired.Spec = appsv1.DeploymentSpec{
+		Replicas: &replicas,
+		Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"guildnet.io/workspace": ws.Name}},
+		Template: podTemplate,
+		Strategy: appsv1.DeploymentStrategy{Type: appsv1.RollingUpdateDeploymentStrategyType, RollingUpdate: &appsv1.RollingUpdateDeployment{MaxSurge: func() *intstr.IntOrString { v := intstr.FromString("25%"); return &v }(), MaxUnavailable: func() *intstr.IntOrString { v := intstr.FromString("25%"); return &v }()}},
+	}
+
+	// NOTE: Do NOT set the owner reference on the desired object before
+	// performing a server-side apply. If the owner (the Workspace) does not
+	// have fully-populated TypeMeta fields when we embed it, the API server
+	// can reject the apply. Instead we will set the controller reference on
+	// the live Deployment after the apply succeeds (below).
+
+	// NOTE: Some clusters exhibit issues with server-side apply (for example
+	// rejecting apply payloads with "invalid object type" errors). To keep
+	// the operator functional across a range of clusters, use a conservative
+	// Get/Create/Update flow here. This loses server-side apply field ownership
+	// semantics but reliably ensures the Deployment matches the desired spec.
+	// We still perform post-update verification below and a delete+create
+	// fallback if necessary.
+	if cerr := controllerutil.SetControllerReference(ws, desired, r.Scheme); cerr != nil {
+		logger.Error(cerr, "failed to set controller reference on desired deployment before ensure")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	existing := &appsv1.Deployment{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: ws.Namespace, Name: depName}, existing); err != nil {
+		if apierrors.IsNotFound(err) {
+			if cerr := r.Create(ctx, desired); cerr != nil {
+				logger.Error(cerr, "failed to create deployment", "deployment", depName)
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+		} else {
+			logger.Error(err, "failed to get deployment")
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+	} else {
+		// Update only the spec portion we manage. This avoids clobbering other
+		// fields that other controllers may legitimately manage.
+		existing.Spec = desired.Spec
+		if uerr := r.Update(ctx, existing); uerr != nil {
+			logger.Error(uerr, "failed to update deployment", "deployment", depName)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+	}
+
+	// Refresh live Deployment into dep for status reporting below
+	dep := &appsv1.Deployment{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: ws.Namespace, Name: depName}, dep); err != nil {
+		logger.Error(err, "failed to get deployment after apply")
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	// Ensure the live Deployment has an owner reference pointing to the
+	// Workspace so Kubernetes garbage-collects it when the Workspace is
+	// removed. Do this after the server-side apply to avoid embedding the
+	// Workspace object into the apply payload (which can fail if TypeMeta is
+	// missing on the owner). Update with retry on conflict.
+	if err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		// Reload current deployment before mutating
+		cur := &appsv1.Deployment{}
+		if err := r.Get(ctx, client.ObjectKey{Namespace: ws.Namespace, Name: depName}, cur); err != nil {
+			return err
+		}
+		if err := controllerutil.SetControllerReference(ws, cur, r.Scheme); err != nil {
+			return err
+		}
+		return r.Update(ctx, cur)
+	}); err != nil {
+		logger.Error(err, "failed to set controller reference on deployment after apply")
+		// Not a hard failure for reconciliation; continue to verification below.
+	}
+
+	// After apply, the API server may still drop or mutate certain fields
+	// (initContainers, pod-level securityContext, container image/securityContext)
+	// due to merge semantics or prior field managers. Verify concretely that the
+	// live Deployment matches the desired pod template and re-apply a few
+	// times; if that fails, fall back to deleting and recreating the Deployment
+	// so the operator becomes the authoritative owner of the podTemplate.
+	var finalErr error
+	// capture desired pieces for comparison
+	desiredPodSC := podSpec.SecurityContext
+	desiredContainerImage := workspaceContainer.Image
+
+	cmpInt64 := func(a, b *int64) bool {
+		if a == nil && b == nil {
+			return true
+		}
+		if a == nil || b == nil {
+			return false
+		}
+		return *a == *b
+	}
+
+	for attempt := 0; attempt < 5; attempt++ {
+		postDep := &appsv1.Deployment{}
+		if err := r.Get(ctx, client.ObjectKey{Namespace: ws.Namespace, Name: depName}, postDep); err != nil {
+			finalErr = err
+			logger.Error(err, "failed to get deployment while verifying post-apply state", "attempt", attempt)
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+
+		needFix := false
+
+		// If init container got dropped, request re-apply
+		if len(postDep.Spec.Template.Spec.InitContainers) == 0 {
+			logger.Info("initContainers missing after apply; will retry apply", "workspace", ws.Name, "attempt", attempt)
+			needFix = true
+		}
+
+		// Verify pod-level securityContext matches the desired values (presence
+		// and numeric uid/gid/fsGroup). For nginx we expect non-root 101; for
+		// others we expect the conservative non-root 1000 configured above.
+		liveSC := postDep.Spec.Template.Spec.SecurityContext
+		if desiredPodSC == nil {
+			if liveSC != nil {
+				logger.Info("unexpected pod-level securityContext present; will retry apply/clear", "workspace", ws.Name, "attempt", attempt)
+				needFix = true
+			}
+		} else {
+			if liveSC == nil {
+				logger.Info("pod-level securityContext missing after apply; will retry apply", "workspace", ws.Name, "attempt", attempt)
+				needFix = true
+			} else {
+				if !cmpInt64(desiredPodSC.RunAsUser, liveSC.RunAsUser) || !cmpInt64(desiredPodSC.RunAsGroup, liveSC.RunAsGroup) || !cmpInt64(desiredPodSC.FSGroup, liveSC.FSGroup) {
+					logger.Info("pod-level securityContext mismatch; will retry apply", "workspace", ws.Name, "attempt", attempt, "desired", desiredPodSC, "live", liveSC)
+					needFix = true
+				}
+			}
+		}
+
+		// Verify the workspace container image and container-level securityContext
+		// match the desired values.
+		foundWorkspace := false
+		for _, c := range postDep.Spec.Template.Spec.Containers {
+			if c.Name == "workspace" {
+				foundWorkspace = true
+				if c.Image != desiredContainerImage {
+					logger.Info("workspace container image mismatch; will retry apply", "workspace", ws.Name, "attempt", attempt, "desired", desiredContainerImage, "live", c.Image)
+					needFix = true
+				}
+				// For nginx images we intentionally clear the container-level
+				// securityContext and rely on the pod-level context; for other
+				// images we expect a container-level securityContext to be set.
+				if strings.Contains(imgLower, "nginx") {
+					if c.SecurityContext != nil {
+						logger.Info("workspace container securityContext present for nginx image; will retry apply/clear", "workspace", ws.Name, "attempt", attempt)
+						needFix = true
+					}
+				} else {
+					if c.SecurityContext == nil {
+						logger.Info("workspace container securityContext missing for non-nginx image; will retry apply", "workspace", ws.Name, "attempt", attempt)
+						needFix = true
+					}
+				}
+				break
+			}
+		}
+		if !foundWorkspace {
+			logger.Info("workspace container not found in live deployment; will retry apply", "workspace", ws.Name, "attempt", attempt)
+			needFix = true
+		}
+
+		if !needFix {
+			finalErr = nil
+			break
+		}
+
+		// Re-apply by performing a targeted Get/Update: copy the desired
+		// spec into the live Deployment and update. This avoids server-side
+		// apply which some API servers in this environment reject.
+		if perr := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+			cur := &appsv1.Deployment{}
+			if err := r.Get(ctx, client.ObjectKey{Namespace: ws.Namespace, Name: depName}, cur); err != nil {
+				return err
+			}
+			cur.Spec = desired.Spec
+			return r.Update(ctx, cur)
+		}); perr != nil {
+			logger.Error(perr, "re-apply update failed", "attempt", attempt)
+			finalErr = perr
+		}
+
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// If after retries we still don't control the podTemplate fields, do a
+	// delete+create to ensure the operator is authoritative for the
+	// Deployment's pod template. This is more aggressive but guarantees we
+	// can enforce initContainers and securityContext as required.
+	if finalErr != nil {
+		logger.Info("post-apply verification failed; recreating Deployment to ensure operator ownership", "deployment", depName)
+
+		// Attempt to delete the existing Deployment (foreground) and then
+		// create the desired Deployment from scratch.
+		delObj := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: ws.Namespace, Name: depName}}
+		if derr := r.Delete(ctx, delObj, client.PropagationPolicy(metav1.DeletePropagationForeground)); derr != nil {
+			if !apierrors.IsNotFound(derr) {
+				logger.Error(derr, "failed to delete deployment during recreate fallback", "deployment", depName)
+			}
+		} else {
+			// Wait for deletion to complete (best-effort small backoff)
+			for i := 0; i < 20; i++ {
+				time.Sleep(200 * time.Millisecond)
+				chk := &appsv1.Deployment{}
+				if err := r.Get(ctx, client.ObjectKey{Namespace: ws.Namespace, Name: depName}, chk); apierrors.IsNotFound(err) {
+					break
+				}
+			}
+		}
+
+		// Create desired Deployment anew
+		// Ensure controller reference is set again
+		if err := controllerutil.SetControllerReference(ws, desired, r.Scheme); err != nil {
+			logger.Error(err, "failed to set controller reference on desired deployment before recreate")
+		} else {
+			if cerr := r.Create(ctx, desired); cerr != nil {
+				if !apierrors.IsAlreadyExists(cerr) {
+					logger.Error(cerr, "failed to create deployment during recreate fallback", "deployment", depName)
+				} else {
+					logger.Info("deployment already exists after delete; skipping create", "deployment", depName)
+				}
+			} else {
+				logger.Info("recreated deployment to enforce operator ownership", "deployment", depName)
+			}
+		}
 	}
 
 	// Use cached operator-level default which is kept in memory by a watch.

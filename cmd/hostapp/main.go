@@ -3,17 +3,13 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"log"
-	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -124,54 +120,13 @@ func startOperator(ctx context.Context, restCfg *rest.Config) error {
 
 // ensureSelfSigned creates a minimal self-signed certificate if not present.
 func ensureSelfSigned(dir, certPath, keyPath string) error {
+	// Production mode: do not generate self-signed certificates. Require valid cert and key to exist.
 	if _, err := os.Stat(certPath); err == nil {
 		if _, err2 := os.Stat(keyPath); err2 == nil {
 			return nil
 		}
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	// build a tiny self-signed cert
-	// NOTE: This is for development only.
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return err
-	}
-	tmpl := x509.Certificate{
-		SerialNumber:          big.NewInt(time.Now().UnixNano()),
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-		DNSNames:              []string{"localhost"},
-	}
-	// Add 127.0.0.1 to IP SANs for dev UX
-	if ip := net.ParseIP("127.0.0.1"); ip != nil {
-		tmpl.IPAddresses = append(tmpl.IPAddresses, ip)
-	}
-	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
-	if err != nil {
-		return err
-	}
-	cf, err := os.Create(certPath)
-	if err != nil {
-		return err
-	}
-	defer cf.Close()
-	if err := pem.Encode(cf, &pem.Block{Type: "CERTIFICATE", Bytes: der}); err != nil {
-		return err
-	}
-	kf, err := os.Create(keyPath)
-	if err != nil {
-		return err
-	}
-	defer kf.Close()
-	if err := pem.Encode(kf, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)}); err != nil {
-		return err
-	}
-	return nil
+	return fmt.Errorf("tls cert or key not found: %s and %s; place valid certs in ./certs/ or %s", certPath, keyPath, dir)
 }
 
 // dns1123Name converts an arbitrary string into a DNS-1123 compliant name:
@@ -425,6 +380,13 @@ func main() {
 	// Ensure core health endpoint is reachable
 	mux.Handle("/api/health", apiMux)
 
+	// Best-effort: restore persisted published mappings in background
+	go func() {
+		if err := api.RestorePublishedMappings(context.Background(), deps); err != nil {
+			log.Printf("api: restore published mappings failed: %v", err)
+		}
+	}()
+
 	// health check
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -528,17 +490,20 @@ func main() {
 		}
 		pfMgr = k8s.NewPortForwardManager(kcli.Rest, "default")
 	}
+	// Debug: log resolved API host for visibility
+	if kcli != nil && kcli.Rest != nil {
+		log.Printf("k8s: REST host resolved to %s", kcli.Rest.Host)
+	}
 	if kcli != nil && kcli.Rest != nil {
 		log.Printf("Workspace CRD mode active (legacy paths removed)")
 	} else {
 		log.Printf("Kubernetes not available; CRD/operator features disabled")
 	}
 
-	// Start operator (controller-runtime) in-process so status of Workspaces is managed.
+	// Start operator (controller-runtime) in-process only when explicitly enabled.
+	// Production default: embedded operator is disabled. Enable via GN_EMBED_OPERATOR=1 environment variable.
 	if kcli != nil && kcli.Rest != nil {
-		var g settings.Global
-		_ = setMgr.GetGlobal(&g)
-		if g.EmbedOperator {
+		if strings.TrimSpace(os.Getenv("GN_EMBED_OPERATOR")) == "1" {
 			go func() {
 				if err := startOperator(ctx, kcli.Rest); err != nil {
 					log.Printf("operator start failed: %v", err)

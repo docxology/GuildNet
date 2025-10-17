@@ -5,8 +5,9 @@ set -euo pipefail
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 BIN="${ROOT_DIR}/bin/hostapp"
 
-# Prefer GuildNet kubeconfig for hostapp if present
-if [ -f "$HOME/.guildnet/kubeconfig" ]; then
+# Do not auto-prefer per-repo kubeconfig in production mode.
+# For compatibility, set GN_USE_GUILDNET_KUBECONFIG=1 to preserve previous behavior.
+if [ "${GN_USE_GUILDNET_KUBECONFIG:-0}" = "1" ] && [ -f "$HOME/.guildnet/kubeconfig" ]; then
   export KUBECONFIG="${KUBECONFIG:-$HOME/.guildnet/kubeconfig}"
 fi
 

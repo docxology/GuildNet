@@ -48,10 +48,25 @@ setup-tailscale: ## Setup Tailscale router (enable forwarding, up, approve route
 	bash ./scripts/setup-tailscale.sh
 
 setup-all: ## One-command: Headscale up -> LAN sync -> ensure Kubernetes (kind) -> Headscale namespace -> router DS -> addons -> operator -> hostapp -> verify
-	@bash ./scripts/deploy-all.sh
-
-deploy-all: ## Run the cross-machine idempotent deploy wrapper (scripts/deploy-all.sh)
-	@bash ./scripts/deploy-all.sh
+	@CL=$${CLUSTER:-$${GN_CLUSTER_NAME:-default}}; \
+	echo "[setup-all] Using cluster: $$CL"; \
+	$(MAKE) headscale-up; \
+	$(MAKE) env-sync-lan; \
+	# Ensure Kubernetes is reachable; if not, bring up a local kind cluster and export kubeconfig
+	ok=1; kubectl --request-timeout=3s get --raw=/readyz >/dev/null 2>&1 || ok=0; \
+	if [ $$ok -eq 0 ]; then \
+		if [ "$${USE_KIND:-0}" = "1" ]; then \
+			$(MAKE) kind-up; \
+		else \
+			echo "Kubernetes API not reachable and USE_KIND!=1; please configure KUBECONFIG or set USE_KIND=1 to auto-create a kind cluster"; exit 2; \
+		fi; \
+	fi; \
+	CLUSTER=$$CL $(MAKE) headscale-namespace; \
+	CLUSTER=$$CL $(MAKE) router-ensure || true; \
+	$(MAKE) deploy-k8s-addons || true; \
+	$(MAKE) deploy-operator || true; \
+	$(MAKE) deploy-hostapp || true; \
+	$(MAKE) verify-e2e || true
 
 # ---------- Build ----------
 build: build-backend build-ui ## Build backend and UI
@@ -213,7 +228,7 @@ deploy-operator: ## Deploy operator (build+load image into kind if USE_KIND=1, t
 	fi
 	bash ./scripts/deploy-operator.sh
 
-deploy-hostapp: ## Run hostapp locally
+deploy-hostapp: ## Run hostapp locally (or deploy in cluster if configured)
 	$(MAKE) run
 
 verify-e2e: ## Verify router, routes, kube API, DB

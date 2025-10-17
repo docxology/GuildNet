@@ -139,6 +139,19 @@ func (c *Connector) DialContext(ctx context.Context, network, addr string) (net.
 	return s.Dial(ctx, network, addr)
 }
 
+// Listen exposes a listener on the underlying tsnet.Server so callers can publish
+// services into the tailscale/Tailnet. The addr parameter supports formats like
+// ":8080" for an ephemeral host port. This is a convenience wrapper.
+func (c *Connector) Listen(network, addr string) (net.Listener, error) {
+	c.mu.RLock()
+	s := c.srv
+	c.mu.RUnlock()
+	if s == nil {
+		return nil, errors.New("connector not started")
+	}
+	return s.Listen(network, addr)
+}
+
 // HTTPTransport returns a clone of base (or a new one) that dials via tsnet.
 func (c *Connector) HTTPTransport(base *http.Transport) *http.Transport {
 	t := &http.Transport{}

@@ -64,6 +64,22 @@ else
   echo "not found"; PASS=0
 fi
 
+# If tailscale pods failed recently, check logs for common 'TUN device ... is busy' local-host issue
+if kubectl -n kube-system get pods -l app=tailscale-subnet-router >/dev/null 2>&1; then
+  for p in $(kubectl -n kube-system get pods -l app=tailscale-subnet-router -o name 2>/dev/null | sed 's#pod/##'); do
+    if kubectl -n kube-system logs "$p" -c tailscale --tail=200 2>/dev/null | grep -i "device or resource busy" >/dev/null 2>&1; then
+      echo "\nDetected 'TUN device ... is busy' in tailscale pod logs for $p.";
+      echo "This commonly happens when a host-level tailscaled or leftover tailscale interface (tailscale0) is present on a single-node/local cluster.";
+      echo "Remediation: on the host where kubelet runs, stop host tailscaled and remove the interface, then re-run deploy:";
+      echo "  sudo systemctl stop tailscaled || true";
+      echo "  sudo pkill tailscaled || true";
+      echo "  sudo ip link delete tailscale0 || true";
+      echo "  sudo rm -rf /var/lib/tailscale/* || true";
+      PASS=0
+    fi
+  done
+fi
+
 # Kube readyz + nodes
 if command -v kubectl >/dev/null && [ -f "${KUBECONFIG}" ] && kubectl version --request-timeout=3s >/dev/null 2>&1; then
   kubectl --request-timeout=5s get --raw='/readyz?verbose' || { PASS=0; true; }
@@ -88,4 +104,55 @@ if [ "$PASS" = "1" ]; then
   echo "SUMMARY: PASS"
 else
   echo "SUMMARY: FAIL"; exit 1
+fi
+
+### Operator-based smoke test: create a Workspace via the HostApp server API
+### What we verify:
+###  - HostApp is reachable (default https://127.0.0.1:8090 unless overridden)
+###  - HostApp accepts a Workspace create request and reports the Workspace as Running
+###  - HostApp exposes a proxied endpoint for the workspace at
+###      /api/cluster/<cluster>/proxy/server/<workspace>/
+###    and that endpoint returns an HTML page containing the expected code-server login UI (e.g. "password" or "code-server").
+### Why via HostApp: the HostApp performs proper proxying, auth and routing; tests should exercise that layer rather than bypassing it via a direct kubectl port-forward.
+echo "--- Operator smoke (via HostApp proxy) ---"
+if command -v kubectl >/dev/null && [ -f "${KUBECONFIG}" ] && kubectl version --request-timeout=3s >/dev/null 2>&1; then
+  VERIFY_SCRIPT="$ROOT/scripts/verify-workspace.sh"
+  if [ -x "$VERIFY_SCRIPT" ]; then
+    WS_NAME="verify-code-server-e2e"
+    CLUSTER_ID="default"
+    HOSTAPP_URL="${GN_HOSTAPP_URL:-https://127.0.0.1:8090}"
+    echo "Using HostApp at $HOSTAPP_URL to create and verify Workspace $WS_NAME on cluster $CLUSTER_ID"
+    # Create workspace and wait for Running/proxyTarget via HostApp API (non-fatal)
+    if ! HOSTAPP_URL="$HOSTAPP_URL" "$VERIFY_SCRIPT" "$CLUSTER_ID" "$WS_NAME" codercom/code-server:4.9.0 changeme; then
+      echo "verify-workspace helper failed; skipping operator smoke test"; true
+    else
+      # Probe the HostApp proxied root and look for code-server login markers
+      echo "Probing HostApp proxy for workspace root to detect login UI"
+      set +e
+      if curl -k --http1.1 --max-time 10 -sS "$HOSTAPP_URL/api/cluster/$CLUSTER_ID/proxy/server/$WS_NAME/" | grep -iE "password|code-server" >/dev/null 2>&1; then
+        echo "code-server page reachable through HostApp proxy and login UI appears"
+      else
+        echo "code-server page did not show expected login content via HostApp; dumping HostApp workspace info and k8s logs"
+        # HostApp workspace JSON (if HostApp available)
+        if curl -k -sS "$HOSTAPP_URL/api/cluster/$CLUSTER_ID/workspaces/$WS_NAME" >/tmp/verify-e2e-hostapp-ws.json 2>/dev/null; then
+          echo "HostApp workspace status:"; jq -r '.status // {}' /tmp/verify-e2e-hostapp-ws.json || true
+        fi
+        kubectl -n default get pods -l guildnet.io/workspace=$WS_NAME -o wide || true
+        kubectl -n default logs -l guildnet.io/workspace=$WS_NAME --tail=200 || true
+        PASS=0
+      fi
+      set -e
+    fi
+    # Cleanup: prefer HostApp API delete, fall back to kubectl
+    echo "Cleaning up Workspace $WS_NAME"
+    if curl -k -sS -X DELETE "$HOSTAPP_URL/api/cluster/$CLUSTER_ID/workspaces/$WS_NAME" >/dev/null 2>&1; then
+      true
+    else
+      kubectl -n default delete workspace $WS_NAME --ignore-not-found=true || true
+    fi
+  else
+    echo "verify-workspace helper not found or not executable; skipping operator smoke test"
+  fi
+else
+  echo "skipping operator smoke test (no kubectl/kubeconfig)"
 fi

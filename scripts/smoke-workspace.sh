@@ -11,17 +11,15 @@ NAME=${1:-quick-code-server-ws}
 NAMESPACE=${2:-default}
 IMAGE=${3:-codercom/code-server:4.9.0}
 PORT=${4:-8080}
-PASSWORD=${5:-changeme}
 
 TMP=$(mktemp /tmp/quick-ws-XXXXXX.yaml)
 trap 'rm -f "$TMP"' EXIT
 
 sed -e "s|{{NAME}}|$NAME|g" \
-    -e "s|{{NAMESPACE}}|$NAMESPACE|g" \
-    -e "s|{{IMAGE}}|$IMAGE|g" \
-    -e "s|{{PORT}}|$PORT|g" \
-    -e "s|{{PASSWORD}}|$PASSWORD|g" \
-    "$TEMPLATE" > "$TMP"
+  -e "s|{{NAMESPACE}}|$NAMESPACE|g" \
+  -e "s|{{IMAGE}}|$IMAGE|g" \
+  -e "s|{{PORT}}|$PORT|g" \
+  "$TEMPLATE" > "$TMP"
 
 echo "Applying Workspace from $TMP"
 kubectl apply -f "$TMP"
@@ -38,6 +36,7 @@ echo "kubectl -n $NAMESPACE port-forward svc/$NAME $PORT:$PORT"
 cat <<'EOF'
 Notes:
 - This script creates a Workspace CR and relies on the operator to create the Deployment/Service.
+- The Workspace CR schema does not accept arbitrary env entries; to set runtime secrets (password) prefer using the operator/hostapp UI or a separate Secret mounted by the operator if supported.
 - If the operator fails to reconcile, inspect operator logs and the Workspace resource:
   kubectl -n guildnet-system logs -l app=workspace-operator --tail=200
   kubectl -n $NAMESPACE get workspace $NAME -o yaml
