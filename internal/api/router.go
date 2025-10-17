@@ -835,6 +835,95 @@ func Router(deps Deps) *http.ServeMux {
 				_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 				return
 			}
+
+			if action == "join-config" {
+				// Build a join config JSON similar to scripts/generate_join_config.sh output.
+				out := map[string]any{}
+				out["version"] = 2
+				out["created_at"] = time.Now().UTC().Format(time.RFC3339)
+				out["creator"] = map[string]any{"host": r.Host, "user": ""}
+
+				// Hostapp/ui base URL: prefer X-Forwarded-Proto/Host if present, otherwise infer from request
+				scheme := "http"
+				if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+					scheme = "https"
+				}
+				host := r.Host
+				if host == "" {
+					host = "127.0.0.1:8090"
+				}
+				ui := map[string]any{"vite_api_base": fmt.Sprintf("%s://%s", scheme, host)}
+				out["ui"] = ui
+				out["hostapp"] = map[string]any{"url": fmt.Sprintf("%s://%s", scheme, host)}
+
+				// Include CAPem if available from repo certs/server.crt
+				if data, err := os.ReadFile("certs/server.crt"); err == nil {
+					out["ui"].(map[string]any)["ca_pem"] = string(data)
+					out["hostapp"].(map[string]any)["ca_pem"] = string(data)
+				}
+
+				// Cluster section
+				clusterRec := map[string]any{"name": "", "kubeconfig": "", "notes": ""}
+				if kc, ok := readClusterKubeconfig(deps.DB, deps.Secrets, id); ok {
+					clusterRec["kubeconfig"] = kc
+				}
+				// include per-cluster settings
+				var cs settings.Cluster
+				_ = setMgr.GetCluster(id, &cs)
+				if cs.Name != "" {
+					clusterRec["name"] = cs.Name
+				}
+				if cs.Namespace != "" {
+					clusterRec["namespace"] = cs.Namespace
+				}
+				if cs.APIProxyURL != "" {
+					clusterRec["api_proxy_url"] = cs.APIProxyURL
+				}
+				if cs.APIProxyForceHTTP {
+					clusterRec["api_proxy_force_http"] = true
+				}
+				if cs.DisableAPIProxy {
+					clusterRec["disable_api_proxy"] = true
+				}
+				if cs.PreferPodProxy {
+					clusterRec["prefer_pod_proxy"] = true
+				}
+				if cs.UsePortForward {
+					clusterRec["use_port_forward"] = true
+				}
+				if cs.IngressDomain != "" {
+					clusterRec["ingress_domain"] = cs.IngressDomain
+				}
+				if cs.IngressClassName != "" {
+					clusterRec["ingress_class_name"] = cs.IngressClassName
+				}
+				if cs.WorkspaceTLSSecret != "" {
+					clusterRec["workspace_tls_secret"] = cs.WorkspaceTLSSecret
+				}
+				if cs.CertManagerIssuer != "" {
+					clusterRec["cert_manager_issuer"] = cs.CertManagerIssuer
+				}
+				out["cluster"] = clusterRec
+
+				// Tailscale hints
+				var ts settings.Tailscale
+				_ = setMgr.GetTailscale(&ts)
+				tails := map[string]any{"login_server": ts.LoginServer, "preauth_key": ts.PreauthKey, "hostname": ts.Hostname}
+				// If per-cluster TS client auth key stored in credentials, include it
+				if deps.DB != nil {
+					var cred map[string]any
+					if deps.DB.Get("credentials", fmt.Sprintf("cl:%s:ts_client_auth", id), &cred) == nil {
+						if v, ok := cred["value"].(string); ok && strings.TrimSpace(v) != "" {
+							tails["preauth_key"] = v
+						}
+					}
+				}
+				out["tailscale"] = tails
+
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(out)
+				return
+			}
 			if action == "health" {
 				// Check and report reachability of this cluster
 				kc, ok := readClusterKubeconfig(deps.DB, deps.Secrets, id)

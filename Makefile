@@ -231,6 +231,9 @@ deploy-operator: ## Deploy operator (build+load image into kind if USE_KIND=1, t
 deploy-hostapp: ## Run hostapp locally (or deploy in cluster if configured)
 	$(MAKE) run
 
+generate-join-config: ## Generate join config JSON for the current machine/cluster (uses scripts/generate_join_config.sh)
+	bash ./scripts/generate_join_config.sh --out ${GN_JOIN_OUT:-guildnet.config}
+
 verify-e2e: ## Verify router, routes, kube API, DB
 	bash ./scripts/verify-e2e.sh
 

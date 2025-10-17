@@ -99,7 +99,7 @@ Dev convenience: the router can detect a local `kubectl proxy` and rewrite clust
 
 ### Join/bootstrap flow and cluster management
 
-- `scripts/create_join_info.sh` produces `guildnet.config` join artifacts used by the UI and automation.
+- `scripts/generate_join_config.sh` produces `guildnet.config` join artifacts used by the UI and automation.
 - `POST /bootstrap` persists cluster records and kubeconfigs, then pre-warms clients and RDB connectivity. On failure, state is rolled back to keep the UI consistent.
 
 ### Operator modes and CRDs

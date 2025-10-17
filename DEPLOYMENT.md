@@ -115,7 +115,7 @@ Create a join file or provide kubeconfig and call the Host App bootstrap endpoin
 Generate join artifact (example):
 
 ```bash
-bash scripts/create_join_info.sh --kubeconfig /path/to/kubeconfig --out guildnet.config
+bash scripts/generate_join_config.sh --kubeconfig /path/to/kubeconfig --out guildnet.config
 ```
 
 Attach via API (same flow):

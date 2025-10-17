@@ -7,6 +7,7 @@ import {
   clusterHealth,
   deleteClusterRecord,
   getClusterKubeconfig,
+  getClusterJoinConfig,
   getClusterRecord
 } from '../lib/api'
 import PublishedServices from '../components/PublishedServices'
@@ -78,6 +79,21 @@ export default function Settings() {
     URL.revokeObjectURL(url)
   }
 
+  const downloadJoinConfig = async () => {
+    const data = await getClusterJoinConfig(clusterId())
+    if (!data) {
+      pushToast({ type: 'error', message: 'No join config available' })
+      return
+    }
+    const blob = new Blob([data], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `guildnet.${clusterId()}.config`
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
   const destroyCluster = async () => {
     if (!confirm('Delete this cluster record? This will not touch the actual cluster.')) return
     const ok = await deleteClusterRecord(clusterId())
@@ -131,6 +147,7 @@ export default function Settings() {
                 <div class="flex gap-2">
                   <button class="btn" disabled={busy()} onClick={rotateKubeconfig}>Attach</button>
                   <button class="btn" onClick={downloadKubeconfig}>Download stored</button>
+                  <button class="btn" onClick={downloadJoinConfig}>Download join config</button>
                 </div>
               </div>
 

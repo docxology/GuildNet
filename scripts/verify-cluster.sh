@@ -231,8 +231,8 @@ fi
 
 echolog "Step: generate guildnet.config (join file)"
 JOIN_OUT="$ROOT/guildnet.config"
-if ! bash "$ROOT/scripts/create_join_info.sh" --kubeconfig "$KUBECONFIG_OUT" --name "$CLUSTER_NAME" --out "$JOIN_OUT" 2>&1 | tee -a "$LOGFILE"; then
-  echolog "create_join_info failed"; exit 5
+if ! bash "$ROOT/scripts/generate_join_config.sh" --kubeconfig "$KUBECONFIG_OUT" --name "$CLUSTER_NAME" --out "$JOIN_OUT" 2>&1 | tee -a "$LOGFILE"; then
+  echolog "generate_join_config failed"; exit 5
 fi
 echolog "Join file created: $JOIN_OUT"
 

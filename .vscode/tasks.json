@@ -86,7 +86,7 @@
     {
       "label": "Generate join config (guildnet.config)",
       "type": "shell",
-      "command": "bash scripts/create_join_info.sh --kubeconfig \"${GN_KUBECONFIG:-${KUBECONFIG:-$HOME/.kube/config}}\" --name \"${GN_CLUSTER_NAME:-}\" --hostapp-url \"${GN_HOSTAPP_URL:-https://127.0.0.1:8090}\" --include-ca \"${GN_INCLUDE_CA:-}\" --login-server \"${GN_LOGIN_SERVER:-}\" --auth-key \"${GN_AUTH_KEY:-}\" --hostname \"${GN_HOSTNAME:-$(hostname)}\" --out \"${GN_JOIN_OUT:-guildnet.config}\"",
+      "command": "bash scripts/generate_join_config.sh --out \"${GN_JOIN_OUT:-guildnet.config}\"",
       "group": "build",
       "problemMatcher": []
     },

@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Verify the share-and-join flow in isolation:
 # - Builds the binary
-# - Creates a join config using create_join_info.sh
+# - Creates a join config using generate_join_config.sh
 # - Spawns a temp HOME
 # - Runs join.sh with that config and verifies Host App health
 #
@@ -64,7 +64,7 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 JOIN_CFG="$TMP_DIR/guildnet.config"
 
 # Create the join info
-CMD=("$SCRIPT_DIR/create_join_info.sh" --hostapp-url "$HOSTAPP_URL" --out "$JOIN_CFG")
+CMD=("$SCRIPT_DIR/generate_join_config.sh" --hostapp-url "$HOSTAPP_URL" --out "$JOIN_CFG")
 [ -n "$INCLUDE_CA" ] && CMD+=(--include-ca "$INCLUDE_CA")
 [ -n "$LOGIN_SERVER" ] && CMD+=(--login-server "$LOGIN_SERVER")
 [ -n "$AUTH_KEY" ] && CMD+=(--auth-key "$AUTH_KEY")

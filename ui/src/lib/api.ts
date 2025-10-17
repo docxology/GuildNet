@@ -301,6 +301,16 @@ export async function getClusterKubeconfig(id: string): Promise<string | null> {
   }
 }
 
+export async function getClusterJoinConfig(id: string): Promise<string | null> {
+  try {
+    const res = await fetch(apiUrl(`/api/deploy/clusters/${encodeURIComponent(id)}?action=join-config`), { method: 'POST' })
+    if (!res.ok) return null
+    return await res.text()
+  } catch {
+    return null
+  }
+}
+
 export async function deleteClusterRecord(id: string): Promise<boolean> {
   try {
     const res = await fetch(apiUrl(`/api/deploy/clusters/${encodeURIComponent(id)}`), {

@@ -1,3 +1,1 @@
-- [ ] server holds realtime health ping to all clusters
-  - [ ] server holds realtime health ping to all services in each cluster
-  - [ ] surface health status in UI immediately
+- [ ] consolidate LOCAL_LISTEN and VITE_API_BASE to a single var
