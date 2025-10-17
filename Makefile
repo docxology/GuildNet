@@ -21,7 +21,7 @@ PROVIDER ?= lan
 	agent-build \
 	crd-apply operator-run operator-build db-health \
 	setup-headscale setup-tailscale setup-all \
-	kind-up \
+	# Local disposable cluster helper removed; use microk8s or set KUBECONFIG
 	deploy-k8s-addons deploy-operator deploy-hostapp verify-e2e \
 	diag-router diag-k8s diag-db headscale-approve-routes
 
@@ -47,18 +47,19 @@ setup-headscale: ## Setup Headscale (Docker) and bootstrap preauth
 setup-tailscale: ## Setup Tailscale router (enable forwarding, up, approve routes)
 	bash ./scripts/setup-tailscale.sh
 
-setup-all: ## One-command: Headscale up -> LAN sync -> ensure Kubernetes (kind) -> Headscale namespace -> router DS -> addons -> operator -> hostapp -> verify
+setup-all: ## One-command: Headscale up -> LAN sync -> ensure Kubernetes (microk8s) -> Headscale namespace -> router DS -> addons -> operator -> hostapp -> verify
 	@CL=$${CLUSTER:-$${GN_CLUSTER_NAME:-default}}; \
 	echo "[setup-all] Using cluster: $$CL"; \
 	$(MAKE) headscale-up; \
 	$(MAKE) env-sync-lan; \
-	# Ensure Kubernetes is reachable; if not, bring up a local kind cluster and export kubeconfig
+	# Ensure Kubernetes is reachable; if not, try microk8s setup or fail
 	ok=1; kubectl --request-timeout=3s get --raw=/readyz >/dev/null 2>&1 || ok=0; \
 	if [ $$ok -eq 0 ]; then \
-		if [ "$${USE_KIND:-0}" = "1" ]; then \
-			$(MAKE) kind-up; \
+		# Attempt microk8s setup if helper script exists
+		if [ -x "./scripts/microk8s-setup.sh" ]; then \
+			bash ./scripts/microk8s-setup.sh $(GN_KUBECONFIG) || { echo "microk8s setup failed"; exit 2; }; \
 		else \
-			echo "Kubernetes API not reachable and USE_KIND!=1; please configure KUBECONFIG or set USE_KIND=1 to auto-create a kind cluster"; exit 2; \
+			echo "Kubernetes API not reachable; please configure KUBECONFIG or install microk8s"; exit 2; \
 		fi; \
 	fi; \
 	CLUSTER=$$CL $(MAKE) headscale-namespace; \
@@ -77,17 +78,16 @@ build-backend: ## Build Go backend (bin/hostapp)
 operator-build: ## Build operator manager binary (reuses hostapp for now if integrated later)
 	@echo "(placeholder) operator shares hostapp binary in prototype"
 
-# Build and (optionally) load operator image into kind nodes for local testing
+# Build and (optionally) load operator image into local clusters for local testing
 .PHONY: operator-image-build operator-image-load operator-build-load
 operator-image-build: build-backend ## Build a container image for the operator from bin/hostapp
 	@echo "Building operator image $(OPERATOR_IMAGE) ..."
 	docker build -f scripts/Dockerfile.operator -t $(OPERATOR_IMAGE) .
 
-operator-image-load: operator-image-build ## Load the operator image into the current kind cluster (KIND_CLUSTER_NAME)
-	@echo "Loading operator image into kind (if kind present)"
-	@# Prefer kind if available, otherwise try microk8s (ctr) import
-	# Delegate to helper script which handles kind or microk8s image load
-	@bash ./scripts/load-operator-image.sh $(OPERATOR_IMAGE) "${KIND_CLUSTER_NAME:-}" || echo "operator image load helper failed"
+operator-image-load: operator-image-build ## Load the operator image into a local cluster (microk8s preferred)
+	@echo "Loading operator image into local cluster (microk8s preferred)"
+	# Delegate to helper script which handles microk8s image import
+	@bash ./scripts/load-operator-image.sh $(OPERATOR_IMAGE) "" || echo "operator image load helper failed"
 
 operator-build-load: operator-image-load ## Convenience target to build and load operator image
 	@echo "operator image build+load complete"
@@ -222,10 +222,8 @@ deploy-k8s-addons: ## Install MetalLB (pool from .env), CRDs, imagePullSecret, D
 	bash ./scripts/k8s-setup-registry-secret.sh || true
 	bash ./scripts/rethinkdb-setup.sh || true
 
-deploy-operator: ## Deploy operator (build+load image into kind if USE_KIND=1, then apply manifests)
-	@if [ "${USE_KIND:-0}" = "1" ]; then \
-		$(MAKE) operator-build-load; \
-	fi
+deploy-operator: ## Deploy operator (ensure operator image is available, then apply manifests)
+	# If you use microk8s for local development, import the operator image first with: make operator-image-load
 	bash ./scripts/deploy-operator.sh
 
 deploy-hostapp: ## Run hostapp locally (or deploy in cluster if configured)
@@ -330,10 +328,6 @@ router-ensure: ## Deploy Tailscale subnet router DaemonSet (uses tmp/cluster-<id
 
 plain-quickstart: ## Alias to setup-all for plain K8S flow
 	$(MAKE) setup-all
-
-# ---------- Kind (local Kubernetes) ----------
-kind-up: ## Create a local kind cluster and write kubeconfig to $(GN_KUBECONFIG)
-	bash ./scripts/kind-setup.sh
 
 .PHONY: deploy-networkpolicies
 deploy-networkpolicies: ## Apply recommended network policies for workspace isolation

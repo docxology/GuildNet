@@ -2,22 +2,12 @@
 set -euo pipefail
 
 IMAGE=${1:-}
-KIND_CLUSTER_NAME=${2:-}
 
 if [ -z "$IMAGE" ]; then
-  echo "Usage: $0 <image> [kind-cluster-name]"
+  echo "Usage: $0 <image> [cluster-name]"
   exit 2
 fi
 
-# If a kind cluster name is provided, prefer loading into that kind cluster.
-if [ -n "$KIND_CLUSTER_NAME" ] && command -v kind >/dev/null 2>&1; then
-  echo "Loading $IMAGE into kind cluster $KIND_CLUSTER_NAME"
-  kind load docker-image "$IMAGE" --name "$KIND_CLUSTER_NAME"
-  echo "Loaded $IMAGE into kind cluster $KIND_CLUSTER_NAME"
-  exit 0
-fi
-
-# If microk8s is present, prefer loading into microk8s when no kind cluster name was given.
 if command -v microk8s >/dev/null 2>&1; then
   echo "Loading $IMAGE into microk8s containerd"
   if ! command -v docker >/dev/null 2>&1; then
@@ -59,13 +49,4 @@ if command -v microk8s >/dev/null 2>&1; then
   exit 1
 fi
 
-# If we reached here and kind exists but no KIND_CLUSTER_NAME was provided, skip kind load
-if command -v kind >/dev/null 2>&1; then
-  if [ -z "$KIND_CLUSTER_NAME" ]; then
-    echo "KIND_CLUSTER_NAME not set; skipping kind load"
-    exit 0
-  fi
-fi
-
-echo "No supported local cluster loader found (kind or microk8s); skipping image load"
 exit 0

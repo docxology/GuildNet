@@ -49,5 +49,5 @@ Notes and caveats
   can also cause existing Workspaces to be reconciled; whether an existing
   Service is converted depends on cluster policies and LoadBalancer availability
   (and may require manual exposure updates for in-use workloads).
-- In kind/test environments, MetalLB should be installed and configured to allocate
-  IPs for LoadBalancer Services.
+ - For local test environments, MetalLB should be installed and configured to allocate
+   IPs for LoadBalancer Services (set METALLB_POOL_RANGE appropriately).

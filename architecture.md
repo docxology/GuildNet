@@ -162,16 +162,16 @@ Dev convenience: the router can detect a local `kubectl proxy` and rewrite clust
 
 ### Developer & deployment workflow
 
-- `scripts/kind-setup.sh` — create a local kind cluster and write kubeconfig to `~/.guildnet/kubeconfig`.
-- `scripts/deploy-metallb.sh` — install MetalLB for LoadBalancer IPs in kind.
-- `scripts/deploy-operator.sh` — apply CRDs, create `guildnet-system` namespace and deploy the in-cluster operator (image configurable via env/IMAGE). The script can be extended to load local images into kind for dev.
+- `scripts/microk8s-setup.sh` — provision microk8s and write kubeconfig to `~/.guildnet/kubeconfig`.
+- `scripts/deploy-metallb.sh` — install MetalLB for LoadBalancer IPs in local clusters.
+- `scripts/deploy-operator.sh` — apply CRDs, create `guildnet-system` namespace and deploy the in-cluster operator (image configurable via env/IMAGE). The script can be extended to load local images into microk8s for dev.
 - `scripts/run-hostapp.sh` — recommended dev flow; sets `KUBECONFIG=~/.guildnet/kubeconfig` when present, stops any existing hostapp listening on the chosen port, and starts `bin/hostapp serve` with an embedded operator.
 
 ### Future small improvements (suggestions)
 
 - Add a short `README` snippet or `docs/bootstrap.md` showing the exact `POST /bootstrap` JSON and form upload shape and an example `guildnet.config`.
-- Add a `make recreate-dev` or `make dev-setup` target that wires `scripts/kind-setup.sh`, `scripts/deploy-metallb.sh` and `kubectl apply -f k8s/rethinkdb.yaml` for easier local setup.
-- Make `scripts/deploy-operator.sh` accept a `LOCAL_IMAGE` argument or perform `kind load docker-image` when necessary for local operator image testing.
+- Add a `make recreate-dev` or `make dev-setup` target that wires `scripts/microk8s-setup.sh`, `scripts/deploy-metallb.sh` and `kubectl apply -f k8s/rethinkdb.yaml` for easier local setup.
+- Make `scripts/deploy-operator.sh` accept a `LOCAL_IMAGE` argument or provide instructions to import the operator image into microk8s when necessary for local operator image testing.
 
 If you want, I can add any of the small follow-ups above (README snippet, Make target, or deploy-operator enhancements).
 

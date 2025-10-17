@@ -216,7 +216,7 @@ The config file path: `~/.guildnet/config.json` (created by tools like the init 
 - GN_USE_GUILDNET_KUBECONFIG — opt-in for dev: when set, scripts like `scripts/run-hostapp.sh` will prefer `~/.guildnet/kubeconfig` as the source for `KUBECONFIG`.
 - KUBE_PROXY_ADDR — explicit host:port or URL for a local kubectl proxy (e.g. http://127.0.0.1:8001). When set, the Host App will allow enabling a per-cluster APIProxyURL fallback and will detect local proxy availability.
 - LISTEN_LOCAL (or environment used to override `pkg/config.Config.ListenLocal`) — override the HTTP listener address
-- USE_KIND / MAKE targets variables — used by Makefile to build and load images for local kind clusters (see Makefile targets rather than environment-driven behavior for production).
+- Local cluster image/load variables — used by Makefile to build and load images for local clusters (prefer microk8s imports). See Makefile targets rather than environment-driven behavior for production.
 
 ### Runtime settings stored in localdb (via `settings.Manager`)
 

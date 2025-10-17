@@ -1,3 +1,2 @@
 - [ ] consolidate LOCAL_LISTEN and VITE_API_BASE to a single var
-- [ ] remove all support and mention of minikube, k3d, kind
 - [ ] more clean up

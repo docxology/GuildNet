@@ -34,7 +34,8 @@ Build and deploy the operator:
 make deploy-operator
 ```
 
-This will build+load the operator image for kind (when `USE_KIND=1`) and then run `./scripts/deploy-operator.sh` to apply the operator manifests to the cluster.
+This will build or ensure the operator image is available to your cluster and then run `./scripts/deploy-operator.sh` to apply the operator manifests to the cluster.
+Import the operator image into microk8s prior to running the deploy script.
 
 Verify operator status with kubectl (quick checks):
 

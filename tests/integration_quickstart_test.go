@@ -13,7 +13,7 @@ import (
 )
 
 // This integration test is intentionally skipped by default. To run locally set
-// CI_QUICKSTART=1 and ensure microk8s/kind and HostApp are available.
+// CI_QUICKSTART=1 and ensure microk8s and HostApp are available.
 func TestIntegration_QuickstartSubset(t *testing.T) {
 	if os.Getenv("CI_QUICKSTART") != "1" {
 		t.Skip("skipping quickstart integration; set CI_QUICKSTART=1 to run")
@@ -23,9 +23,10 @@ func TestIntegration_QuickstartSubset(t *testing.T) {
 	cwd, _ := os.Getwd()
 	root = filepath.Join(cwd, "..")
 
-	// Run verify-cluster.sh to create a disposable kind cluster (fast path), but don't delete it
+	// Run verify-cluster.sh. This script no longer creates disposable clusters;
+	// ensure KUBECONFIG or microk8s is available in the environment before running.
 	verifyCmd := exec.Command("bash", "scripts/verify-cluster.sh")
-	verifyCmd.Env = append(os.Environ(), "USE_KIND=1", "NO_DELETE=1", "SKIP_METALLB=1")
+	verifyCmd.Env = append(os.Environ(), "NO_DELETE=1", "SKIP_METALLB=1")
 	// Limit runtime to avoid long CI hangs
 	var bout bytes.Buffer
 	verifyCmd.Stdout = &bout

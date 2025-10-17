@@ -2,9 +2,11 @@
 set -euo pipefail
 
 # verify-cluster.sh
-# Create a disposable kind cluster test-<rand>, generate guildnet.config, POST to hostapp /bootstrap,
-# create a workspace (code-server), tail logs via SSE, exercise DB API (list/create/table/delete),
-# then destroy the cluster. Verbose logging and diagnostics are written to /tmp/verify-cluster-<ts>.log
+# Run verification steps against an existing Kubernetes cluster (microk8s recommended).
+# This script does NOT auto-create disposable clusters. It will generate a guildnet.config,
+# POST to hostapp /bootstrap, create a workspace (code-server), tail logs via SSE,
+# exercise DB API (list/create/table/delete), and clean up local diagnostics. Verbose
+# logging and diagnostics are written to /tmp/verify-cluster-<ts>.log
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 LOGDIR=${LOGDIR:-/tmp}
@@ -20,7 +22,7 @@ cleanup() {
   CLUSTER_NAME=${CLUSTER_NAME:-}
   HOSTAPP_STARTED=${HOSTAPP_STARTED:-0}
   HOSTAPP_PID_FILE=${HOSTAPP_PID_FILE:-/dev/null}
-  echolog "Cleaning up: attempting to destroy kind cluster '$CLUSTER_NAME'"
+  echolog "Cleaning up: no automatic deletion of external clusters will be performed; cleaning local artifacts for '$CLUSTER_NAME'"
   # If we started a hostapp, kill it
   if [ "${HOSTAPP_STARTED}" -eq 1 ] && [ -f "${HOSTAPP_PID_FILE}" ]; then
     pid=$(cat "${HOSTAPP_PID_FILE}" 2>/dev/null || true)
@@ -33,18 +35,9 @@ cleanup() {
     echolog "NO_DELETE=1; skipping cluster deletion"
   else
     if [ -n "$CLUSTER_NAME" ]; then
-      if command -v kind >/dev/null 2>&1; then
-        if kind get clusters | grep -qx "$CLUSTER_NAME"; then
-          echolog "Deleting kind cluster $CLUSTER_NAME"
-          kind delete cluster --name "$CLUSTER_NAME" 2>&1 | tee -a "$LOGFILE" || echolog "kind delete cluster failed"
-        else
-          echolog "No kind cluster $CLUSTER_NAME found"
-        fi
-      else
-        echolog "Skipping kind delete: 'kind' not found in PATH"
-      fi
+      echolog "No disposable cluster deletion implemented for this run; if you created a local cluster outside this script, delete it manually."
     else
-      echolog "No CLUSTER_NAME set; skipping kind delete"
+      echolog "No CLUSTER_NAME set; nothing to delete"
     fi
   fi
   echolog "Logs saved to $LOGFILE"
@@ -59,22 +52,14 @@ need curl
 need jq
 need kubectl
 
-# 'kind' is only required when USE_KIND=1; check later when needed
-
 # NO_DELETE: when set to 1, do not delete clusters at the end (useful for debugging)
 NO_DELETE=${NO_DELETE:-0}
 
-# Control whether we create a local kind cluster. Default: do NOT use kind (use real k8s).
-USE_KIND=${USE_KIND:-0}
-
-# If using kind, generate a short random suffix and cluster name; otherwise leave empty
-if [ "$USE_KIND" = "1" ]; then
-  RAND=$(head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n')
-  CLUSTER_NAME="test-$RAND"
-  export KIND_CLUSTER_NAME="$CLUSTER_NAME"
-else
-  CLUSTER_NAME=""
-fi
+# This script no longer creates disposable clusters. It expects a kubeconfig
+# to be provided (via KUBECONFIG or GN_KUBECONFIG) or will try to provision
+# microk8s via scripts/microk8s-setup.sh. CLUSTER_NAME is only used for
+# hostapp registration and may remain empty for local kubeconfig usage.
+CLUSTER_NAME=""
 
 # Ensure RAND is always set (used for workspace/db names) even when not creating kind
 RAND=${RAND:-}
@@ -88,42 +73,11 @@ HOSTAPP_PID_FILE="/tmp/verify-hostapp-${RAND:-noid}.pid"
 
 
 
-# Control whether we create a local kind cluster. Default: do NOT use kind (use real k8s).
-# Set USE_KIND=1 in CI to create a disposable kind cluster.
-USE_KIND=${USE_KIND:-0}
-if [ "$USE_KIND" = "1" ]; then
-  # Pick an available host port for the kind API server (default 6443); avoid collisions
-  pick_port() {
-    for p in $(seq 6443 6500); do
-      if ! ss -ltn "sport = :$p" | grep -q LISTEN; then
-        echo $p; return
-      fi
-    done
-    echo 6443
-  }
-  KIND_API_SERVER_PORT=$(pick_port)
-  export KIND_API_SERVER_PORT
-  echolog "Selected KIND API server host port: $KIND_API_SERVER_PORT"
-else
-  echolog "USE_KIND not set; skipping local kind cluster creation and using existing kubeconfig"
-fi
+echolog "Disposable cluster creation disabled; using existing kubeconfig or microk8s setup"
 
 echolog "Starting verify-cluster run for cluster: $CLUSTER_NAME"
 echolog "Logfile: $LOGFILE"
 
-if [ "$USE_KIND" = "1" ]; then
-  echolog "Step: create kind cluster"
-  if ! command -v kind >/dev/null 2>&1; then
-    echolog "ERROR: 'kind' not found in PATH but USE_KIND=1. Install kind or unset USE_KIND."; exit 2
-  fi
-  if ! bash "$ROOT/scripts/kind-setup.sh" 2>&1 | tee -a "$LOGFILE"; then
-    echolog "kind-setup failed"; exit 3
-  fi
-  KUBECONFIG_OUT=${KUBECONFIG_OUT:-${GN_KUBECONFIG:-$HOME/.guildnet/kubeconfig}}
-  if [ ! -f "$KUBECONFIG_OUT" ]; then
-    echolog "Expected kubeconfig at $KUBECONFIG_OUT not found after kind setup"; exit 4
-  fi
-else
   # Use existing kubeconfig from environment if present, otherwise default location
   KUBECONFIG_OUT=${KUBECONFIG_OUT:-${GN_KUBECONFIG:-${KUBECONFIG:-$HOME/.kube/config}}}
   # If the kubeconfig file is missing, try to create one from env vars or attempt to start a local cluster
@@ -155,18 +109,9 @@ users:
 EOF
       echolog "Wrote generated kubeconfig to $KUBECONFIG_OUT"
     else
-      # Try to start a local cluster using minikube, microk8s, k3d in that order
+      # Start a local cluster using microk8s only.
       started=0
-      if command -v minikube >/dev/null 2>&1; then
-        echolog "Attempting to start minikube cluster (this may take a few minutes)"
-        if minikube start >/dev/null 2>&1; then
-          started=1
-          KUBECONFIG_OUT="$(minikube kubeconfig)"
-        else
-          echolog "minikube start failed"
-        fi
-      fi
-      if [ $started -eq 0 ] && [ -x "$ROOT/scripts/microk8s-setup.sh" ]; then
+      if [ -x "$ROOT/scripts/microk8s-setup.sh" ]; then
         echolog "Invoking scripts/microk8s-setup.sh to provision microk8s (will auto-install if needed) and emit kubeconfig"
         if OUT=$(bash "$ROOT/scripts/microk8s-setup.sh" "$KUBECONFIG_OUT" 2>&1 | tee -a "$LOGFILE"); then
           # microk8s-setup prints the kubeconfig path as its last line; use that if non-empty
@@ -186,17 +131,10 @@ EOF
           echolog "microk8s setup script failed"
         fi
       fi
-      if [ $started -eq 0 ] && command -v k3d >/dev/null 2>&1; then
-        echolog "Attempting to create a k3d cluster 'guildnet-k3d'"
-        if k3d cluster list | grep -q guildnet-k3d || k3d cluster create guildnet-k3d >/dev/null 2>&1; then
-          started=1
-          KUBECONFIG_OUT=$(k3d kubeconfig get guildnet-k3d)
-        else
-          echolog "k3d create failed"
-        fi
-      fi
-      if [ $started -eq 0 ]; then
-        echolog "Unable to generate kubeconfig from env and no local cluster provider succeeded. Set KUBECONFIG or run with USE_KIND=1 to create a kind cluster"; exit 4
+      if [ -z "${KUBECONFIG_OUT:-}" ]; then
+        echolog "Unable to generate kubeconfig from env and no microk8s kubeconfig was produced."
+        echolog "This repository no longer auto-provisions legacy local providers. Provide a valid KUBECONFIG or install/run microk8s via scripts/microk8s-setup.sh.";
+        exit 4
       fi
     fi
   fi
@@ -208,7 +146,7 @@ echolog "Using kubeconfig: $KUBECONFIG_OUT"
 echolog "Performing Kubernetes API preflight check (timeout 5s)"
 if ! kubectl --request-timeout=5s get --raw='/readyz' >/dev/null 2>&1; then
   echolog "Kubernetes API not reachable using kubeconfig $KUBECONFIG_OUT."
-  echolog "Set KUBECONFIG to a reachable cluster or run with USE_KIND=1 to create a local kind cluster.";
+  echolog "Set KUBECONFIG to a reachable cluster or install/run microk8s via scripts/microk8s-setup.sh.";
   exit 4
 fi
 
@@ -218,16 +156,12 @@ if command -v microk8s >/dev/null 2>&1 || grep -q "microk8s" <<< "${KUBECONFIG_O
   (cd "$ROOT" && MAKEFLAGS= make operator-build-load) 2>&1 | tee -a "$LOGFILE" || echolog "operator build/load may have failed (continuing)"
 fi
 
-# For non-kind clusters (microk8s, minikube, k3d, or real clusters) deploy the operator
-# so the operator's API types (CRDs) and controller become available for the test run.
-# We avoid doing this for the disposable-kind path because the kind flow deploys the
-# operator later when USE_KIND=1.
-if [ "${USE_KIND:-0}" != "1" ]; then
-  echolog "Deploying operator into target cluster (non-kind path)"
-  export OPERATOR_IMAGE="${OPERATOR_IMAGE:-guildnet/hostapp:local}"
-  echolog "Using OPERATOR_IMAGE=$OPERATOR_IMAGE for operator deployment"
-  bash "$ROOT/scripts/deploy-operator.sh" 2>&1 | tee -a "$LOGFILE" || echolog "deploy-operator failed (continuing)"
-fi
+# Deploy the operator into the target cluster so the operator's API types (CRDs)
+# and controller become available for the test run.
+echolog "Deploying operator into target cluster"
+export OPERATOR_IMAGE="${OPERATOR_IMAGE:-guildnet/hostapp:local}"
+echolog "Using OPERATOR_IMAGE=$OPERATOR_IMAGE for operator deployment"
+bash "$ROOT/scripts/deploy-operator.sh" 2>&1 | tee -a "$LOGFILE" || echolog "deploy-operator failed (continuing)"
 
 echolog "Step: generate guildnet.config (join file)"
 JOIN_OUT="$ROOT/guildnet.config"
@@ -290,17 +224,12 @@ else
   fi
 fi
 
-# If we're running in a disposable kind cluster, build+load the operator image into kind
-# and deploy the operator into the cluster so the operator's API is available for test runs.
-if [ "$USE_KIND" = "1" ]; then
-  echolog "USE_KIND=1: building+loading operator image into kind and deploying operator"
-  # Build and load operator image (non-fatal if kind or docker not present)
-  (cd "$ROOT" && env KIND_CLUSTER_NAME="$CLUSTER_NAME" MAKEFLAGS= make operator-build-load) 2>&1 | tee -a "$LOGFILE" || echolog "operator build/load may have failed (continuing)"
-  # Deploy the operator manifests into the cluster
-  export OPERATOR_IMAGE="${OPERATOR_IMAGE:-guildnet/hostapp:local}"
-  echolog "Using OPERATOR_IMAGE=$OPERATOR_IMAGE for operator deployment"
-  bash "$ROOT/scripts/deploy-operator.sh" 2>&1 | tee -a "$LOGFILE" || echolog "deploy-operator failed (continuing)"
-fi
+# For microk8s or real clusters deploy the operator now. If you run a local
+# cluster with a local image you may need to import the operator image into
+# microk8s or ensure OPERATOR_IMAGE is reachable by the cluster.
+export OPERATOR_IMAGE="${OPERATOR_IMAGE:-guildnet/hostapp:local}"
+echolog "Using OPERATOR_IMAGE=$OPERATOR_IMAGE for operator deployment"
+bash "$ROOT/scripts/deploy-operator.sh" 2>&1 | tee -a "$LOGFILE" || echolog "deploy-operator failed (continuing)"
 
 # Ensure CRDs from the repository are applied into the test cluster so the operator can register types
 if [ -d "$ROOT/config/crd" ]; then

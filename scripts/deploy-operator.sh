@@ -22,7 +22,7 @@ fi
 
 # Prefer 'Never' for local dev images (e.g. tags that include ':local') so
 # container runtimes don't attempt to pull from a registry when the image is
-# loaded locally (microk8s import / kind load). Default to IfNotPresent.
+# loaded locally (microk8s import). Default to IfNotPresent.
 case "$IMAGE" in
   *:local)
     IMAGE_PULL_POLICY=Never
@@ -184,7 +184,5 @@ fi
 
 # If running in a local cluster and the image appears to be a remote GHCR image, warn the user
 if echo "${IMAGE}" | grep -q "ghcr.io" 2>/dev/null; then
-  if command -v kind >/dev/null 2>&1 && [ "${USE_KIND:-0}" = "1" ]; then
-    echo "[operator] NOTE: operator image appears to be hosted on ghcr.io; run 'make operator-build-load' to build+load it into kind or set OPERATOR_IMAGE to a reachable image"
-  fi
+  echo "[operator] NOTE: operator image appears to be hosted on ghcr.io; ensure the target cluster can pull this image or import it into microk8s before deploying"
 fi
