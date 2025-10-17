@@ -30,6 +30,7 @@ import (
 	"github.com/your/module/internal/settings"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -1391,7 +1392,15 @@ func Router(deps Deps) *http.ServeMux {
 				var spec map[string]any
 				_ = json.NewDecoder(r.Body).Decode(&spec)
 				// expect { image, name?, env?, ports?, args?, resources?, labels? }
-				name := strings.TrimSpace(fmt.Sprint(spec["name"]))
+				// Avoid fmt.Sprint on nil which prints "<nil>"; only use string when present.
+				var name string
+				if v, ok := spec["name"]; ok && v != nil {
+					if s, ok := v.(string); ok {
+						name = strings.TrimSpace(s)
+					} else {
+						name = strings.TrimSpace(fmt.Sprint(v))
+					}
+				}
 				if name == "" {
 					name = fmt.Sprintf("ws-%s", uuid.NewString()[:8])
 				}
@@ -1409,7 +1418,16 @@ func Router(deps Deps) *http.ServeMux {
 					},
 				}
 				if _, err := dyn.Resource(gvr).Namespace(defaultNS).Create(r.Context(), &unstructured.Unstructured{Object: obj}, metav1.CreateOptions{}); err != nil {
-					httpx.JSONError(w, http.StatusInternalServerError, "workspace create failed", "create_failed", err.Error())
+					// If this is a Kubernetes StatusError (validation, etc), surface its structured
+					// details to the client so the UI can display helpful messages.
+					var details any = err.Error()
+					if se, ok := err.(*apierrors.StatusError); ok {
+						// Use the Status object if available; include message, reason and details.
+						s := se.ErrStatus
+						// Attempt to include the most useful fields.
+						details = map[string]any{"message": s.Message, "reason": string(s.Reason), "details": s.Details}
+					}
+					httpx.JSONError(w, http.StatusInternalServerError, "workspace create failed", "create_failed", details)
 					return
 				}
 				httpx.JSON(w, http.StatusAccepted, map[string]any{"id": name, "status": "pending"})

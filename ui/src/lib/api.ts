@@ -226,10 +226,14 @@ export async function createClusterWorkspace(
         body: JSON.stringify(payload)
       }
     )
-    if (!res.ok) return null
-    return (await res.json()) as { id: string; status: string }
-  } catch {
-    return null
+    // Use the shared handler so structured server errors (message/details)
+    // are parsed and converted to a thrown Error which the caller can show.
+    return await handle<{ id: string; status: string }>(res)
+  } catch (e) {
+    // Let the caller handle errors; returning null would swallow useful
+    // server-side validation messages. Preserve previous behaviour on
+    // unexpected failures by rethrowing the original error.
+    throw e
   }
 }
 
