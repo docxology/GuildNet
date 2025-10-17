@@ -11,9 +11,9 @@ import (
 
 	r "gopkg.in/rethinkdb/rethinkdb-go.v6"
 
-	"github.com/your/module/internal/model"
+	"github.com/docxology/GuildNet/internal/model"
 	// For Kubernetes-based service discovery when running outside the cluster
-	k8sclient "github.com/your/module/internal/k8s"
+	k8sclient "github.com/docxology/GuildNet/internal/k8s"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )

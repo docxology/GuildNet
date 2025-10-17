@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/your/module/internal/audit"
-	"github.com/your/module/internal/localdb"
-	"github.com/your/module/internal/secrets"
+	"github.com/docxology/GuildNet/internal/audit"
+	"github.com/docxology/GuildNet/internal/localdb"
+	"github.com/docxology/GuildNet/internal/secrets"
 )
 
 // Manager coordinates lifecycle operations for Headscale instances.

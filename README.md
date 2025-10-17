@@ -28,6 +28,18 @@ GuildNet is a private self-hostable stack that puts human-in-the-loop with agent
 - **Radicle**: A decentralized git hosting solution for managing code repositories within the cluster.
 - **Knowledge Base**: A system for storing and managing knowledge, integrated with agent workflows.
 
+## Developer Tools
+
+**MetaGuildNet** provides convenience SDKs, CLI tools, and orchestration utilities:
+
+- 🐹 **Go SDK** - Type-safe client library with retry logic and context support
+- 🐍 **Python CLI** (`mgn`) - Command-line tool for cluster/workspace/database management  
+- 📜 **Installation Scripts** - Automated installation and verification
+- 🎭 **Orchestration Examples** - Multi-cluster patterns, lifecycle management, CI/CD integration
+- 📚 **Comprehensive Documentation** - Getting started, concepts, examples, API reference
+
+See **[metaguildnet/README.md](metaguildnet/README.md)** for quick start and **[metaguildnet/INTEGRATION_REVIEW.md](metaguildnet/INTEGRATION_REVIEW.md)** for validation report.
+
 ## Quickstart
 
 ### Headscale

@@ -175,5 +175,206 @@ Dev convenience: the router can detect a local `kubectl proxy` and rewrite clust
 
 If you want, I can add any of the small follow-ups above (README snippet, Make target, or deploy-operator enhancements).
 
+---
+
+## MetaGuildNet: SDK, CLI, and Orchestration Layer
+
+MetaGuildNet is a collection of utilities, SDKs, CLIs, scripts, and examples that sits on top of GuildNet to facilitate configuration, installation, usage, verification, and orchestration.
+
+### Architecture Position
+
+```mermaid
+flowchart TB
+    subgraph User["User/Developer"]
+        CLI["mgn CLI (Python)"]
+        SDK["Go SDK"]
+        Scripts["Installation Scripts"]
+    end
+    
+    subgraph MetaGuildNet["MetaGuildNet Layer"]
+        direction LR
+        Client["API Client"]
+        Config["Config Manager"]
+        Installer["Installer"]
+        Visualizer["Dashboard"]
+        Orchestrator["Orchestrator Examples"]
+    end
+    
+    subgraph GuildNet["GuildNet Core"]
+        HostApp["Host App API"]
+        Operator["Operator"]
+        Registry["Registry"]
+    end
+    
+    subgraph Infrastructure["Infrastructure"]
+        K8s["Kubernetes"]
+        RDB["RethinkDB"]
+        Headscale["Headscale/Tailscale"]
+    end
+    
+    CLI --> Client
+    SDK --> Client
+    Scripts --> Installer
+    Client --> HostApp
+    Orchestrator --> Client
+    Visualizer --> Client
+    HostApp --> Registry
+    Registry --> K8s
+    Registry --> RDB
+    HostApp --> Headscale
+    
+    classDef meta fill:#f59e0b,stroke:#d97706,color:#1a1a1a
+    classDef core fill:#0ea5a4,stroke:#064e3b,color:#032b2b
+    class MetaGuildNet meta
+    class GuildNet core
+```
+
+### MetaGuildNet Components
+
+#### 1. Go SDK (`metaguildnet/sdk/go/`)
+
+Convenience wrappers around the Host App API:
+- **client/guildnet.go** - Main client with connection management
+- **client/cluster.go** - Cluster operations (list, get, bootstrap, settings)
+- **client/workspace.go** - Workspace operations (create, delete, logs, stream)
+- **client/database.go** - Database operations (list, create, query)
+- **client/health.go** - Health and status monitoring
+- **testing/** - Test utilities (fixtures, assertions, mocks)
+- **examples/** - Working examples (basic workflow, multi-cluster, database sync)
+
+#### 2. Python CLI (`metaguildnet/python/`)
+
+Command-line interface for GuildNet management:
+- **mgn cluster** - Cluster management commands
+- **mgn workspace** - Workspace lifecycle operations
+- **mgn database** - Database operations
+- **mgn install** - Automated installation orchestrator
+- **mgn verify** - Installation and health verification
+- **mgn viz** - Real-time terminal dashboard (using rich library)
+
+Configuration via `~/.config/guildnet/config.yaml` or environment variables.
+
+#### 3. Installation Scripts (`metaguildnet/scripts/install/`)
+
+Automated installation for local development:
+- **00-check-prereqs.sh** - System requirements verification
+- **01-install-microk8s.sh** - MicroK8s installation and configuration
+- **02-setup-headscale.sh** - Headscale setup (wraps core GuildNet scripts)
+- **03-deploy-guildnet.sh** - Deploy GuildNet components
+- **04-bootstrap-cluster.sh** - Initial cluster bootstrap
+- **install-all.sh** - One-command full installation
+
+#### 4. Verification Scripts (`metaguildnet/scripts/verify/`)
+
+Comprehensive health checks:
+- **verify-system.sh** - System-level checks (docker, kubernetes, networking)
+- **verify-network.sh** - Network connectivity and Tailscale/Headscale
+- **verify-kubernetes.sh** - Kubernetes cluster health and resources
+- **verify-guildnet.sh** - GuildNet installation and API
+- **verify-all.sh** - Complete verification suite
+
+#### 5. Utility Scripts (`metaguildnet/scripts/utils/`)
+
+Operational utilities:
+- **log-collector.sh** - Collect logs from all components for troubleshooting
+- **debug-info.sh** - Generate comprehensive debug information bundle
+- **cleanup.sh** - Clean up test resources (workspaces, pods, images)
+- **backup-config.sh** - Backup configurations and data (with restore script)
+
+#### 6. Orchestration Examples (`metaguildnet/orchestrator/`)
+
+Templates and examples for production patterns:
+
+**Multi-cluster orchestration:**
+- Federation configurations
+- Load balancing across clusters
+- Cross-cluster workload distribution
+
+**Lifecycle management:**
+- Rolling updates (zero-downtime updates)
+- Blue-green deployments (parallel version deployment)
+- Canary deployments (gradual rollout with monitoring)
+
+**CI/CD integration:**
+- GitHub Actions workflows
+- GitLab CI pipelines
+- Jenkins pipelines
+
+### Design Principles
+
+1. **Non-invasive** - MetaGuildNet wraps GuildNet without modifying core behavior
+2. **Composable** - Components can be used independently or together
+3. **Production-ready** - All examples work by default with sensible settings
+4. **Language flexibility** - Go SDK for performance, Python CLI for user experience
+5. **Local-first** - Optimized for single-machine MicroK8s development
+
+### Usage Patterns
+
+#### Quick Start (Python CLI)
+
+```bash
+# Install MetaGuildNet CLI
+cd metaguildnet/python
+uv pip install -e .
+
+# Automated installation
+mgn install
+
+# Verify installation
+mgn verify
+
+# Create workspace
+mgn workspace create <cluster-id> --name myapp --image nginx
+
+# Monitor with live dashboard
+mgn viz
+```
+
+#### Programmatic (Go SDK)
+
+```go
+import "github.com/your/module/metaguildnet/sdk/go/client"
+
+c := client.NewClient("https://localhost:8090", "token")
+clusters, _ := c.Clusters().List(ctx)
+
+for _, cluster := range clusters {
+    health, _ := c.Health().Cluster(ctx, cluster.ID)
+    fmt.Printf("%s: %s\n", cluster.Name, health.Status)
+}
+```
+
+#### CI/CD Integration
+
+MetaGuildNet provides ready-to-use CI/CD examples:
+- Build Docker images
+- Deploy to multiple clusters
+- Run health checks
+- Automatic rollback on failure
+
+See `metaguildnet/orchestrator/examples/cicd/` for complete examples.
+
+### Relationship to Core GuildNet
+
+MetaGuildNet is a **rider** - it facilitates using GuildNet but is not required for operation:
+
+- **Core GuildNet** - Runs independently, provides API, manages clusters
+- **MetaGuildNet** - Provides convenience layer for configuration, deployment, monitoring
+
+Users can:
+- Use MetaGuildNet for easier onboarding and operations
+- Use core GuildNet API directly for custom integrations
+- Mix both approaches as needed
+
+### Documentation
+
+- **metaguildnet/README.md** - Overview and quick start
+- **metaguildnet/QUICKSTART.md** - Quick reference guide
+- **metaguildnet/docs/getting-started.md** - Installation walkthrough
+- **metaguildnet/docs/concepts.md** - Architecture and design
+- **metaguildnet/docs/examples.md** - Usage examples and patterns
+- **metaguildnet/docs/api-reference.md** - Complete API reference
+- **metaguildnet/TESTING.md** - Test suite and validation
+
 ````
 

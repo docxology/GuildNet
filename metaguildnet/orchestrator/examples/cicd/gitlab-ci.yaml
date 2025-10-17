@@ -1,0 +1,199 @@
+# GitLab CI Pipeline for GuildNet Deployment
+# Place this in .gitlab-ci.yml
+
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  IMAGE_TAG: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  
+stages:
+  - build
+  - test
+  - deploy-staging
+  - deploy-production
+  - verify
+
+# Build Docker image
+build:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build -t $IMAGE_TAG .
+    - docker tag $IMAGE_TAG $CI_REGISTRY_IMAGE:latest
+    - docker push $IMAGE_TAG
+    - docker push $CI_REGISTRY_IMAGE:latest
+  only:
+    - main
+    - staging
+    - tags
+
+# Unit tests
+test:unit:
+  stage: test
+  image: python:3.11
+  script:
+    - pip install -r requirements.txt
+    - pytest tests/unit
+  only:
+    - main
+    - staging
+    - merge_requests
+
+# Deploy to staging
+deploy:staging:
+  stage: deploy-staging
+  image: python:3.11
+  environment:
+    name: staging
+    url: https://staging.example.com
+  before_script:
+    - pip install uv
+    - git clone https://gitlab.com/your/guildnet.git
+    - cd guildnet/metaguildnet/python
+    - uv pip install -e .
+    - cd ../../..
+  script:
+    - |
+      mgn workspace create $STAGING_CLUSTER_ID \
+        --name $CI_PROJECT_NAME \
+        --image $IMAGE_TAG \
+        --env "ENVIRONMENT=staging" \
+        --env "VERSION=$CI_COMMIT_SHORT_SHA" \
+        --env "CI_JOB_ID=$CI_JOB_ID"
+    - |
+      mgn workspace wait $STAGING_CLUSTER_ID $CI_PROJECT_NAME --timeout 5m
+  variables:
+    MGN_API_URL: $STAGING_API_URL
+    MGN_API_TOKEN: $STAGING_API_TOKEN
+  only:
+    - staging
+    - main
+
+# Integration tests on staging
+test:staging:
+  stage: deploy-staging
+  image: python:3.11
+  needs:
+    - deploy:staging
+  before_script:
+    - pip install uv
+    - git clone https://gitlab.com/your/guildnet.git
+    - cd guildnet/metaguildnet/python
+    - uv pip install -e .
+    - cd ../../..
+  script:
+    - |
+      mgn workspace test $STAGING_CLUSTER_ID $CI_PROJECT_NAME \
+        --http-check /health \
+        --http-check /api/v1/status
+    - pytest tests/integration --staging
+  variables:
+    MGN_API_URL: $STAGING_API_URL
+    MGN_API_TOKEN: $STAGING_API_TOKEN
+  only:
+    - staging
+    - main
+
+# Deploy to production (manual approval required)
+deploy:production:
+  stage: deploy-production
+  image: python:3.11
+  environment:
+    name: production
+    url: https://example.com
+  when: manual
+  before_script:
+    - pip install uv
+    - git clone https://gitlab.com/your/guildnet.git
+    - cd guildnet/metaguildnet/python
+    - uv pip install -e .
+    - cd ../../..
+  script:
+    - |
+      for cluster in $PROD_CLUSTER_US $PROD_CLUSTER_EU $PROD_CLUSTER_ASIA; do
+        echo "Deploying to cluster: $cluster"
+        
+        mgn workspace create $cluster \
+          --name $CI_PROJECT_NAME \
+          --image $IMAGE_TAG \
+          --env "ENVIRONMENT=production" \
+          --env "VERSION=$CI_COMMIT_SHORT_SHA" \
+          --env "REGION=$cluster"
+        
+        mgn workspace wait $cluster $CI_PROJECT_NAME --timeout 10m
+        
+        # Quick health check
+        mgn workspace test $cluster $CI_PROJECT_NAME --http-check /health
+        
+        # Wait before deploying to next cluster
+        sleep 30
+      done
+  variables:
+    MGN_API_URL: $PROD_API_URL
+    MGN_API_TOKEN: $PROD_API_TOKEN
+  only:
+    - main
+  # Automatic rollback if deployment fails
+  after_script:
+    - |
+      if [ "$CI_JOB_STATUS" != "success" ]; then
+        echo "Deployment failed, rolling back..."
+        for cluster in $PROD_CLUSTER_US $PROD_CLUSTER_EU $PROD_CLUSTER_ASIA; do
+          mgn workspace delete $cluster $CI_PROJECT_NAME || true
+        done
+      fi
+
+# Post-deployment verification
+verify:production:
+  stage: verify
+  image: python:3.11
+  needs:
+    - deploy:production
+  before_script:
+    - pip install uv
+    - git clone https://gitlab.com/your/guildnet.git
+    - cd guildnet/metaguildnet/python
+    - uv pip install -e .
+    - cd ../../..
+  script:
+    - |
+      for cluster in $PROD_CLUSTER_US $PROD_CLUSTER_EU $PROD_CLUSTER_ASIA; do
+        echo "Verifying cluster: $cluster"
+        
+        mgn cluster status $cluster
+        mgn workspace get $cluster $CI_PROJECT_NAME
+        mgn workspace test $cluster $CI_PROJECT_NAME \
+          --http-check /health \
+          --http-check /metrics
+      done
+    - pytest tests/e2e --production
+  variables:
+    MGN_API_URL: $PROD_API_URL
+    MGN_API_TOKEN: $PROD_API_TOKEN
+  only:
+    - main
+
+# Cleanup old deployments
+cleanup:
+  stage: verify
+  image: python:3.11
+  when: manual
+  before_script:
+    - pip install uv
+    - git clone https://gitlab.com/your/guildnet.git
+    - cd guildnet/metaguildnet/python
+    - uv pip install -e .
+    - cd ../../..
+  script:
+    - |
+      # List and optionally clean up old workspaces
+      mgn workspace list $STAGING_CLUSTER_ID
+      # Add cleanup logic as needed
+  variables:
+    MGN_API_URL: $STAGING_API_URL
+    MGN_API_TOKEN: $STAGING_API_TOKEN
+

@@ -3,8 +3,8 @@ package httpx
 import (
 	"context"
 
-	"github.com/your/module/internal/db"
-	"github.com/your/module/internal/model"
+	"github.com/docxology/GuildNet/internal/db"
+	"github.com/docxology/GuildNet/internal/model"
 )
 
 // DBManager captures the subset of database manager methods used by handlers.

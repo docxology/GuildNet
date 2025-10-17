@@ -1,4 +1,4 @@
-module github.com/your/module
+module github.com/docxology/GuildNet
 
 go 1.22.0
 

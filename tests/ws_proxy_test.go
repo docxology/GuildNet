@@ -11,8 +11,8 @@ import (
 
 	"nhooyr.io/websocket"
 
-	httpx "github.com/your/module/internal/httpx"
-	"github.com/your/module/internal/proxy"
+	httpx "github.com/docxology/GuildNet/internal/httpx"
+	"github.com/docxology/GuildNet/internal/proxy"
 )
 
 // wsEchoHandler accepts a WebSocket and echoes a single message back.

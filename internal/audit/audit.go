@@ -4,7 +4,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/your/module/internal/localdb"
+	"github.com/docxology/GuildNet/internal/localdb"
 )
 
 // Append writes an audit event to the local DB for traceability.

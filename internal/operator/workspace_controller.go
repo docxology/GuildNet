@@ -20,7 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	apiv1alpha1 "github.com/your/module/api/v1alpha1"
+	apiv1alpha1 "github.com/docxology/GuildNet/api/v1alpha1"
 )
 
 // WorkspaceReconciler reconciles a Workspace object into a Deployment + Service.

@@ -27,17 +27,17 @@ import (
 	crlog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	"github.com/your/module/internal/httpx"
-	"github.com/your/module/internal/k8s"
-	"github.com/your/module/internal/metrics"
-	"github.com/your/module/internal/model"
-	"github.com/your/module/internal/proxy"
-	"github.com/your/module/internal/settings"
+	"github.com/docxology/GuildNet/internal/httpx"
+	"github.com/docxology/GuildNet/internal/k8s"
+	"github.com/docxology/GuildNet/internal/metrics"
+	"github.com/docxology/GuildNet/internal/model"
+	"github.com/docxology/GuildNet/internal/proxy"
+	"github.com/docxology/GuildNet/internal/settings"
 
-	//"github.com/your/module/internal/store"
-	"github.com/your/module/internal/store"
-	"github.com/your/module/internal/ts"
-	"github.com/your/module/pkg/config"
+	//"github.com/docxology/GuildNet/internal/store"
+	"github.com/docxology/GuildNet/internal/store"
+	"github.com/docxology/GuildNet/internal/ts"
+	"github.com/docxology/GuildNet/pkg/config"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -47,16 +47,16 @@ import (
 
 	// no direct transport import; use rest.TransportFor
 
-	apiv1alpha1 "github.com/your/module/api/v1alpha1"
-	"github.com/your/module/internal/operator"
-	"github.com/your/module/internal/permission"
+	apiv1alpha1 "github.com/docxology/GuildNet/api/v1alpha1"
+	"github.com/docxology/GuildNet/internal/operator"
+	"github.com/docxology/GuildNet/internal/permission"
 	corev1 "k8s.io/api/core/v1"
 
 	// New imports
-	"github.com/your/module/internal/api"
-	"github.com/your/module/internal/cluster"
-	"github.com/your/module/internal/localdb"
-	"github.com/your/module/internal/secrets"
+	"github.com/docxology/GuildNet/internal/api"
+	"github.com/docxology/GuildNet/internal/cluster"
+	"github.com/docxology/GuildNet/internal/localdb"
+	"github.com/docxology/GuildNet/internal/secrets"
 )
 
 // kubeconfigResolver implements cluster.Resolver backed by localdb credentials.

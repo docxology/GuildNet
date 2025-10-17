@@ -4,9 +4,9 @@ import (
 	"context"
 	"testing"
 
-	"github.com/your/module/internal/db"
-	"github.com/your/module/internal/httpx"
-	"github.com/your/module/internal/model"
+	"github.com/docxology/GuildNet/internal/db"
+	"github.com/docxology/GuildNet/internal/httpx"
+	"github.com/docxology/GuildNet/internal/model"
 )
 
 type fakeDBMgr struct {

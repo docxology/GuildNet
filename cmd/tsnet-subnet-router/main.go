@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/your/module/internal/ts"
+	"github.com/docxology/GuildNet/internal/ts"
 )
 
 func main() {

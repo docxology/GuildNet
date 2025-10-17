@@ -3,8 +3,8 @@ package api
 import (
 	"testing"
 
-	"github.com/your/module/internal/localdb"
-	"github.com/your/module/internal/settings"
+	"github.com/docxology/GuildNet/internal/localdb"
+	"github.com/docxology/GuildNet/internal/settings"
 )
 
 // TestEnsureProxyFallbackOnTimeout verifies that when a local kube-proxy is

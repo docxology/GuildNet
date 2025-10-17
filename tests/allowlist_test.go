@@ -1,7 +1,7 @@
 package tests
 
 import (
-	"github.com/your/module/internal/proxy"
+	"github.com/docxology/GuildNet/internal/proxy"
 	"testing"
 )
 

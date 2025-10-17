@@ -19,7 +19,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
-	"github.com/your/module/internal/model"
+	"github.com/docxology/GuildNet/internal/model"
 )
 
 type Client struct {

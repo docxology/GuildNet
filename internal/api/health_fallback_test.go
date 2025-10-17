@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/your/module/internal/localdb"
-	"github.com/your/module/internal/secrets"
+	"github.com/docxology/GuildNet/internal/localdb"
+	"github.com/docxology/GuildNet/internal/secrets"
 )
 
 // TestHealthEndpointProxyFallback ensures the /api/health path will enable

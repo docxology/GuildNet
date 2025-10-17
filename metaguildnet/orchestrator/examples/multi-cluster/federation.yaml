@@ -1,0 +1,53 @@
+# Multi-cluster federation configuration example
+
+federation:
+  name: production-federation
+  description: "Production multi-cluster setup with geographic distribution"
+  
+  clusters:
+    # Primary US East cluster
+    - id: cluster-us-east-1
+      name: "US East (Primary)"
+      role: primary
+      weight: 40
+      region: us-east-1
+      priority: 1
+      
+    # Secondary US West cluster
+    - id: cluster-us-west-2
+      name: "US West (Secondary)"
+      role: secondary
+      weight: 30
+      region: us-west-2
+      priority: 2
+      
+    # European cluster
+    - id: cluster-eu-west-1
+      name: "EU West"
+      role: secondary
+      weight: 30
+      region: eu-west-1
+      priority: 2
+  
+  # Load balancing strategy
+  load_balancing:
+    strategy: weighted  # Options: weighted, round-robin, geo-proximity
+    health_check_interval: 30s
+    failover_enabled: true
+  
+  # Deployment strategy
+  deployment:
+    mode: simultaneous  # Options: simultaneous, sequential, rolling
+    max_parallel: 3
+    wait_for_ready: true
+    rollback_on_failure: true
+  
+  # Sync configuration
+  sync:
+    enabled: true
+    interval: 5m
+    sync_resources:
+      - workspaces
+      - databases
+      - configurations
+

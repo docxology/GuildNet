@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	httpx "github.com/your/module/internal/httpx"
-	"github.com/your/module/internal/proxy"
+	httpx "github.com/docxology/GuildNet/internal/httpx"
+	"github.com/docxology/GuildNet/internal/proxy"
 )
 
 // This test constructs the ping handler logic without tsnet by simulating a dialer outcome.

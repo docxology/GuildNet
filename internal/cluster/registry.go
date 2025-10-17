@@ -11,12 +11,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/your/module/internal/db"
-	"github.com/your/module/internal/httpx"
-	"github.com/your/module/internal/k8s"
-	"github.com/your/module/internal/localdb"
-	"github.com/your/module/internal/settings"
-	"github.com/your/module/internal/ts/connector"
+	"github.com/docxology/GuildNet/internal/db"
+	"github.com/docxology/GuildNet/internal/httpx"
+	"github.com/docxology/GuildNet/internal/k8s"
+	"github.com/docxology/GuildNet/internal/localdb"
+	"github.com/docxology/GuildNet/internal/settings"
+	"github.com/docxology/GuildNet/internal/ts/connector"
 	"k8s.io/client-go/dynamic"
 )
 

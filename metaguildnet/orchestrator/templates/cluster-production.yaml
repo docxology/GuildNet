@@ -1,0 +1,40 @@
+# Production-ready GuildNet cluster configuration template
+
+cluster:
+  name: production-cluster
+  namespace: guildnet-system
+  
+  # Production settings
+  settings:
+    workspace_lb_enabled: true
+    prefer_pod_proxy: false
+    use_port_forward: false
+    api_proxy_force_http: false
+  
+  # Ingress configuration
+  ingress:
+    domain: workspaces.example.com
+    class_name: nginx
+    tls_secret: wildcard-tls
+    cert_manager_issuer: letsencrypt-prod
+    auth_url: https://auth.example.com/verify
+    auth_signin: https://auth.example.com/signin
+  
+  # Image pull secret for private registry
+  image_pull_secret: regcreds
+  
+  # Organization ID
+  org_id: production
+  
+  # Tailscale/Headscale configuration
+  tailscale:
+    login_server: https://headscale.example.com
+    routes: "10.96.0.0/12,10.244.0.0/16"
+    hostname: prod-cluster-router
+  
+  # Resource quotas and limits (optional)
+  quotas:
+    max_workspaces: 100
+    max_cpu: "100"
+    max_memory: "200Gi"
+

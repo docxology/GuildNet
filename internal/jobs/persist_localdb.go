@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/your/module/internal/localdb"
+	"github.com/docxology/GuildNet/internal/localdb"
 )
 
 // LocalPersist implements Persist on top of localdb.DB

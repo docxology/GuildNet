@@ -5,7 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/your/module/internal/httpx"
+	"github.com/docxology/GuildNet/internal/httpx"
 )
 
 // Re-declare minimal helpers mirroring main.go for unit testing without exporting from main package.

@@ -18,16 +18,16 @@ import (
 	"github.com/google/uuid"
 	"nhooyr.io/websocket"
 
-	"github.com/your/module/internal/cluster"
-	"github.com/your/module/internal/httpx"
-	"github.com/your/module/internal/jobs"
-	"github.com/your/module/internal/localdb"
-	"github.com/your/module/internal/orch"
-	"github.com/your/module/internal/proxy"
-	"github.com/your/module/internal/secrets"
+	"github.com/docxology/GuildNet/internal/cluster"
+	"github.com/docxology/GuildNet/internal/httpx"
+	"github.com/docxology/GuildNet/internal/jobs"
+	"github.com/docxology/GuildNet/internal/localdb"
+	"github.com/docxology/GuildNet/internal/orch"
+	"github.com/docxology/GuildNet/internal/proxy"
+	"github.com/docxology/GuildNet/internal/secrets"
 
 	// New settings
-	"github.com/your/module/internal/settings"
+	"github.com/docxology/GuildNet/internal/settings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"

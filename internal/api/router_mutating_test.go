@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/your/module/internal/localdb"
+	"github.com/docxology/GuildNet/internal/localdb"
 )
 
 // TestMutatingWhenNoK8sClients ensures POST to create workspace returns 503

@@ -1,0 +1,24 @@
+# Minimal GuildNet cluster configuration template
+
+cluster:
+  name: my-cluster
+  namespace: default
+  
+  # Basic settings
+  settings:
+    workspace_lb_enabled: false
+    prefer_pod_proxy: false
+    use_port_forward: true
+  
+  # Optional: Ingress configuration
+  ingress:
+    domain: ""
+    class_name: ""
+    tls_secret: ""
+  
+  # Optional: Image pull secret
+  image_pull_secret: ""
+  
+  # Optional: Organization ID
+  org_id: "default"
+

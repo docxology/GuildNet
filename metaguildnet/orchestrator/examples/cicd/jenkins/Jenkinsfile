@@ -1,0 +1,215 @@
+// Jenkinsfile for GuildNet Deployment
+// This is a declarative pipeline for deploying to GuildNet
+
+pipeline {
+    agent any
+    
+    environment {
+        DOCKER_REGISTRY = credentials('docker-registry')
+        GUILDNET_API_URL = credentials('guildnet-api-url')
+        GUILDNET_API_TOKEN = credentials('guildnet-api-token')
+        IMAGE_NAME = "myapp"
+        IMAGE_TAG = "${env.GIT_COMMIT.take(8)}"
+        FULL_IMAGE = "${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
+    }
+    
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 30, unit: 'MINUTES')
+        timestamps()
+    }
+    
+    stages {
+        stage('Build') {
+            steps {
+                script {
+                    echo "Building image: ${FULL_IMAGE}"
+                    docker.build(FULL_IMAGE)
+                }
+            }
+        }
+        
+        stage('Test') {
+            steps {
+                script {
+                    echo "Running unit tests"
+                    sh 'pytest tests/unit'
+                }
+            }
+        }
+        
+        stage('Push Image') {
+            steps {
+                script {
+                    docker.withRegistry("https://${DOCKER_REGISTRY}", 'docker-credentials') {
+                        docker.image(FULL_IMAGE).push()
+                        docker.image(FULL_IMAGE).push('latest')
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy to Staging') {
+            steps {
+                script {
+                    echo "Deploying to staging cluster"
+                    sh '''
+                        pip install uv
+                        git clone https://github.com/your/guildnet.git
+                        cd guildnet/metaguildnet/python
+                        uv pip install -e .
+                        cd ../../..
+                        
+                        mgn workspace create staging-cluster \
+                            --name ${IMAGE_NAME} \
+                            --image ${FULL_IMAGE} \
+                            --env "ENVIRONMENT=staging" \
+                            --env "VERSION=${IMAGE_TAG}" \
+                            --env "BUILD_NUMBER=${BUILD_NUMBER}"
+                        
+                        mgn workspace wait staging-cluster ${IMAGE_NAME} --timeout 5m
+                    '''
+                }
+            }
+        }
+        
+        stage('Integration Tests') {
+            steps {
+                script {
+                    echo "Running integration tests on staging"
+                    sh '''
+                        mgn workspace test staging-cluster ${IMAGE_NAME} \
+                            --http-check /health \
+                            --http-check /api/status
+                        
+                        pytest tests/integration --staging
+                    '''
+                }
+            }
+        }
+        
+        stage('Approve Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    timeout(time: 24, unit: 'HOURS') {
+                        input message: 'Deploy to production?', 
+                              ok: 'Deploy',
+                              submitter: 'admin,release-manager'
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            parallel {
+                stage('US East') {
+                    steps {
+                        script {
+                            deployToCluster('prod-us-east')
+                        }
+                    }
+                }
+                stage('US West') {
+                    steps {
+                        script {
+                            deployToCluster('prod-us-west')
+                        }
+                    }
+                }
+                stage('EU West') {
+                    steps {
+                        script {
+                            deployToCluster('prod-eu-west')
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Verify Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    echo "Verifying production deployments"
+                    sh '''
+                        for cluster in prod-us-east prod-us-west prod-eu-west; do
+                            echo "Verifying $cluster"
+                            
+                            mgn cluster status $cluster
+                            mgn workspace get $cluster ${IMAGE_NAME}
+                            mgn workspace test $cluster ${IMAGE_NAME} \
+                                --http-check /health \
+                                --http-check /metrics
+                        done
+                    '''
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            script {
+                echo "Deployment successful"
+                // Send success notification
+                slackSend(
+                    color: 'good',
+                    message: "✓ Deployment successful: ${env.JOB_NAME} #${env.BUILD_NUMBER}\nCommit: ${env.GIT_COMMIT.take(8)}"
+                )
+            }
+        }
+        failure {
+            script {
+                echo "Deployment failed, rolling back..."
+                sh '''
+                    # Rollback staging
+                    mgn workspace delete staging-cluster ${IMAGE_NAME} || true
+                    
+                    # Rollback production if it was deployed
+                    if [ "${GIT_BRANCH}" = "main" ]; then
+                        for cluster in prod-us-east prod-us-west prod-eu-west; do
+                            mgn workspace delete $cluster ${IMAGE_NAME} || true
+                        done
+                    fi
+                '''
+                
+                // Send failure notification
+                slackSend(
+                    color: 'danger',
+                    message: "✗ Deployment failed: ${env.JOB_NAME} #${env.BUILD_NUMBER}\nCommit: ${env.GIT_COMMIT.take(8)}"
+                )
+            }
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
+
+// Helper function to deploy to a cluster
+def deployToCluster(clusterName) {
+    echo "Deploying to ${clusterName}"
+    sh """
+        mgn workspace create ${clusterName} \
+            --name ${IMAGE_NAME} \
+            --image ${FULL_IMAGE} \
+            --env "ENVIRONMENT=production" \
+            --env "VERSION=${IMAGE_TAG}" \
+            --env "CLUSTER=${clusterName}" \
+            --env "BUILD_NUMBER=${BUILD_NUMBER}"
+        
+        mgn workspace wait ${clusterName} ${IMAGE_NAME} --timeout 10m
+        
+        mgn workspace test ${clusterName} ${IMAGE_NAME} --http-check /health
+    """
+    echo "Successfully deployed to ${clusterName}"
+}
+

@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/your/module/internal/model"
+	"github.com/docxology/GuildNet/internal/model"
 )
 
 type perServerLogs struct {

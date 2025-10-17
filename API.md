@@ -4,6 +4,8 @@ This document lists the Host App HTTP API endpoints, per-cluster services and en
 
 Note: the runtime behavior is implemented in `internal/api/router.go`, `internal/settings/settings.go`, and `pkg/config/config.go`.
 
+**Developer Tools:** For higher-level API wrappers, see [MetaGuildNet Go SDK](metaguildnet/sdk/go/) and [Python CLI](metaguildnet/python/). Complete API reference: [metaguildnet/docs/api-reference.md](metaguildnet/docs/api-reference.md).
+
 ## Table of Contents
 
 - Host App server API endpoints
@@ -254,6 +256,86 @@ curl -k -X POST "https://127.0.0.1:8090/api/cluster/<clusterID>/workspaces" -H '
   - Do not rely on automatic local `kubectl proxy` detection in production; configure `APIProxyURL` per-cluster or set `KUBE_PROXY_ADDR` intentionally.
   - TLS certificates and `GUILDNET_MASTER_KEY` are required for secure production runs.
 
+
+---
+
+## MetaGuildNet SDK & CLI
+
+MetaGuildNet provides convenient SDK and CLI tools for interacting with the GuildNet API.
+
+### Go SDK
+
+The Go SDK (`metaguildnet/sdk/go/client/`) provides type-safe wrappers around the Host App API:
+
+```go
+import "github.com/your/module/metaguildnet/sdk/go/client"
+
+// Create client
+c := client.NewClient("https://localhost:8090", "your-token")
+
+// List clusters
+clusters, err := c.Clusters().List(ctx)
+
+// Create workspace
+spec := client.WorkspaceSpec{
+    Name:  "myapp",
+    Image: "nginx:latest",
+}
+ws, err := c.Workspaces(clusterID).Create(ctx, spec)
+
+// Database operations
+dbs, err := c.Databases(clusterID).List(ctx)
+
+// Health checks
+health, err := c.Health().Global(ctx)
+```
+
+See `metaguildnet/docs/api-reference.md` for complete SDK documentation.
+
+### Python CLI
+
+The Python CLI (`mgn`) provides command-line access to GuildNet:
+
+```bash
+# Install
+cd metaguildnet/python
+uv pip install -e .
+
+# Cluster management
+mgn cluster list
+mgn cluster status <cluster-id>
+
+# Workspace operations
+mgn workspace create <cluster-id> --name myapp --image nginx
+mgn workspace list <cluster-id>
+mgn workspace logs <cluster-id> myapp
+
+# Database operations
+mgn database list <cluster-id>
+mgn database create <cluster-id> mydb
+
+# Installation & verification
+mgn install        # Automated installation
+mgn verify         # Verify installation
+
+# Visualization
+mgn viz            # Live dashboard
+```
+
+Configuration via environment:
+- `MGN_API_URL` - GuildNet API endpoint (default: https://localhost:8090)
+- `MGN_API_TOKEN` - API authentication token
+
+See `metaguildnet/python/README.md` for complete CLI documentation.
+
+### Orchestration Examples
+
+MetaGuildNet includes examples for:
+- Multi-cluster orchestration (`metaguildnet/orchestrator/examples/multi-cluster/`)
+- Lifecycle management (rolling update, blue-green, canary)
+- CI/CD integration (GitHub Actions, GitLab CI, Jenkins)
+
+See `metaguildnet/docs/examples.md` for detailed walkthroughs.
 
 ---
 

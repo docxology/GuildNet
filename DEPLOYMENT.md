@@ -184,4 +184,279 @@ kubectl -n <ns> describe workspace <name>
 
 
 ---
+
+## MetaGuildNet: Simplified Deployment & Management
+
+MetaGuildNet provides automated installation, verification, and management tools to simplify GuildNet deployment.
+
+### Quick Start with MetaGuildNet
+
+#### 1. Automated Installation (Local Development)
+
+For single-machine MicroK8s setup:
+
+```bash
+cd metaguildnet/scripts
+
+# Full automated installation
+./install/install-all.sh
+```
+
+This runs:
+- Prerequisites check (docker, kubectl, microk8s)
+- MicroK8s installation and configuration
+- Headscale setup
+- GuildNet component deployment
+- Cluster bootstrap
+
+#### 2. Manual Step-by-Step Installation
+
+```bash
+cd metaguildnet/scripts/install
+
+# 1. Check prerequisites
+./00-check-prereqs.sh
+
+# 2. Install MicroK8s
+./01-install-microk8s.sh
+
+# 3. Setup Headscale
+./02-setup-headscale.sh
+
+# 4. Deploy GuildNet
+./03-deploy-guildnet.sh
+
+# 5. Bootstrap cluster
+./04-bootstrap-cluster.sh
+```
+
+#### 3. Verification
+
+After installation, verify everything is working:
+
+```bash
+cd metaguildnet/scripts/verify
+
+# Complete verification
+./verify-all.sh
+
+# Or individual checks
+./verify-system.sh       # System prerequisites
+./verify-network.sh      # Network connectivity
+./verify-kubernetes.sh   # Kubernetes cluster
+./verify-guildnet.sh     # GuildNet components
+```
+
+### Python CLI Installation & Usage
+
+#### Install MetaGuildNet CLI
+
+```bash
+cd metaguildnet/python
+
+# Install with uv (recommended)
+uv pip install -e .
+
+# Or with pip
+pip install -e .
+```
+
+#### Configuration
+
+Set environment variables:
+
+```bash
+export MGN_API_URL="https://localhost:8090"
+export MGN_API_TOKEN="your-api-token"
+```
+
+Or create `~/.config/guildnet/config.yaml`:
+
+```yaml
+api_url: https://localhost:8090
+api_token: your-api-token
+```
+
+#### CLI Commands
+
+```bash
+# Cluster management
+mgn cluster list
+mgn cluster status <cluster-id>
+mgn cluster bootstrap --kubeconfig ~/.kube/config
+
+# Workspace operations
+mgn workspace list <cluster-id>
+mgn workspace create <cluster-id> --name myapp --image nginx
+mgn workspace logs <cluster-id> myapp
+mgn workspace delete <cluster-id> myapp
+
+# Database operations
+mgn database list <cluster-id>
+mgn database create <cluster-id> mydb "My Database"
+
+# Installation & verification
+mgn install      # Automated installation
+mgn verify       # Verify installation
+
+# Live dashboard
+mgn viz          # Real-time terminal dashboard
+```
+
+### Go SDK Usage
+
+For programmatic access to GuildNet:
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    
+    "github.com/your/module/metaguildnet/sdk/go/client"
+)
+
+func main() {
+    ctx := context.Background()
+    c := client.NewClient("https://localhost:8090", "your-token")
+    
+    // List clusters
+    clusters, err := c.Clusters().List(ctx)
+    if err != nil {
+        log.Fatal(err)
+    }
+    
+    for _, cluster := range clusters {
+        fmt.Printf("Cluster: %s (ID: %s)\n", cluster.Name, cluster.ID)
+        
+        // List workspaces
+        workspaces, _ := c.Workspaces(cluster.ID).List(ctx)
+        fmt.Printf("  Workspaces: %d\n", len(workspaces))
+    }
+}
+```
+
+### Production Deployment Patterns
+
+MetaGuildNet includes examples for production deployment:
+
+#### Multi-Cluster Orchestration
+
+```bash
+cd metaguildnet/orchestrator/examples/multi-cluster
+
+# Deploy to multiple clusters
+./deploy-federated.sh
+```
+
+#### Lifecycle Management
+
+```bash
+cd metaguildnet/orchestrator/examples/lifecycle
+
+# Rolling update
+./rolling-update.sh <cluster-id> <workspace-name> <new-image>
+
+# Blue-green deployment
+go run blue-green.go --cluster <id> --workspace <name> --new-image <image>
+
+# Canary deployment
+./canary.sh <cluster-id> <workspace-name> <new-image> 10
+```
+
+#### CI/CD Integration
+
+Templates provided for:
+- **GitHub Actions** - `orchestrator/examples/cicd/github-actions.yaml`
+- **GitLab CI** - `orchestrator/examples/cicd/gitlab-ci.yaml`
+- **Jenkins** - `orchestrator/examples/cicd/jenkins/Jenkinsfile`
+
+### Operational Utilities
+
+#### Log Collection
+
+```bash
+cd metaguildnet/scripts/utils
+
+# Collect all logs
+./log-collector.sh
+
+# Creates: guildnet-logs-TIMESTAMP/ with all component logs
+```
+
+#### Debug Information
+
+```bash
+# Generate debug bundle
+./debug-info.sh
+
+# Creates: guildnet-debug-TIMESTAMP.tar.gz
+```
+
+#### Cleanup
+
+```bash
+# Dry run
+./cleanup.sh --dry-run
+
+# Clean test resources
+./cleanup.sh --workspaces
+
+# Full cleanup (including configs)
+./cleanup.sh --all --force
+```
+
+#### Backup & Restore
+
+```bash
+# Backup configurations and data
+./backup-config.sh
+
+# Creates: guildnet-backup-TIMESTAMP/
+# Includes restore script
+
+# Restore from backup
+./guildnet-backup-TIMESTAMP/restore.sh
+```
+
+### Deployment Comparison
+
+| Method | Use Case | Time | Customization |
+|--------|----------|------|---------------|
+| `install-all.sh` | Quick local setup | ~10 min | Low |
+| Manual steps | Learning/debugging | ~20 min | High |
+| `mgn install` | Python-friendly | ~15 min | Medium |
+| Manual (this doc) | Production | Varies | Full |
+
+### Troubleshooting with MetaGuildNet
+
+```bash
+# Check system health
+mgn verify
+
+# View live status
+mgn viz
+
+# Collect logs for support
+cd metaguildnet/scripts/utils
+./log-collector.sh
+./debug-info.sh
+
+# Share the generated .tar.gz file
+```
+
+### Documentation
+
+- **metaguildnet/README.md** - MetaGuildNet overview
+- **metaguildnet/QUICKSTART.md** - Quick reference
+- **metaguildnet/TESTING.md** - Test suite and validation
+- **metaguildnet/docs/** - Complete documentation
+  - `getting-started.md` - Installation walkthrough
+  - `concepts.md` - Architecture and design
+  - `examples.md` - Usage examples
+  - `api-reference.md` - API documentation
+
+---
 Created by automation. Edit as needed to match your production layout and secrets management.

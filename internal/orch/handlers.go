@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/your/module/internal/headscale"
-	"github.com/your/module/internal/jobs"
-	"github.com/your/module/internal/localdb"
-	"github.com/your/module/internal/secrets"
+	"github.com/docxology/GuildNet/internal/headscale"
+	"github.com/docxology/GuildNet/internal/jobs"
+	"github.com/docxology/GuildNet/internal/localdb"
+	"github.com/docxology/GuildNet/internal/secrets"
 )
 
 // Deps carries minimal dependencies for orchestration handlers.

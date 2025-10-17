@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/your/module/internal/db"
-	"github.com/your/module/internal/metrics"
-	"github.com/your/module/internal/model"
+	"github.com/docxology/GuildNet/internal/db"
+	"github.com/docxology/GuildNet/internal/metrics"
+	"github.com/docxology/GuildNet/internal/model"
 )
 
 // DBAPI bundles dependencies needed by database handlers.

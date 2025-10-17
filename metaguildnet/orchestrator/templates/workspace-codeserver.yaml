@@ -1,0 +1,42 @@
+# code-server workspace template
+
+workspace:
+  name: codeserver-workspace
+  image: codercom/code-server:4.90.3
+  
+  env:
+    - name: PASSWORD
+      value: changeme  # Change in production!
+    - name: SUDO_PASSWORD
+      value: changeme
+  
+  ports:
+    - name: http
+      containerPort: 8080
+      protocol: TCP
+  
+  # Optional: Persistent storage
+  # volumes:
+  #   - name: workspace-data
+  #     persistentVolumeClaim:
+  #       claimName: workspace-pvc
+  #   - name: home
+  #     mountPath: /home/coder
+  
+  # Optional: Resource limits
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "250m"
+    limits:
+      memory: "2Gi"
+      cpu: "2"
+  
+  # Optional: Labels
+  labels:
+    app: code-server
+    environment: development
+  
+  # Optional: Notes
+  notes: "Development code-server workspace"
+

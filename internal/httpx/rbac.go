@@ -4,7 +4,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/your/module/internal/model"
+	"github.com/docxology/GuildNet/internal/model"
 )
 
 // RBACStore is an in-memory permission binding store (MVP) keyed by scope.

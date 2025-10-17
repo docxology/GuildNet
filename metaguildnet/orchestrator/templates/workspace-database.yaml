@@ -1,0 +1,43 @@
+# Database workspace template (PostgreSQL example)
+
+workspace:
+  name: postgres-db
+  image: postgres:16-alpine
+  
+  env:
+    - name: POSTGRES_PASSWORD
+      value: securepassword  # Use secrets in production!
+    - name: POSTGRES_USER
+      value: guildnet
+    - name: POSTGRES_DB
+      value: app_database
+    - name: PGDATA
+      value: /var/lib/postgresql/data/pgdata
+  
+  ports:
+    - name: postgres
+      containerPort: 5432
+      protocol: TCP
+  
+  # Persistent storage recommended
+  # volumes:
+  #   - name: postgres-data
+  #     persistentVolumeClaim:
+  #       claimName: postgres-pvc
+  #   - name: data
+  #     mountPath: /var/lib/postgresql/data
+  
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "250m"
+    limits:
+      memory: "1Gi"
+      cpu: "1"
+  
+  labels:
+    app: postgres
+    component: database
+  
+  notes: "PostgreSQL database workspace"
+

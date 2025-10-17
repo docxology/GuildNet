@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	k8sclient "github.com/your/module/internal/k8s"
+	k8sclient "github.com/docxology/GuildNet/internal/k8s"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 

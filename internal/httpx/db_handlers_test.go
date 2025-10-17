@@ -11,8 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/your/module/internal/db"
-	"github.com/your/module/internal/model"
+	"github.com/docxology/GuildNet/internal/db"
+	"github.com/docxology/GuildNet/internal/model"
 )
 
 // End-to-end style tests for the per-cluster database API wrapper.

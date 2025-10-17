@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/your/module/internal/localdb"
+	"github.com/docxology/GuildNet/internal/localdb"
 )
 
 // Tailscale holds tsnet control-plane settings managed at runtime.
