@@ -1,112 +1,262 @@
 # MetaGuildNet
 
-MetaGuildNet is a comprehensive utilities and orchestration layer for GuildNet. It provides convenience SDKs, automation scripts, orchestration examples, and verification tools to simplify the deployment, management, and operation of GuildNet clusters.
+**Fork-Specific Enhancements and Documentation for GuildNet**
+
+## Overview
+
+MetaGuildNet is a structured enhancement layer for the GuildNet project, providing:
+
+- **Comprehensive Documentation**: Technical guides, architecture notes, and best practices
+- **Convenience Tooling**: Wrappers, utilities, and automation scripts
+- **Verification Suite**: Integration tests, end-to-end tests, and health checks
+- **Examples**: Real-world usage patterns and scenarios
+
+All fork-specific modifications, enhancements, and tooling live in this directory, maintaining clean separation from upstream GuildNet while enabling seamless synchronization.
 
 ## Philosophy
 
-MetaGuildNet acts as a "rider" on top of GuildNet - it does not replace or fork GuildNet, but instead provides higher-level abstractions and utilities that make it easier to:
+> "Prefer modularity and composability over monoliths. Each component should do one thing well and be replaceable."
 
-- **Configure** - Manage complex multi-cluster configurations
-- **Install** - Automated, reproducible installation workflows
-- **Use** - Convenient SDKs and CLIs for common operations
-- **Verify** - Comprehensive verification and health checking
-- **Visualize** - Real-time dashboards and status monitoring
-- **Orchestrate** - Multi-cluster deployment patterns and lifecycle management
+MetaGuildNet follows these principles:
 
-## Prerequisites
+- **Default-First**: Everything works out of the box with sensible defaults
+- **Environment-Driven**: Customize via environment variables when needed
+- **Production-Ready**: No dev/prod split—this is a developer tool
+- **Upstream-Compatible**: Designed to merge cleanly with upstream changes
 
-MetaGuildNet requires a working GuildNet installation. If you don't have GuildNet installed yet, follow the [GuildNet installation guide](../DEPLOYMENT.md) first.
+## Directory Structure
+
+```
+MetaGuildNet/
+├── README.md                    # This file
+├── docs/                        # Technical documentation
+│   ├── ARCHITECTURE.md          # Fork-specific architecture decisions
+│   ├── CONTRIBUTING.md          # Contribution guidelines
+│   ├── SETUP.md                 # Detailed setup procedures
+│   ├── VERIFICATION.md          # Verification and testing guide
+│   └── UPSTREAM_SYNC.md         # Syncing with upstream GuildNet
+├── scripts/                     # Convenience scripts and wrappers
+│   ├── setup/                   # Automated setup scripts
+│   ├── verify/                  # Verification and health check scripts
+│   └── utils/                   # General utilities
+├── tests/                       # Fork-specific test suites
+│   ├── integration/             # Integration tests
+│   └── e2e/                     # End-to-end tests
+└── examples/                    # Usage examples and templates
+    ├── basic/                   # Basic usage patterns
+    └── advanced/                # Advanced scenarios
+```
 
 ## Quick Start
 
-### Install MetaGuildNet CLI (Python)
+### First-Time Setup
 
 ```bash
-cd metaguildnet/python
-uv pip install -e .
+# 1. Run the unified setup wizard
+make -C MetaGuildNet setup-wizard
+
+# 2. Verify installation
+make -C MetaGuildNet verify-all
+
+# 3. Run a basic example
+make -C MetaGuildNet example-basic
 ```
 
-### Verify Your GuildNet Installation
+### Daily Workflow
 
 ```bash
-mgn verify all
+# Check health of all components
+make -C MetaGuildNet health-check
+
+# Run verification suite
+make -C MetaGuildNet verify
+
+# Sync with upstream (when needed)
+make -C MetaGuildNet sync-upstream
 ```
 
-### Use the Go SDK
+## Integration with GuildNet
 
-```go
-import "github.com/docxology/GuildNet/metaguildnet/sdk/go/client"
-
-c := client.NewClient("https://localhost:8090", "")
-clusters, err := c.Clusters().List()
-```
-
-### Run an Orchestrator Example
+MetaGuildNet seamlessly integrates with the base GuildNet Makefile:
 
 ```bash
-cd metaguildnet/orchestrator/examples/multi-cluster
-./deploy-federated.sh
+# Standard GuildNet commands work as usual
+make setup              # Base setup
+make run                # Run hostapp
+
+# MetaGuildNet enhancements
+make meta-setup         # Enhanced setup with verification
+make meta-verify        # Comprehensive health checks
+make meta-docs          # Generate/serve documentation
+```
+
+## Key Features
+
+### 1. Automated Setup Orchestration
+
+The setup wizard automates the entire stack:
+
+- **Network Layer**: Headscale + Tailscale with automatic route configuration
+- **Cluster Layer**: Talos Kubernetes with add-ons (MetalLB, CRDs, RethinkDB)
+- **Application Layer**: Host app with embedded operator
+- **Verification**: End-to-end health checks and connectivity tests
+
+### 2. Comprehensive Verification
+
+Multi-layer verification ensures everything works:
+
+- **Network**: Tailnet connectivity, route propagation
+- **Cluster**: Kubernetes API, node health, storage
+- **Database**: RethinkDB connectivity and schema
+- **Application**: Host app APIs, workspace creation, proxy
+
+### 3. Developer Experience
+
+Convenience wrappers reduce friction:
+
+- **One-Command Setup**: `make meta-setup` orchestrates everything
+- **Smart Defaults**: Environment variables with sensible fallbacks
+- **Error Recovery**: Automatic retry with exponential backoff
+- **Diagnostic Tools**: Structured troubleshooting commands
+
+### 4. Documentation-Driven
+
+Living documentation that stays current:
+
+- **Architecture Decision Records** (ADRs)
+- **Troubleshooting Playbooks**
+- **Integration Examples**
+- **API Documentation**
+
+## Environment Configuration
+
+MetaGuildNet respects all GuildNet environment variables and adds:
+
+```bash
+# MetaGuildNet-specific configuration
+METAGN_SETUP_MODE=auto           # auto|interactive|minimal
+METAGN_VERIFY_TIMEOUT=300        # Verification timeout (seconds)
+METAGN_AUTO_APPROVE_ROUTES=true  # Auto-approve Tailscale routes
+METAGN_LOG_LEVEL=info            # debug|info|warn|error
 ```
 
 ## Documentation
 
-- [Getting Started](docs/getting-started.md) - Installation and first steps
-- [Concepts](docs/concepts.md) - Architecture and patterns
-- [Examples](docs/examples.md) - Detailed walkthroughs
-- [API Reference](docs/api-reference.md) - SDK and CLI documentation
+- **[Setup Guide](docs/SETUP.md)**: Detailed setup procedures and troubleshooting
+- **[Architecture](docs/ARCHITECTURE.md)**: Fork-specific design decisions
+- **[Verification](docs/VERIFICATION.md)**: Testing and health check procedures
+- **[Contributing](docs/CONTRIBUTING.md)**: How to contribute to this fork
+- **[Upstream Sync](docs/UPSTREAM_SYNC.md)**: Maintaining sync with upstream GuildNet
 
-## Components
+## Testing
 
-### Go SDK (`sdk/go/`)
+```bash
+# Run all tests
+make -C MetaGuildNet test-all
 
-Convenience wrappers around the GuildNet Host App API:
-- Cluster management
-- Workspace operations
-- Database interactions
-- Health monitoring
-- Testing utilities
+# Run specific test suites
+make -C MetaGuildNet test-integration
+make -C MetaGuildNet test-e2e
 
-### Python CLI (`python/`)
+# Run with coverage
+make -C MetaGuildNet test-coverage
+```
 
-Command-line interface and automation tools:
-- `mgn cluster` - Manage clusters
-- `mgn workspace` - Workspace operations
-- `mgn install` - Automated installation
-- `mgn verify` - Verification suite
-- `mgn viz` - Real-time dashboard
+## Examples
 
-### Orchestrator Examples (`orchestrator/`)
+Browse the `examples/` directory for:
 
-Production-ready patterns:
-- Multi-cluster federation
-- Lifecycle management (rolling updates, blue-green, canary)
-- CI/CD integration examples
-- Configuration templates
+- **Basic**: Single-node setup, workspace creation, proxy access
+- **Advanced**: Multi-node clusters, custom images, persistent storage
 
-### Scripts (`scripts/`)
+Run examples directly:
 
-Comprehensive automation:
-- Installation scripts
-- Verification scripts
-- Utility scripts (logging, debugging, backup)
+```bash
+# Basic workspace example
+bash MetaGuildNet/examples/basic/create-workspace.sh
 
-### Tests (`tests/`)
-
-Integration and end-to-end tests:
-- Go SDK tests
-- Python CLI tests
-- Orchestrator example tests
-- Full workflow tests
+# Advanced multi-user scenario
+bash MetaGuildNet/examples/advanced/multi-user-setup.sh
+```
 
 ## Contributing
 
-MetaGuildNet follows GuildNet's development principles:
-- Modular, composable components
-- Production-first (no dev/local modes)
-- Sensible defaults with customization via environment variables
-- Well-documented, clearly-commented code
+We welcome contributions! See [CONTRIBUTING.md](docs/CONTRIBUTING.md) for:
+
+- Code style and standards
+- Testing requirements
+- Pull request process
+- Development workflow
+
+## Upstream Relationship
+
+This fork maintains compatibility with upstream GuildNet:
+
+- **Sync Cadence**: Weekly upstream pulls (or as needed)
+- **Merge Strategy**: Rebase onto upstream main
+- **Feature Isolation**: Fork features in MetaGuildNet/ only
+- **Upstream Contributions**: Extract generic improvements for PRs
+
+See [UPSTREAM_SYNC.md](docs/UPSTREAM_SYNC.md) for procedures.
+
+## Troubleshooting
+
+Common issues and solutions:
+
+### Setup Fails
+
+```bash
+# Check prerequisites
+make -C MetaGuildNet check-prereqs
+
+# View detailed logs
+METAGN_LOG_LEVEL=debug make -C MetaGuildNet setup-wizard
+```
+
+### Connectivity Issues
+
+```bash
+# Diagnose network
+make -C MetaGuildNet diag-network
+
+# Diagnose cluster
+make -C MetaGuildNet diag-cluster
+```
+
+### Verification Failures
+
+```bash
+# Run incremental verification
+make -C MetaGuildNet verify-step-by-step
+
+# Export diagnostic bundle
+make -C MetaGuildNet export-diagnostics
+```
+
+See [docs/VERIFICATION.md](docs/VERIFICATION.md) for comprehensive troubleshooting.
 
 ## License
 
-Same as GuildNet - see [LICENSE](../LICENSE)
+This fork maintains the same license as upstream GuildNet. See [../LICENSE](../LICENSE).
+
+## Support and Community
+
+- **Issues**: Open issues in this fork's repository
+- **Discussions**: Use GitHub Discussions for questions
+- **Upstream Issues**: File bugs affecting base GuildNet upstream
+
+## Changelog
+
+### v1.0.0 (Current)
+
+- Initial MetaGuildNet structure
+- Automated setup wizard
+- Comprehensive verification suite
+- Integration test framework
+- Documentation overhaul
+- Example scenarios
+
+---
+
+**Philosophy**: Do or do not, there is no try. Everything here works by default, is production-ready, and can be customized as needed.
 
